@@ -1,0 +1,17 @@
+v0.4.21 GUI integration TEST
+
+Validated source core: SCRIPTCLASS TYPEDEF MATCH PERMANENT - 2026-09-12.
+The original reference core remains bundled unchanged.
+Sims3_CC_Health_Scanner_CORE_INTEGRATED_TEST.py adds GUI/test wiring around the validated logic.
+
+Current integration-only additions include:
+- GUI-selected source folder / scan mode / Master Database / scans root
+- dry-run routing preview
+- explicitly gated REAL Routing TEST
+- Last Scanned date + time for new/rescanned records
+- Move_Manifest.txt logging for real routing
+- GUI mode avoids blocking console input prompts
+
+MDB pre-scan backups and the completion summary are handled by app.py.
+No check_* health function bodies or classification rules are intentionally changed.
+All 66 check_* functions are preserved.
