@@ -1,0 +1,30 @@
+# Python virtual environment
+.venv/
+venv/
+env/
+
+# Python cache / compiled files
+__pycache__/
+*.py[cod]
+
+# Local databases and spreadsheets created/edited by the user
+*.mdb
+*.accdb
+
+# Logs
+*.log
+
+# Temporary / backup files
+*.tmp
+*.temp
+*.bak
+*.backup
+*~
+
+# Windows junk
+Thumbs.db
+Desktop.ini
+
+# IDE / editor folders
+.vscode/
+.idea/
