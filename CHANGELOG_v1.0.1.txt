@@ -1,4 +1,4 @@
-CAS CURATOR v1.0.1 — CHANGES SINCE v1.0
+﻿CAS CURATOR v1.0.1 — CHANGES SINCE v1.0
 ==========================================
 
 
@@ -61,6 +61,7 @@ Metadata and review tools
 Interface and readability
 
 - General UI polish improved resizing, layout consistency, readability and theme behaviour across Library, Scan, Guide and supporting windows.
+- Library is now the single place to create, open or change the active Master Database. Scan shows that same MDB read-only and always writes to it.
 - Improved dialog handling for long messages and Windows paths, with more consistent sizing, wrapping and centring.
 - Added the teal-green CAS Curator package/check application icon for the title bar/taskbar.
 - Updated the Guide and simplified Manual fields help to reflect the current workflows in plain language.
@@ -72,3 +73,4 @@ Compatibility and safety notes
 - Managed locations are explicit actions only — CAS Curator does not add background folder watching or automatic movement.
 - ZIP is the supported archive preview/extract format; RAR and 7Z are not supported.
 - CC Magic Import remains a deployment-copy workflow and is deliberately separate from the master package's File Location.
+

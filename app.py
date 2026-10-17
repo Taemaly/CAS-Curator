@@ -5519,7 +5519,7 @@ class MainWindow(QMainWindow):
 <li>Wait until the package and thumbnail counts finish loading.</li>
 </ol>
 <p>By default CAS Curator remembers the last MDB and opens it next time. To use another one, simply click <b>Open MDB…</b>. You can turn automatic reopening off or on with <b>File &gt; Open last used MDB on startup</b>.</p>
-<p>The Scan page normally follows whichever MDB is open in Library. If you deliberately browse to a different Scan MDB, that is treated as a temporary Scan override until you click <b>Use Library MDB</b> again.</p>
+<p>The Scan page always uses the Master Database currently open in Library. Scan shows that MDB path read-only; create, open, or change the Master Database from <b>Library</b>.</p>
 
 <h2><a name="views"></a>Table and Gallery views</h2>
 <p>Table is best for detailed information and bulk work. Gallery is best when you recognise CC visually.</p>
@@ -5704,7 +5704,7 @@ class MainWindow(QMainWindow):
 <ol>
 <li>Open <b>Scan</b>.</li>
 <li>Choose the <b>CC source folder</b>. Package files inside its subfolders are included too. Use <b>Open folder</b> if you want to open the selected source in Windows Explorer.</li>
-<li>The MDB normally matches the one open in Library. If you have no MDB yet, click <b>New MDB…</b>. To deliberately use another existing workbook for this scan, click <b>Browse MDB…</b>.</li>
+<li><b>Library and Scan always use the same Master Database.</b> Scan shows the active Library MDB as a read-only path. To create, open, or change the Master Database, use the <b>Library</b> page.</li>
 <li>If you have unsaved manual Library edits, save or revert them first.</li>
 <li>Click <b>Run Scan</b>. A normal scan starts immediately after validation; CAS Curator only opens a choice box when something genuinely needs your decision, such as ZIP/Sims3Pack handling or MDB compatibility.</li>
 </ol>
@@ -5779,10 +5779,10 @@ class MainWindow(QMainWindow):
 <p>Keep the backup and move manifest until you are satisfied that a large operation is correct.</p>
 
 <h2><a name="troubleshooting"></a>Troubleshooting</h2>
-<p><b>No Master Database yet:</b> click <b>Create new MDB…</b> in Library or <b>New MDB…</b> on Scan, choose where to save it, then run your first Scan.</p>
+<p><b>No Master Database yet:</b> go to <b>Library</b>, click <b>Create new MDB…</b>, choose where to save it, then run your first Scan.</p>
 <p><b>The wrong MDB opens at startup:</b> click <b>Open MDB…</b> and choose the one you want. That becomes the remembered MDB. You can also untick <b>File &gt; Open last used MDB on startup</b>.</p>
-<p><b>Scan is pointing at a different MDB:</b> click <b>Use Library MDB</b> to remove the temporary Scan override.</p>
-<p><b>Run Scan is unavailable:</b> choose a valid source folder and .xlsx Master Database, and save/revert pending manual Library edits.</p>
+<p><b>Scan shows the wrong MDB:</b> go to <b>Library</b> and open the Master Database you want. Scan updates automatically and cannot use a separate MDB.</p>
+<p><b>Run Scan is unavailable:</b> open a valid .xlsx Master Database in <b>Library</b>, choose a valid source folder, and save/revert pending manual Library edits.</p>
 <p><b>Scan reports an MDB compatibility issue:</b> some spreadsheet programs save extra workbook information that the scanner cannot safely read. Choose <b>Create compatible copy…</b>. CAS Curator leaves your original workbook untouched, creates and verifies a separate compatible copy, and switches Scan to that copy. If the affected MDB was open in Library, the compatible copy is opened there too. Run Scan again after the copy is ready.</p>
 <p><b>Run Routing is unavailable:</b> choose a valid source and separate destination, create a fresh Routing Preview, then tick the move acknowledgement.</p>
 <p><b>Routing says Changed since scan / Not in MDB:</b> choose <b>Run Scan First</b> when you want current scanner-derived metadata and reliable tracking. <b>Continue Routing Anyway</b> is available for deliberate cases, but stale or unknown packages may not have complete MDB information.</p>
@@ -5887,20 +5887,10 @@ class MainWindow(QMainWindow):
         self.scan_mdb_edit.setObjectName("ScanPathField")
         self.scan_mdb_edit.setReadOnly(True)
         self.scan_mdb_edit.setFixedHeight(action_height)
-        self.scan_mdb_edit.setPlaceholderText("Use the MDB open in Library or browse to another workbook…")
+        self.scan_mdb_edit.setReadOnly(True)
+        self.scan_mdb_edit.setPlaceholderText("No Master Database open — open or create one in Library.")
+        self.scan_mdb_edit.setToolTip("The Scan page uses the Master Database currently open in Library. Change it from Library.")
         mdb_row_layout.addWidget(self.scan_mdb_edit, 1)
-        use_opened = QPushButton("Use Library MDB")
-        use_opened.setFixedSize(165, action_height)
-        use_opened.clicked.connect(self._scan_use_opened_mdb)
-        mdb_row_layout.addWidget(use_opened)
-        mdb_browse = QPushButton("Browse MDB…")
-        mdb_browse.setFixedSize(135, action_height)
-        mdb_browse.clicked.connect(self._choose_scan_mdb)
-        mdb_row_layout.addWidget(mdb_browse)
-        mdb_new = QPushButton("New MDB…")
-        mdb_new.setFixedSize(115, action_height)
-        mdb_new.clicked.connect(self.create_new_mdb)
-        mdb_row_layout.addWidget(mdb_new)
         source_layout.addWidget(mdb_row)
 
         # Scanner mode controls are DEV-only. PUBLIC uses one conservative scan
@@ -7582,9 +7572,15 @@ class MainWindow(QMainWindow):
         if self.random_sim_page is not None:
             self.random_sim_page.setVisible(is_random_sim)
         if is_scan:
-            if self.mdb and not self.scan_mdb_path:
-                self.scan_mdb_path = str(self.mdb.path.resolve())
-                self.scan_mdb_edit.setText(self.scan_mdb_path)
+            if self.mdb:
+                global_mdb_path = str(self.mdb.path.resolve())
+                if self.scan_mdb_path != global_mdb_path:
+                    self.scan_mdb_path = global_mdb_path
+                    self.scan_mdb_edit.setText(global_mdb_path)
+            else:
+                self.scan_mdb_path = ""
+                self.scan_mdb_override = False
+                self.scan_mdb_edit.clear()
             self._update_scan_start_state()
             self.statusBar().showMessage(("CAS Scanner — Run Scan keeps source files in place; Routing Preview is available" if IS_PUBLIC_BUILD else "Scanner — Start Scan keeps source files in place; Routing Preview is available"))
         elif is_random_sim:
@@ -7654,14 +7650,10 @@ class MainWindow(QMainWindow):
         self._update_scan_start_state()
 
     def _choose_scan_mdb(self):
-        start = str(Path(self.scan_mdb_path).parent) if self.scan_mdb_path else str(self.settings.value("last_dir", str(Path.home())))
-        path, _ = QFileDialog.getOpenFileName(self, "Choose scanner Master Database", start, "Excel Workbook (*.xlsx);;All files (*)")
-        if not path:
-            return
-        self.scan_mdb_path = str(Path(path).resolve())
-        self.scan_mdb_edit.setText(self.scan_mdb_path)
-        self.scan_log.appendPlainText(f"Selected scanner MDB: {self.scan_mdb_path}")
-        self._update_scan_start_state()
+        # Scan no longer owns MDB selection. Keep this legacy callback inert in
+        # case an older signal/session tries to invoke it.
+        self.statusBar().showMessage("Open, create, or change the Master Database from Library.", 5000)
+        return
 
     def _on_routing_ack_toggled(self, checked: bool):
         if hasattr(self, "real_routing_check"):
@@ -8478,7 +8470,10 @@ class MainWindow(QMainWindow):
         elif hasattr(self, "scan_log"):
             self.scan_log.appendPlainText("GUI: validation passed; Run Scan starts directly (no redundant confirmation).")
 
-        runner_py = Path(__file__).resolve().parent / "scanner_integration_runner.py"
+        if getattr(sys, "frozen", False):
+            runner_py = Path(sys.executable).resolve().parent / "scanner" / "CASCurator_ScannerRuntime.exe"
+        else:
+            runner_py = Path(__file__).resolve().parent / "scanner_integration_runner.py"
         if not runner_py.exists():
             QMessageBox.critical(self, "Scanner", f"Missing integration runner:\n{runner_py}")
             return
@@ -8636,6 +8631,11 @@ class MainWindow(QMainWindow):
 
     def _resolve_scanner_python38(self):
         """Resolve the real Python 3.8 executable without shell quoting."""
+        if getattr(sys, "frozen", False):
+            scanner_exe = Path(sys.executable).resolve().parent / "scanner" / "CASCurator_ScannerRuntime.exe"
+            if scanner_exe.is_file():
+                return scanner_exe, ""
+            return None, "The bundled CAS Curator scanner runtime is missing:\n" + str(scanner_exe)
         probe = (
             "import sys; print(sys.executable); "
             "raise SystemExit(0 if sys.version_info[:2] == (3, 8) else 8)"
@@ -10932,8 +10932,9 @@ class MainWindow(QMainWindow):
         if hasattr(self, "mdb_path_label"):
             self.mdb_path_label.setText(full_mdb_path)
             self.mdb_path_label.setToolTip(full_mdb_path)
-        if hasattr(self, "scan_mdb_edit") and not self.scan_mdb_path:
-            self.scan_mdb_path = full_mdb_path
+        self.scan_mdb_path = full_mdb_path
+        self.scan_mdb_override = False
+        if hasattr(self, "scan_mdb_edit"):
             self.scan_mdb_edit.setText(full_mdb_path)
         self._populate_edit_options()
         self._refresh_cc_magic_profile_choices()
