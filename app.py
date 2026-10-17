@@ -1910,10 +1910,6 @@ class MainWindow(QMainWindow):
         copy_dropin_action.setToolTip("Copy selected original package files to the configured CC Magic Import folder. Originals remain in place and File Location is not changed.")
         copy_dropin_action.triggered.connect(self.copy_selected_to_cc_magic_dropin)
         tools_menu.addAction(copy_dropin_action)
-        remove_dropin_action = QAction("Remove Selected from CC Magic Import…", self)
-        remove_dropin_action.setToolTip("Remove only SHA-256 verified deployment copies from CC Magic Import. A matching master copy outside Import must still exist; File Location is never changed.")
-        remove_dropin_action.triggered.connect(self.remove_selected_from_cc_magic_dropin)
-        tools_menu.addAction(remove_dropin_action)
         tools_menu.addSeparator()
         set_dropin_action = QAction("Set CC Magic Import Folder…", self)
         set_dropin_action.triggered.connect(self.set_cc_magic_dropin_folder)
@@ -3724,7 +3720,12 @@ class MainWindow(QMainWindow):
             title_label.setParent(header)
             title_width = max(180, card_width - 71)
             self._prepare_dialog_label(title_label, title_width)
-            header_layout.addWidget(icon_label, 0, Qt.AlignVCenter)
+            # Keep the icon visually attached to the opening line on long
+            # confirmation prompts. Short information boxes still look best
+            # vertically centred, but centring a 42 px icon beside several
+            # wrapped lines makes it appear to float halfway down the message.
+            icon_alignment = Qt.AlignTop if len(detail_text) > 150 else Qt.AlignVCenter
+            header_layout.addWidget(icon_label, 0, icon_alignment)
             header_layout.addWidget(title_label, 1, Qt.AlignVCenter)
             # QMessageBox uses an internal multi-column grid.  Spanning only
             # the first two columns centres the cards inside the left portion
@@ -5629,7 +5630,7 @@ class MainWindow(QMainWindow):
 <li><b>Unverifiable</b> — a file is present but CAS Curator cannot safely verify that it is the same package.</li>
 <li><b>Unavailable</b> — the Import folder is not configured or cannot currently be accessed.</li>
 </ul>
-<p><b>Remove Selected from CC Magic Import…</b> deletes only SHA-256 verified deployment copies when CAS Curator can also verify that a matching master copy still exists outside Import.</p>
+<p><b>After CC Magic processes the Import folder:</b> manage or remove that content from inside CC Magic itself. CAS Curator does not delete or move files from CC Magic-managed storage. If you use CAS Curator Status or Profiles to track your own workflow, update those manually after making changes in CC Magic.</p>
 <p>To look for a package online, right-click its row and choose <b>Search Web for Package</b>. CAS Curator opens a Google search in your default browser using the package name with the <code>.package</code> ending removed and common separators cleaned up. If Creator is filled in, it is included automatically to make the search more specific.</p>
 <h3>Merge Profiles</h3>
 <p>Merge Profiles record which merged collections contain the package. A package can belong to several Merge Profiles at once. Merge membership is separate from Status and from general Profiles.</p>
@@ -5672,8 +5673,8 @@ class MainWindow(QMainWindow):
 <p>Routing already provides automatic evidence-based sorting by supported type. Managed Locations are most useful for deliberate organisation such as creator folders, Testing, Archive or another collection structure that you choose yourself.</p>
 <h3>Move a filtered group together</h3>
 <p>Filter by <b>CC Type</b>, <b>Status</b>, <b>Creator</b> or <b>Profile</b> directly, or use <b>+ Add Filter…</b> for fields such as <b>File Location</b>, Age, Gender or any other currently available column. Select the rows you want, then use <b>Move Selected to Location…</b>. CAS Curator verifies package identity and SHA-256 before completing controlled moves.</p>
-<h3>Prepare or remove a group for CC Magic</h3>
-<p>Click <b>+ Add Filter…</b> and choose <b>CC Magic Import is Not in Import</b>, then select the packages you want and use <b>Copy Selected to CC Magic Import…</b>. To clean up later, filter with <b>CC Magic Import is In Import</b>, select the group, and use <b>Remove Selected from CC Magic Import…</b>. CAS Curator verifies the outside master copy and the Import copy before deletion, so a different same-name file is never removed automatically.</p>
+<h3>Prepare a group for CC Magic</h3>
+<p>Click <b>+ Add Filter…</b> and choose <b>CC Magic Import is Not in Import</b>, then select the packages you want and use <b>Copy Selected to CC Magic Import…</b>. The Import folder is only a deployment drop-in location. Once CC Magic processes those files, use CC Magic itself to manage or remove them. CAS Curator does not delete files from CC Magic-managed storage.</p>
 <h3>Bring in a folder of new downloads</h3>
 <p>Use the recommended sequence <b>Run Scan → Preview Routing → Run Routing</b>. Scan adds or refreshes MDB knowledge; Preview Routing shows exactly where files would go; Run Routing performs the physical move. When ZIPs are present, Scan can extract them beside the original archives first so newly extracted packages join the same scan. When Sims3Packs are present, CAS Curator can analyse their manifests, avoid extracting a CAS package when an identical standalone <code>.package</code> is already present, and optionally extract missing CAS package copies while leaving the original Sims3Pack untouched.</p>
 <h3>Find an item again later</h3>
@@ -9671,9 +9672,6 @@ class MainWindow(QMainWindow):
         copy_dropin_action = menu.addAction(
             "Copy Package to CC Magic Import…" if selected_count == 1 else f"Copy {selected_count} Selected Packages to CC Magic Import…"
         )
-        remove_dropin_action = menu.addAction(
-            "Remove Package from CC Magic Import…" if selected_count == 1 else f"Remove {selected_count} Selected Packages from CC Magic Import…"
-        )
         menu.addSeparator()
         copy_action = menu.addAction("Copy file name")
         menu.addSeparator()
@@ -9692,8 +9690,6 @@ class MainWindow(QMainWindow):
             self.move_selected_to_location(selected_rows)
         elif chosen == copy_dropin_action:
             self.copy_selected_to_cc_magic_dropin(selected_rows)
-        elif chosen == remove_dropin_action:
-            self.remove_selected_from_cc_magic_dropin(selected_rows)
         elif chosen == copy_action:
             self._copy_filename_text(filename)
         elif chosen == delete_action:
@@ -10404,189 +10400,6 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "CC Magic copy complete", "\n".join(copy_lines))
         self.statusBar().showMessage(
             f"CC Magic Import: {len(copied):,} copied, {len(already_present):,} already present", 9000
-        )
-
-    def remove_selected_from_cc_magic_dropin(self, source_rows: Optional[List[int]] = None):
-        """Remove only verified deployment copies from CC Magic Import.
-
-        Safety rules:
-        - the selected Library row must resolve to a matching master .package outside Import;
-        - the Import copy must match that master's SHA-256 exactly;
-        - missing, ambiguous, unreadable or different same-name files are never deleted;
-        - MDB File Location and the organised master package are never changed.
-        """
-        if not self.mdb:
-            QMessageBox.information(self, "Remove from CC Magic Import", "Open a Master Database first.")
-            return
-        rows = self._managed_selected_rows(source_rows)
-        if not rows:
-            QMessageBox.information(self, "Remove from CC Magic Import", "Select one or more package rows first.")
-            return
-        if self.scan_process is not None and self.scan_process.state() != QProcess.NotRunning:
-            QMessageBox.warning(
-                self, "Remove from CC Magic Import",
-                "Wait for the current Scan/Routing operation to finish before removing Import copies."
-            )
-            return
-        if not self._confirm_pending_changes():
-            return
-        if not self.cc_magic_dropin_path or not Path(self.cc_magic_dropin_path).is_dir():
-            answer = QMessageBox.question(
-                self, "CC Magic Import",
-                "No CC Magic Import folder is configured.\n\n"
-                "Set it from Tools → Set CC Magic Import Folder….\n\n"
-                "Choose the folder now?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
-            )
-            if answer != QMessageBox.Yes or not self.set_cc_magic_dropin_folder():
-                return
-        target_root = Path(self.cc_magic_dropin_path).resolve()
-
-        grouped: Dict[str, dict] = {}
-        skipped: List[str] = []
-        conflicts: List[str] = []
-        for source_row in rows:
-            rec = self.model.record(source_row)
-            filename = Path(str((rec or {}).get("Package", "") or "").strip()).name
-            if not filename or not filename.lower().endswith(".package"):
-                skipped.append(f"{filename or '(unnamed row)'} — no usable .package filename")
-                continue
-            try:
-                master_path, master_hash = self._resolve_managed_package_source(source_row)
-            except Exception as exc:
-                skipped.append(f"{filename} — could not verify a master copy outside Import: {exc}")
-                continue
-            try:
-                master_resolved = master_path.resolve()
-            except OSError:
-                master_resolved = master_path.absolute()
-            destination = (target_root / filename).resolve()
-            if os.path.normcase(str(master_resolved)).casefold() == os.path.normcase(str(destination)).casefold():
-                conflicts.append(
-                    f"{filename} — the tracked master copy is the CC Magic Import file itself; CAS Curator will not delete it."
-                )
-                continue
-            key = os.path.normcase(filename).casefold()
-            previous = grouped.get(key)
-            if previous is not None:
-                if previous["hash"] != master_hash:
-                    conflicts.append(
-                        f"{filename} — selected rows with the same filename have different SHA-256 identities."
-                    )
-                    previous["conflicted"] = True
-                continue
-            grouped[key] = {
-                "filename": filename,
-                "destination": destination,
-                "hash": master_hash,
-                "master": master_resolved,
-                "conflicted": False,
-            }
-
-        removable: List[dict] = []
-        already_absent: List[dict] = []
-        for item in grouped.values():
-            if item.get("conflicted"):
-                continue
-            destination = item["destination"]
-            if not destination.exists():
-                already_absent.append(item)
-                continue
-            if not destination.is_file():
-                conflicts.append(f"{destination} exists but is not a normal file.")
-                continue
-            try:
-                import_hash = self._managed_file_sha256(destination)
-            except Exception as exc:
-                conflicts.append(f"{item['filename']} — could not verify the Import copy: {exc}")
-                continue
-            if import_hash != item["hash"]:
-                conflicts.append(
-                    f"{item['filename']} — CC Magic Import contains a different same-name file; it was left untouched."
-                )
-                continue
-            removable.append(item)
-
-        preview = [
-            f"Selected Library rows: {len(rows):,}",
-            f"Verified Import copies to remove: {len(removable):,}",
-            f"Already absent: {len(already_absent):,}",
-            f"Skipped / unverifiable: {len(skipped):,}",
-            f"Conflicts left untouched: {len(conflicts):,}",
-            "",
-            f"CC Magic Import folder: {target_root}",
-        ]
-        if removable:
-            preview += ["", "Verified copies that will be removed:"]
-            for item in removable[:12]:
-                preview.append(f"• {item['destination']}")
-            if len(removable) > 12:
-                preview.append(f"…and {len(removable) - 12} more verified copy/copies.")
-        if skipped:
-            preview += ["", "Skipped:"] + [f"• {line}" for line in skipped[:6]]
-            if len(skipped) > 6:
-                preview.append(f"…and {len(skipped) - 6} more skipped row(s).")
-        if conflicts:
-            preview += ["", "Conflicts:"] + [f"• {line}" for line in conflicts[:6]]
-            if len(conflicts) > 6:
-                preview.append(f"…and {len(conflicts) - 6} more conflict(s).")
-        preview += [
-            "",
-            "Only SHA-256 verified deployment copies inside CC Magic Import will be deleted. "
-            "The organised master packages and MDB File Location are not changed.",
-        ]
-
-        if not removable:
-            QMessageBox.information(self, "CC Magic Import removal", "\n".join(preview))
-            return
-        answer = QMessageBox.question(
-            self, "Preview CC Magic removal", "\n".join(preview),
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-        )
-        if answer != QMessageBox.Yes:
-            return
-
-        removed: List[dict] = []
-        failed: List[str] = []
-        QApplication.setOverrideCursor(Qt.WaitCursor)
-        try:
-            for item in removable:
-                destination = item["destination"]
-                try:
-                    # Re-check immediately before deletion in case another program changed the file after preview.
-                    if not destination.is_file():
-                        failed.append(f"{item['filename']} — Import copy disappeared before removal")
-                        continue
-                    if self._managed_file_sha256(destination) != item["hash"]:
-                        failed.append(f"{item['filename']} — Import copy changed after preview; left untouched")
-                        continue
-                    destination.unlink()
-                    if destination.exists():
-                        failed.append(f"{item['filename']} — Windows reported the file still exists after removal")
-                        continue
-                    removed.append(item)
-                except Exception as exc:
-                    failed.append(f"{item['filename']} — {exc}")
-        finally:
-            QApplication.restoreOverrideCursor()
-
-        self._refresh_cc_magic_import_statuses()
-        detail = [f"Removed from CC Magic Import: {len(removed):,}"]
-        if already_absent:
-            detail.append(f"Already absent: {len(already_absent):,}")
-        if skipped:
-            detail.append(f"Skipped / unverifiable: {len(skipped):,}")
-        if conflicts:
-            detail.append(f"Conflicts: {len(conflicts):,}")
-        if failed:
-            detail.append(f"Removal failures: {len(failed):,}")
-        detail += ["", "Organised master packages stayed untouched. File Location was not changed."]
-        if failed:
-            detail += ["", "Needs attention:"] + [f"• {line}" for line in failed[:8]]
-        QMessageBox.information(self, "CC Magic removal complete", "\n".join(detail))
-        self.statusBar().showMessage(
-            f"CC Magic Import: {len(removed):,} removed, {len(already_absent):,} already absent, "
-            f"{len(skipped) + len(conflicts) + len(failed):,} not removed", 10000
         )
 
     def _search_package_web(self, filename: str, creator: str = ""):

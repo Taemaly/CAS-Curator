@@ -21,8 +21,8 @@ CC Magic Import
 - Added a separate, configurable CC Magic Import destination.
 - Copy Selected to CC Magic Import… is copy-only: the organised master package remains in place and its File Location is not changed.
 - Added a live, read-only CC Magic Import status that reflects the real Import folder, including states such as in Import, not in Import and conflict.
-- CC Magic Import status can be used with + Add Filter… and refreshes after copy/remove operations and external folder changes.
-- Added Remove Selected from CC Magic Import…. CAS Curator removes only a SHA-256 verified deployment copy when it can also verify that the matching master package still exists outside the Import folder.
+- CC Magic Import status can be used with + Add Filter… and refreshes after copy operations and external folder changes.
+- Once CC Magic processes content out of the Import folder, use CC Magic itself to manage or remove it; CAS Curator does not delete files from CC Magic-managed storage.
 
 
 Scan and archive intake
@@ -60,21 +60,10 @@ Metadata and review tools
 
 Interface and readability
 
-- Improved the restored-window Table/details splitter so the side panel can be resized without requiring the main window to be maximised; narrow layouts can scroll where needed.
-- Improved the Scanner Log and completion/log viewing experience, including a larger working area and a themed, independently resizable Expand Log window.
-- Added themed information/warning/decision dialogs that follow the active CAS Curator theme while keeping message text on a neutral, high-contrast reading surface.
-- Improved dialog sizing, wrapping and centring so decision popups remain compact and readable.
-- Improved text contrast in several darker themes, including Navy Bloom, Midnight Steel, Deep Ocean, Storm Purple, Retro Terminal, Black Cherry, Dark Teal and Night Plum.
-- Improved Scanner Log contrast so diagnostic text stays neutral and readable across both light and dark themes.
-- Expanded Scanner Log now uses a neutral grey reading surface with black text in every theme.
-- Fixed remaining Edit and CASP-observation readability issues in darker themes.
-- Fixed long-message and long-Windows-path wrapping across themed information, warning, question, CC Magic preview and Routing preview dialogs.
-- Refined button depth and consistency across Library, Scan and Guide views.
-- Reorganised the Library header and action controls for clearer grouping and alignment while keeping the compact v1-style layout.
+- General UI polish improved resizing, layout consistency, readability and theme behaviour across Library, Scan, Guide and supporting windows.
+- Improved dialog handling for long messages and Windows paths, with more consistent sizing, wrapping and centring.
 - Added the teal-green CAS Curator package/check application icon for the title bar/taskbar.
-- Simplified the Edit → Manual fields help so it gives a short explanation in place, with a direct link to the full Guide section.
-- Updated the Guide to cover the new filters, Creator workflow, File Locations, managed moves, CC Magic Import, ZIP/Sims3Pack intake, routing preflight, Advanced/Experimental metadata and current Scan workflow in plain language.
-
+- Updated the Guide and simplified Manual fields help to reflect the current workflows in plain language.
 
 Compatibility and safety notes
 
