@@ -19,7 +19,7 @@ REL_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"m": MAIN_NS, "r": REL_NS}
 
-EDITABLE_FIELDS = ("Image", "Status", "Creator", "File Location", "CC Magic Profiles", "Merge Profiles", "Notes")
+EDITABLE_FIELDS = ("Image", "Status", "Creator", "Converter", "File Location", "CC Magic Profiles", "Merge Profiles", "Notes")
 
 
 def _normalise_cc_magic_profiles(value: str) -> str:
@@ -428,6 +428,54 @@ def target_to_local_path(target: str) -> Optional[Path]:
     return Path(unquote(target))
 
 
+_THUMBNAIL_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp")
+
+
+def _portable_thumbnail_target(mdb_path: Path, target: str, package_hash: str) -> str:
+    """Resolve a broken scanner thumbnail link beside a moved MDB.
+
+    Scanner-created thumbnails are named from the package SHA-256 and live in a
+    ``Thumbnails`` folder beside the MDB. Manual preview images are deliberately
+    left alone: portability fallback is attempted only when the linked filename
+    itself is the package hash.
+    """
+    if not target:
+        return target
+
+    original = target_to_local_path(target)
+    if original is not None and original.exists():
+        return target
+
+    hash_text = str(package_hash or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", hash_text):
+        return target
+
+    original_name = original.name if original is not None else ""
+    original_suffix = Path(original_name).suffix.lower()
+    original_stem = Path(original_name).stem.lower()
+    if original_stem != hash_text or original_suffix not in _THUMBNAIL_EXTENSIONS:
+        return target
+
+    thumbnail_dir = Path(mdb_path).parent / "Thumbnails"
+    if not thumbnail_dir.is_dir():
+        return target
+
+    # Prefer the exact old filename first, then accept another supported image
+    # extension with the same scanner hash name.
+    candidates = [thumbnail_dir / original_name]
+    candidates.extend(thumbnail_dir / f"{hash_text}{ext}" for ext in _THUMBNAIL_EXTENSIONS)
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate).casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        if candidate.is_file():
+            return str(candidate.resolve())
+
+    return target
+
+
 @dataclass
 class MDBData:
     path: Path
@@ -439,6 +487,7 @@ class MDBData:
     profile_options: List[str]
     file_locations: List[Tuple[str, str]]
     merge_profile_options: List[str]
+    profile_layouts: List[Tuple[str, str, str, str]]
     thumbnail_count: int
     casp_count: int
     package_history_count: int
@@ -511,6 +560,7 @@ class MDBWorkbook:
                 )
                 target = image_value if looks_like_image_path else (hyperlinks.get(image_ref, "") if image_ref else "")
                 if target:
+                    target = _portable_thumbnail_target(path, target, record.get("Package Hash", ""))
                     record["_ThumbnailTarget"] = target
                     record["Thumbnail"] = "Yes"
                     thumbnail_count += 1
@@ -526,6 +576,8 @@ class MDBWorkbook:
             # virtually and get a physical worksheet column only on first save.
             if "Creator" not in headers:
                 headers.append("Creator")
+            if "Converter" not in headers:
+                headers.append("Converter")
             if "CC Magic Profiles" not in headers:
                 headers.append("CC Magic Profiles")
             if "File Location" not in headers:
@@ -570,7 +622,7 @@ class MDBWorkbook:
                 if ea_status:
                     record["EA Resource Status"] = ea_status
 
-            status_options, library_options, profile_options, file_locations, merge_profile_options = self._load_settings(zf, sheets, shared)
+            status_options, library_options, profile_options, file_locations, merge_profile_options, profile_layouts = self._load_settings(zf, sheets, shared)
             # Older workbooks may not yet have a persisted profile registry.
             # Always include profile names already assigned to packages so the UI
             # can manage them, then persist the registry on the next profile save.
@@ -616,6 +668,7 @@ class MDBWorkbook:
             profile_options=profile_options,
             file_locations=file_locations,
             merge_profile_options=merge_profile_options,
+            profile_layouts=profile_layouts,
             thumbnail_count=thumbnail_count,
             casp_count=casp_count,
             package_history_count=package_history_count,
@@ -633,6 +686,7 @@ class MDBWorkbook:
         delete_rows: Optional[Iterable[int]] = None,
         file_locations: Optional[List[Tuple[str, str]]] = None,
         merge_profile_options: Optional[List[str]] = None,
+        profile_layouts: Optional[List[Tuple[str, str, str, str]]] = None,
     ) -> SaveResult:
         """Safely write manual Library fields, registry changes, and staged record deletions."""
         clean: Dict[int, Dict[str, str]] = {}
@@ -720,9 +774,42 @@ class MDBWorkbook:
                 clean_file_locations.append((name, folder_path))
             clean_file_locations.sort(key=lambda item: item[0].casefold())
 
+        clean_profile_layouts: Optional[List[Tuple[str, str, str, str]]] = None
+        if profile_layouts is not None:
+            clean_profile_layouts = []
+            seen_layout_keys = set()
+            for raw_layout in profile_layouts:
+                if not isinstance(raw_layout, (tuple, list)) or len(raw_layout) < 4:
+                    raise ValueError(
+                        "Each Profile Layout entry must contain Profile, Package Hash, Package and File Location."
+                    )
+                profile = str(raw_layout[0] or "").strip()
+                package_hash = str(raw_layout[1] or "").strip().lower()
+                package_name = Path(str(raw_layout[2] or "").strip()).name
+                location_name = str(raw_layout[3] or "").strip()
+                if not profile or not location_name or (not package_hash and not package_name):
+                    raise ValueError(
+                        "Profile Layout entries require a Profile, File Location and package identity."
+                    )
+                identity = ("h:" + package_hash) if package_hash else ("p:" + package_name.casefold())
+                key = (profile.casefold(), identity)
+                if key in seen_layout_keys:
+                    raise ValueError(
+                        f"Duplicate Profile Layout entry for '{profile}' / '{package_name or package_hash}'."
+                    )
+                seen_layout_keys.add(key)
+                clean_profile_layouts.append((profile, package_hash, package_name, location_name))
+            clean_profile_layouts.sort(
+                key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
+            )
+
         if set(clean).intersection(delete_row_nums):
             raise ValueError("A record cannot have pending field edits and deletion in the same save.")
-        if not clean and not delete_row_nums and clean_profiles is None and clean_status_options is None and clean_file_locations is None and clean_merge_profiles is None:
+        if (
+            not clean and not delete_row_nums and clean_profiles is None
+            and clean_status_options is None and clean_file_locations is None
+            and clean_merge_profiles is None and clean_profile_layouts is None
+        ):
             raise ValueError("There are no changes to save.")
 
         path = Path(mdb.path)
@@ -772,7 +859,7 @@ class MDBWorkbook:
 
                     if clean:
                         needed_fields = {field for row_changes in clean.values() for field in row_changes}
-                        virtual_fields = {"Creator", "CC Magic Profiles", "File Location", "Merge Profiles"}
+                        virtual_fields = {"Creator", "Converter", "CC Magic Profiles", "File Location", "Merge Profiles"}
                         missing_required = [
                             field for field in needed_fields
                             if field not in header_to_col and field not in virtual_fields
@@ -785,7 +872,7 @@ class MDBWorkbook:
 
                         # Older workbooks may lack library-owned fields. Add only the fields
                         # actually being saved, preserving every existing column and value.
-                        for virtual_field in ("Creator", "CC Magic Profiles", "File Location", "Merge Profiles"):
+                        for virtual_field in ("Creator", "Converter", "CC Magic Profiles", "File Location", "Merge Profiles"):
                             if virtual_field in needed_fields and virtual_field not in header_to_col:
                                 next_col = max(header_to_col.values(), default=0) + 1
                                 header_to_col[virtual_field] = next_col
@@ -829,7 +916,11 @@ class MDBWorkbook:
 
                 settings_path = sheets.get(self.SETTINGS_SHEET)
                 patched_settings_xml = None
-                if clean_profiles is not None or clean_status_options is not None or clean_file_locations is not None or clean_merge_profiles is not None:
+                if (
+                    clean_profiles is not None or clean_status_options is not None
+                    or clean_file_locations is not None or clean_merge_profiles is not None
+                    or clean_profile_layouts is not None
+                ):
                     if not settings_path:
                         raise ValueError("This workbook does not contain a Settings sheet for its registries.")
                     patched_settings_xml = zin.read(settings_path).decode("utf-8")
@@ -896,6 +987,42 @@ class MDBWorkbook:
                         patched_settings_xml = self._patch_settings_file_locations_xml(
                             patched_settings_xml, clean_file_locations
                         )
+                    if clean_profile_layouts is not None:
+                        # G:J are reserved for Experimental Profile Layouts only when
+                        # unused or already carrying our exact headers. This keeps the
+                        # writer conservative around future/third-party Settings data.
+                        settings_rows = _read_sheet_rows(zin, settings_path, shared)
+                        settings_header = {}
+                        occupied_layout_cols = set()
+                        for row_num, values in settings_rows:
+                            if row_num == 1:
+                                settings_header = {col: value.strip() for col, value in values.items()}
+                            else:
+                                occupied_layout_cols.update(
+                                    col for col in (7, 8, 9, 10)
+                                    if str(values.get(col, "") or "").strip()
+                                )
+                        expected_layout_headers = {
+                            7: "Profile Layout Profile",
+                            8: "Profile Layout Package Hash",
+                            9: "Profile Layout Package",
+                            10: "Profile Layout File Location",
+                        }
+                        for col in (7, 8, 9, 10):
+                            existing_header = settings_header.get(col, "")
+                            if existing_header and existing_header != expected_layout_headers[col]:
+                                raise ValueError(
+                                    f"Settings column {col} is already used by '{existing_header}'. "
+                                    "Experimental Profile Layouts will not overwrite it."
+                                )
+                            if col in occupied_layout_cols and existing_header != expected_layout_headers[col]:
+                                raise ValueError(
+                                    f"Settings column {col} contains existing data without a Profile Layout header. "
+                                    "Experimental Profile Layouts will not overwrite it."
+                                )
+                        patched_settings_xml = self._patch_settings_profile_layouts_xml(
+                            patched_settings_xml, clean_profile_layouts
+                        )
 
                 with zipfile.ZipFile(tmp_path, "w") as zout:
                     for info in zin.infolist():
@@ -926,6 +1053,8 @@ class MDBWorkbook:
                     self._verify_file_locations(ztest, clean_file_locations)
                 if clean_merge_profiles is not None:
                     self._verify_merge_profile_registry(ztest, clean_merge_profiles)
+                if clean_profile_layouts is not None:
+                    self._verify_profile_layouts(ztest, clean_profile_layouts)
 
             try:
                 os.replace(tmp_path, path)
@@ -948,6 +1077,8 @@ class MDBWorkbook:
                 mdb.file_locations = list(clean_file_locations)
             if clean_merge_profiles is not None:
                 mdb.merge_profile_options = list(clean_merge_profiles)
+            if clean_profile_layouts is not None:
+                mdb.profile_layouts = list(clean_profile_layouts)
 
             return SaveResult(
                 backup_path=backup_path,
@@ -1204,20 +1335,28 @@ class MDBWorkbook:
                         f"Save verification failed for row {row_num}, field '{field}'."
                     )
 
-    def _load_settings(self, zf, sheets, shared) -> Tuple[List[str], List[str], List[str], List[Tuple[str, str]], List[str]]:
+    def _load_settings(
+        self, zf, sheets, shared
+    ) -> Tuple[
+        List[str], List[str], List[str], List[Tuple[str, str]], List[str],
+        List[Tuple[str, str, str, str]],
+    ]:
         path = sheets.get(self.SETTINGS_SHEET)
         if not path:
-            return [], [], [], [], []
+            return [], [], [], [], [], []
         status: List[str] = []
         library: List[str] = []
         profiles: List[str] = []
         file_locations: List[Tuple[str, str]] = []
         merge_profiles: List[str] = []
+        profile_layouts: List[Tuple[str, str, str, str]] = []
         seen_profiles = set()
         seen_merge_profiles = set()
         seen_location_names = set()
         has_file_location_headers = False
         has_merge_profile_header = False
+        has_profile_layout_headers = False
+        seen_profile_layouts = set()
         for row_num, values in _read_sheet_rows(zf, path, shared):
             if row_num == 1:
                 has_file_location_headers = (
@@ -1225,6 +1364,12 @@ class MDBWorkbook:
                     and values.get(5, "").strip() == "File Location Path"
                 )
                 has_merge_profile_header = values.get(6, "").strip() == "Merge Profiles"
+                has_profile_layout_headers = (
+                    values.get(7, "").strip() == "Profile Layout Profile"
+                    and values.get(8, "").strip() == "Profile Layout Package Hash"
+                    and values.get(9, "").strip() == "Profile Layout Package"
+                    and values.get(10, "").strip() == "Profile Layout File Location"
+                )
                 continue
             a = values.get(1, "").strip()
             b = values.get(2, "").strip()
@@ -1232,6 +1377,10 @@ class MDBWorkbook:
             location_name = values.get(4, "").strip() if has_file_location_headers else ""
             location_path = values.get(5, "").strip() if has_file_location_headers else ""
             merge_profile = values.get(6, "").strip() if has_merge_profile_header else ""
+            layout_profile = values.get(7, "").strip() if has_profile_layout_headers else ""
+            layout_hash = values.get(8, "").strip().lower() if has_profile_layout_headers else ""
+            layout_package = Path(values.get(9, "").strip()).name if has_profile_layout_headers else ""
+            layout_location = values.get(10, "").strip() if has_profile_layout_headers else ""
             if a:
                 status.append(a)
             if b:
@@ -1245,9 +1394,20 @@ class MDBWorkbook:
             if row_num > 1 and merge_profile and merge_profile.casefold() not in seen_merge_profiles:
                 seen_merge_profiles.add(merge_profile.casefold())
                 merge_profiles.append(merge_profile)
+            if layout_profile and layout_location and (layout_hash or layout_package):
+                identity = ("h:" + layout_hash) if layout_hash else ("p:" + layout_package.casefold())
+                layout_key = (layout_profile.casefold(), identity)
+                if layout_key not in seen_profile_layouts:
+                    seen_profile_layouts.add(layout_key)
+                    profile_layouts.append(
+                        (layout_profile, layout_hash, layout_package, layout_location)
+                    )
         file_locations.sort(key=lambda item: item[0].casefold())
         merge_profiles.sort(key=str.casefold)
-        return status, library, profiles, file_locations, merge_profiles
+        profile_layouts.sort(
+            key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
+        )
+        return status, library, profiles, file_locations, merge_profiles, profile_layouts
 
     def _patch_settings_status_xml(self, xml_text: str, statuses: List[str]) -> str:
         """Replace only the Status registry in Settings column A, preserving other columns."""
@@ -1647,6 +1807,145 @@ class MDBWorkbook:
         actual.sort(key=lambda item: item[0].casefold())
         if actual != expected:
             raise ValueError("Save verification failed for the File Location registry.")
+
+    def _patch_settings_profile_layouts_xml(
+        self, xml_text: str, layouts: List[Tuple[str, str, str, str]]
+    ) -> str:
+        """Persist Experimental Profile Layouts in Settings columns G:J."""
+        ET.register_namespace("", MAIN_NS)
+        root = ET.fromstring(xml_text)
+        sheet_data = root.find(f"{{{MAIN_NS}}}sheetData")
+        if sheet_data is None:
+            raise ValueError("Settings sheet has no sheetData element.")
+
+        rows = {}
+        for row in sheet_data.findall(f"{{{MAIN_NS}}}row"):
+            try:
+                rows[int(row.attrib.get("r", "0") or 0)] = row
+            except ValueError:
+                continue
+
+        def ensure_row(row_num: int):
+            row = rows.get(row_num)
+            if row is not None:
+                return row
+            row = ET.Element(f"{{{MAIN_NS}}}row", {"r": str(row_num)})
+            inserted = False
+            for idx, existing in enumerate(list(sheet_data)):
+                try:
+                    existing_num = int(existing.attrib.get("r", "0") or 0)
+                except ValueError:
+                    existing_num = 0
+                if existing_num > row_num:
+                    sheet_data.insert(idx, row)
+                    inserted = True
+                    break
+            if not inserted:
+                sheet_data.append(row)
+            rows[row_num] = row
+            return row
+
+        def set_cell(row_num: int, col: str, value: str):
+            row = ensure_row(row_num)
+            target_ref = f"{col}{row_num}"
+            old = None
+            style = None
+            for cell in list(row):
+                if cell.attrib.get("r", "") == target_ref:
+                    old = cell
+                    style = cell.attrib.get("s")
+                    break
+            if style is None:
+                previous_col = {"G": "F", "H": "G", "I": "H", "J": "I"}.get(col)
+                if previous_col:
+                    for cell in list(row):
+                        if cell.attrib.get("r", "") == f"{previous_col}{row_num}":
+                            style = cell.attrib.get("s")
+                            break
+            if old is not None:
+                row.remove(old)
+            if not value:
+                return
+            attrs = {"r": target_ref, "t": "inlineStr"}
+            if style:
+                attrs["s"] = style
+            cell = ET.Element(f"{{{MAIN_NS}}}c", attrs)
+            is_node = ET.SubElement(cell, f"{{{MAIN_NS}}}is")
+            t = ET.SubElement(
+                is_node,
+                f"{{{MAIN_NS}}}t",
+                {"{http://www.w3.org/XML/1998/namespace}space": "preserve"},
+            )
+            t.text = value
+            row.append(cell)
+            row[:] = sorted(list(row), key=lambda item: _col_num(item.attrib.get("r", "")))
+
+        headers = {
+            "G": "Profile Layout Profile",
+            "H": "Profile Layout Package Hash",
+            "I": "Profile Layout Package",
+            "J": "Profile Layout File Location",
+        }
+        for col, value in headers.items():
+            set_cell(1, col, value)
+
+        max_existing = max(rows.keys(), default=1)
+        max_needed = max(max_existing, len(layouts) + 1)
+        for row_num in range(2, max_needed + 1):
+            idx = row_num - 2
+            profile, package_hash, package_name, location_name = (
+                layouts[idx] if idx < len(layouts) else ("", "", "", "")
+            )
+            set_cell(row_num, "G", profile)
+            set_cell(row_num, "H", package_hash)
+            set_cell(row_num, "I", package_name)
+            set_cell(row_num, "J", location_name)
+
+        dim = root.find(f"{{{MAIN_NS}}}dimension")
+        if dim is not None:
+            current_ref = dim.attrib.get("ref", "A1:J1")
+            end = current_ref.split(":")[-1]
+            match = re.match(r"([A-Z]+)", end)
+            last_col = match.group(1) if match else "J"
+            if _col_num(last_col + "1") < _col_num("J1"):
+                last_col = "J"
+            last_row = max(max_existing, len(layouts) + 1)
+            dim.set("ref", f"A1:{last_col}{last_row}")
+        return ET.tostring(root, encoding="unicode")
+
+    def _verify_profile_layouts(
+        self, zf: zipfile.ZipFile, expected: List[Tuple[str, str, str, str]]
+    ) -> None:
+        shared = _load_shared_strings(zf)
+        sheets = _sheet_paths(zf)
+        path = sheets.get(self.SETTINGS_SHEET)
+        if not path:
+            raise ValueError("Save verification could not find the Settings sheet.")
+        actual: List[Tuple[str, str, str, str]] = []
+        rows = _read_sheet_rows(zf, path, shared)
+        headers_ok = False
+        for row_num, values in rows:
+            if row_num == 1:
+                headers_ok = (
+                    values.get(7, "").strip() == "Profile Layout Profile"
+                    and values.get(8, "").strip() == "Profile Layout Package Hash"
+                    and values.get(9, "").strip() == "Profile Layout Package"
+                    and values.get(10, "").strip() == "Profile Layout File Location"
+                )
+                continue
+            if not headers_ok:
+                continue
+            profile = values.get(7, "").strip()
+            package_hash = values.get(8, "").strip().lower()
+            package_name = Path(values.get(9, "").strip()).name
+            location_name = values.get(10, "").strip()
+            if profile and location_name and (package_hash or package_name):
+                actual.append((profile, package_hash, package_name, location_name))
+        actual.sort(
+            key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
+        )
+        if actual != expected:
+            raise ValueError("Save verification failed for Experimental Profile Layouts.")
 
     def _count_real_rows(self, zf, path: Optional[str], shared: List[str]) -> int:
         if not path:

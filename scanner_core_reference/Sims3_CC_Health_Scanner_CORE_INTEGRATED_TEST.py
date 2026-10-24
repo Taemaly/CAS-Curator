@@ -20388,15 +20388,15 @@ if SCAN_SOURCE_MODE == "THUMBNAIL_BACKFILL":
     sys.exit(0)
 
 # Exact duplicate routing is deliberately limited to bulk Big_Review scans.
-# Manual Sims3_CC_for_Review rescans must keep their normal routing so known
-# packages can still be re-tested without being diverted as duplicates.
+# Duplicate detection is scoped to the CURRENT source batch only.  Do not seed
+# it from Package Hash values already stored in the MDB: the normal workflow is
+# Run Scan -> Preview Routing -> Run Routing, so a freshly scanned package is
+# already present in the MDB and would otherwise be misclassified as a duplicate
+# of itself.  The first byte-for-byte copy in this source batch keeps its normal
+# route; later copies in the same batch are routed as duplicates.
 if SCAN_SOURCE_MODE == "BIG_REVIEW_BATCH":
-    seen_exact_package_hashes = load_existing_scanned_package_hashes()
-    print(
-        "DUPLICATE HASH INDEX:",
-        f"{len(seen_exact_package_hashes):,}",
-        "existing SHA256 package hash(es)"
-    )
+    seen_exact_package_hashes = set()
+    print("DUPLICATE HASH ROUTING: CURRENT SOURCE BATCH ONLY")
 else:
     seen_exact_package_hashes = set()
     print("DUPLICATE HASH ROUTING: OFF FOR INDIVIDUAL SCAN")
@@ -20408,17 +20408,13 @@ files_to_move = []
 duplicates = []
 exact_duplicate_paths = set()
 # GUI dry-run preview uses its own route records so duplicate detection never
-# replaces/suppresses the normal CC category shown to the user.
+# replaces/suppresses the normal CC category shown to the user.  Like real
+# routing, duplicate status is scoped to the current source batch; MDB history
+# must not make a package duplicate itself immediately after Run Scan.
 routing_preview_records = []
-preview_existing_package_hashes = set()
 preview_seen_package_hashes = set()
 if ROUTING_PREVIEW:
-    try:
-        preview_existing_package_hashes = load_existing_scanned_package_hashes()
-        preview_seen_package_hashes = set(preview_existing_package_hashes)
-        print("ROUTING PREVIEW DUPLICATE INDEX:", len(preview_existing_package_hashes), "existing SHA256 package hash(es)")
-    except Exception as e:
-        print("ROUTING PREVIEW DUPLICATE INDEX WARNING:", e)
+    print("ROUTING PREVIEW DUPLICATE INDEX: current source batch only")
 import time
 print("")
 print("SCAN SESSION:")
@@ -21119,36 +21115,6 @@ for root, dirs, files in os.walk(folder):
 
 
                     # -------------------------
-                    # HIGH / EXTREME RISK CC
-                    # -------------------------
-
-                    elif (
-                        content_type == "Custom Content"
-                        and not possible_skin
-                        and overall_risk in (
-                            "High",
-                            "Extreme"
-                        )
-                    ):
-
-                        risk_folder = overall_risk.upper() + "_RISK"
-
-                        if cc_type and cc_type != "Unknown":
-
-                            move_category = os.path.join(
-                                risk_folder,
-                                "Custom_Sim" if cc_type == "Custom Sim" else cc_type
-                            )
-
-                        else:
-
-                            move_category = os.path.join(
-                                risk_folder,
-                                "Unknown"
-                            )
-
-
-                    # -------------------------
                     # EA MATCH
                     # -------------------------
 
@@ -21211,30 +21177,29 @@ for root, dirs, files in os.walk(folder):
                         )
 
                     # -------------------------
-                    # SAFE / MODERATE
+                    # NORMAL NON-BROKEN CUSTOM CONTENT
                     # -------------------------
+                    # Risk Score / textual Risk are review information only.
+                    # They must never decide the physical routing destination.
+                    # Packages with direct CASP identity are grouped under
+                    # CASP_OBSERVED; other identified custom content is grouped
+                    # under CUSTOM_CONTENT. Unknown custom content was handled
+                    # above by UNIDENTIFIED_CC.
 
                     elif (
                         move_category is None
-                        and overall_risk in [
-                            "Safe",
-                            "Moderate"
-                        ]
+                        and content_type == "Custom Content"
+                        and cc_type
+                        and cc_type != "Unknown"
                     ):
 
-                        if cc_type and cc_type != "Unknown":
+                        casp_observed = bool(str(data[26] or "").strip())
+                        route_root = "CASP_OBSERVED" if casp_observed else "CUSTOM_CONTENT"
 
-                            move_category = os.path.join(
-                                "SAFE_MODERATE",
-                                "Custom_Sim" if cc_type == "Custom Sim" else cc_type
-                            )
-
-                        else:
-
-                            move_category = os.path.join(
-                                "SAFE_MODERATE",
-                                "Unknown"
-                            )
+                        move_category = os.path.join(
+                            route_root,
+                            "Custom_Sim" if cc_type == "Custom Sim" else cc_type
+                        )
 
 
                     # -------------------------

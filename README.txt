@@ -88,6 +88,8 @@ Table drag-fill:
 - Current File Location is intentionally read-only in Table view, so drag-fill does not apply to it.
 - Planned Location supports drag-fill only for rows that meet the same Current Profile/membership conditions as the Edit tab.
 
+
+
 Table bulk clear:
 - Populated drag-fill remains available for copying values down.
 - To clear one editable field across several packages, Ctrl/Shift-select rows in that column and press Delete.

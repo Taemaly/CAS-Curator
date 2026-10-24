@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import zipfile
@@ -46,11 +47,14 @@ from PySide6.QtWidgets import (
     QFormLayout,
     QFrame,
     QGridLayout,
+    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
     QListView,
+    QListWidget,
+    QListWidgetItem,
     QLineEdit,
     QMainWindow,
     QMenu,
@@ -59,8 +63,10 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QScrollArea,
+    QScrollBar,
     QSizePolicy,
     QSplitter,
+    QSplitterHandle,
     QStyledItemDelegate,
     QStyle,
     QStyleFactory,
@@ -93,6 +99,7 @@ from random_sim_exporter import (
     export_collection,
     package_identity,
 )
+from attribution_lookup import lookup_attribution, clean_package_terms, clean_search_query
 from random_sim_usage import (
     default_usage_registry_path,
     dependency_usages_for_record,
@@ -117,7 +124,9 @@ VERSION = (
     if IS_PUBLIC_BUILD else
     "v0.4.63 - DEV Scanner Log + Table Panel Resize TEST"
 )
-
+BUILD_DATE = "23 October 2026"
+PROJECT_CREATOR = "Taemaly"
+PROJECT_SOURCE_URL = "https://github.com/Taemaly/CAS-Curator"
 
 
 from zip_tools import (
@@ -159,19 +168,25 @@ PUBLIC_THEME_ORDER = [
 ]
 PUBLIC_THEME_NAMES = set(PUBLIC_THEME_ORDER)
 
-EDITABLE_FIELDS = {"Image", "Status", "Creator", "File Location", "CC Magic Profiles", "Notes"}
+PROFILE_LOCATION_FIELD = "Planned Profile Location"
+# Inline Table editing is deliberately narrower than Edit-tab editing.
+# Current File Location is physical truth and is read-only in the Table.
+EDITABLE_FIELDS = {"Image", "Status", "Creator", "Converter", "CC Magic Profiles", "Notes", PROFILE_LOCATION_FIELD}
 # Public Status choices are deliberately separate from the legacy Settings-sheet
 # values. The workbook is not migrated here; existing values remain untouched
 # until a previewed, backed-up migration is implemented.
 PUBLIC_STATUS_OPTIONS = ["In Game Use", "To Keep", "To Review"]
 
-# The normal interface stays deliberately compact. Advanced and Experimental are
-# opt-in display layers only: they never change scanner logic, Routing decisions,
-# or package files. The workbook data remains intact when either layer is off.
+# The normal interface stays deliberately compact. Advanced is an opt-in display
+# layer. Experimental adds provisional display metadata plus the explicitly invoked
+# Profile Layouts workflow. Experimental metadata never changes scanner logic or
+# Routing; Profile Layouts move files only after a dedicated preview/confirmation.
+# Workbook data remains intact when either layer is turned off.
 PUBLIC_BASIC_FIELDS = {
     "Package",
     "Status",
     "Creator",
+    "Converter",
     "Health Status",
     "CC Type",
     "Risk Score",
@@ -187,7 +202,6 @@ PUBLIC_BASIC_FIELDS = {
 PUBLIC_ADVANCED_FIELDS = {
     "Health Issues",
     "CASP Instance IDs",
-    "Risk",
     "HQ Warning",
     "Poly Warning",
     "Biggest Texture",
@@ -200,6 +214,7 @@ PUBLIC_EXPERIMENTAL_FIELDS = {
     "Skin Type",
     "EA Resource Status",
     "Outfit Category",
+    PROFILE_LOCATION_FIELD,
 }
 # Package Format is deliberately normal, understandable side-panel metadata,
 # but it is too sparse to spend a Table column on. Keep it out of the column
@@ -231,23 +246,23 @@ def _available_public_columns_for_mdb(mdb) -> List[str]:
     """Return stored + live virtual Library columns in a stable user-facing order."""
     stored = list(getattr(mdb, "headers", []) or [])
     result = []
-    for field in stored + ["CC Magic Import"]:
+    for field in stored + ["CC Magic Import", PROFILE_LOCATION_FIELD]:
         if field not in result and _public_field_visible(field):
             result.append(field)
     return result
 
 
 _BASE_DEFAULT_COLUMNS = [
-    "#", "Package", "Thumbnail", "Creator", "Status", "Health Status", "Health Issues",
+    "#", "Package", "Thumbnail", "Creator", "Converter", "Status", "Health Status", "Health Issues",
     "CC Type", "Subtype", "CASP Instance IDs", "Risk", "Risk Score", "Highest Polys",
-    "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes", "Last Scanned",
+    "File Location", PROFILE_LOCATION_FIELD, "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes", "Last Scanned",
 ]
 DEFAULT_COLUMNS = [field for field in _BASE_DEFAULT_COLUMNS if _public_field_visible(field)]
 
 _BASE_SEARCH_FIELDS = [
     "Package", "Status", "Health Status", "Health Issues", "CC Type",
     "Subtype", "Age", "Gender", "Outfit Category", "CASP Instance IDs", "Risk", "Risk Score", "EA Resource Status",
-    "Creator", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes", "Package Hash", "Normalized Package",
+    "Creator", "Converter", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes", "Package Hash", "Normalized Package",
     "Original Source Path",
 ]
 SEARCH_FIELDS = [
@@ -259,7 +274,7 @@ _BASE_SUMMARY_FIELDS = [
     # Normal package summary first. CC Type / Highest Polys are skipped below
     # because they already live in the top at-a-glance badges.
     "Health Status", "Risk Score", "Age", "Gender", "Package Format",
-    "Creator", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes",
+    "Creator", "Converter", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes",
     # Opt-in technical / provisional details follow when their layer is enabled.
     "Health Issues", "Risk", "HQ Warning", "Poly Warning", "Biggest Texture",
     "CASP Instance IDs", "Duplicate Files", "Last Scanned", "Package Hash",
@@ -269,7 +284,7 @@ _BASE_SUMMARY_FIELDS = [
 SUMMARY_FIELDS = [field for field in _BASE_SUMMARY_FIELDS if _public_field_visible(field)]
 
 # Permanent quick filters stay deliberately small. More specific metadata is
-# available through + Add Filter… so the top Library panel does not grow a new
+# available through + Add Quick Filter… so the top Library panel does not grow a new
 # control for every MDB column.
 _BASE_FILTER_FIELDS = [
     ("Status", "Status"),
@@ -297,17 +312,31 @@ COLUMN_FOLD_GROUPS = {
         "HQ Warning", "Poly Warning", "Biggest Texture", "Highest Polys",
     ],
     "Organise": [
-        "Creator", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles",
+        "Creator", "Converter", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles",
         "Notes", "Last Scanned", "Package Hash",
     ],
 }
 
 
-DISPLAY_FIELD_NAMES = {"CC Magic Profiles": "Profiles", "Merge Profiles": "Merge Profiles", "CC Magic Import": "CC Magic Import"}
+DISPLAY_FIELD_NAMES = {
+    "CC Magic Profiles": "Profile Membership",
+    "Merge Profiles": "Merge Profiles",
+    "CC Magic Import": "CC Magic Import",
+    "File Location": "Current File Location",
+    PROFILE_LOCATION_FIELD: "Planned Location",
+}
 
 
 def _display_field_name(field: str) -> str:
     return DISPLAY_FIELD_NAMES.get(field, field)
+
+
+def _storage_field_name(display_name: str) -> str:
+    """Map a user-facing column label back to its internal field key."""
+    for field, label in DISPLAY_FIELD_NAMES.items():
+        if label == display_name:
+            return field
+    return display_name
 
 
 def _subtype_basis_label(record: Dict[str, str]) -> str:
@@ -389,17 +418,37 @@ def _unique_cc_magic_profiles(records) -> List[str]:
     return sorted(result, key=str.casefold)
 
 
+_CC_TYPE_DISPLAY_ALIASES = {
+    "top": "Tops",
+    "tops": "Tops",
+    "bottom": "Bottoms",
+    "bottoms": "Bottoms",
+    "body": "Full Body",
+    "full body": "Full Body",
+    "fullbody": "Full Body",
+}
+
+
 def _cc_type_key(value: str) -> str:
-    """Case-insensitive key for CC Type filters without changing MDB data."""
-    return str(value or "").strip().casefold()
+    """Canonical CC Type key for filters without changing MDB/scanner data."""
+    clean = str(value or "").strip()
+    key = clean.casefold()
+    if key in {"top", "tops"}:
+        return "top"
+    if key in {"bottom", "bottoms"}:
+        return "bottom"
+    if key in {"body", "full body", "fullbody"}:
+        return "body"
+    return key
 
 
 def _cc_type_label(value: str) -> str:
-    """Clean display label for CC Type values used only by filter controls."""
+    """Friendly user-facing CC Type label without changing stored MDB values."""
     clean = str(value or "").strip()
-    if clean.casefold() == "unknown":
+    key = clean.casefold()
+    if key == "unknown":
         return "Unknown"
-    return clean
+    return _CC_TYPE_DISPLAY_ALIASES.get(key, clean)
 
 
 def _unique_cc_type_values(records) -> list[str]:
@@ -420,6 +469,7 @@ COLUMN_WIDTHS = {
     "#": 54,
     "Package": 340,
     "Creator": 160,
+    "Converter": 160,
     "Thumbnail": 86,
     "Status": 100,
     "Health Status": 112,
@@ -873,6 +923,25 @@ class LibraryTableModel(QAbstractTableModel):
         self.columns: List[str] = list(DEFAULT_COLUMNS)
         self.pending_changes: Dict[int, Dict[str, str]] = {}
         self.pending_deletions: set[int] = set()
+        self.virtual_value_provider = None
+        self.virtual_editable_provider = None
+        self.virtual_setter = None
+        self.virtual_tooltip_provider = None
+        self.virtual_dirty_provider = None
+
+    def set_virtual_field_handlers(
+        self,
+        value_provider=None,
+        editable_provider=None,
+        setter=None,
+        tooltip_provider=None,
+        dirty_provider=None,
+    ):
+        self.virtual_value_provider = value_provider
+        self.virtual_editable_provider = editable_provider
+        self.virtual_setter = setter
+        self.virtual_tooltip_provider = tooltip_provider
+        self.virtual_dirty_provider = dirty_provider
 
     def set_pending_changes(self, pending_changes: Dict[int, Dict[str, str]]):
         # Keep the same shared dict as MainWindow so the table is only an editor/view,
@@ -908,6 +977,11 @@ class LibraryTableModel(QAbstractTableModel):
     def effective_value(self, row: int, field: str) -> str:
         if not (0 <= row < len(self.records)):
             return ""
+        if field == PROFILE_LOCATION_FIELD and self.virtual_value_provider is not None:
+            try:
+                return str(self.virtual_value_provider(row, field) or "")
+            except Exception:
+                return ""
         rec = self.records[row]
         excel_row = self._excel_row(rec)
         if excel_row:
@@ -920,7 +994,14 @@ class LibraryTableModel(QAbstractTableModel):
         if not (0 <= row < len(self.records)):
             return False
         excel_row = self._excel_row(self.records[row])
-        return bool(excel_row and self.pending_changes.get(excel_row))
+        normal_dirty = bool(excel_row and self.pending_changes.get(excel_row))
+        virtual_dirty = False
+        if self.virtual_dirty_provider is not None:
+            try:
+                virtual_dirty = bool(self.virtual_dirty_provider(row))
+            except Exception:
+                virtual_dirty = False
+        return normal_dirty or virtual_dirty
 
     def data(self, index: QModelIndex, role=Qt.DisplayRole):
         if not index.isValid() or index.row() >= len(self.records):
@@ -932,6 +1013,8 @@ class LibraryTableModel(QAbstractTableModel):
         if role == Qt.DisplayRole:
             if field == "#":
                 return str(index.row() + 1)
+            if field == "CC Type":
+                value = _cc_type_label(value)
             if "\n" in value:
                 parts = value.splitlines()
                 return parts[0] + (f"  (+{len(parts)-1})" if len(parts) > 1 else "")
@@ -940,12 +1023,19 @@ class LibraryTableModel(QAbstractTableModel):
             return value
         if role == Qt.ToolTipRole:
             if field == "#" and self.is_row_dirty(index.row()):
-                return "Unsaved manual-field changes in this row"
+                return "Unsaved manual/Profile Location changes in this row"
+            if field == PROFILE_LOCATION_FIELD and self.virtual_tooltip_provider is not None:
+                try:
+                    return self.virtual_tooltip_provider(index.row(), field)
+                except Exception:
+                    pass
             if field in EDITABLE_FIELDS:
                 suffix = "\n\nDouble-click to edit. Changes stay unsaved until you use Save Changes."
                 return (value or "(empty)") + suffix
+            if field == "File Location":
+                return (value or "(empty)") + "\n\nCurrent File Location is read-only in the Table. Route first, or use Edit to correct the recorded physical location."
             if field != "#" and value:
-                return value
+                return _cc_type_label(value) if field == "CC Type" else value
         if role == Qt.UserRole:
             return rec
         if role == DIRTY_ROLE:
@@ -958,13 +1048,27 @@ class LibraryTableModel(QAbstractTableModel):
 
     def flags(self, index: QModelIndex):
         flags = super().flags(index)
-        if index.isValid() and self.columns[index.column()] in EDITABLE_FIELDS:
+        if not index.isValid():
+            return flags
+        field = self.columns[index.column()]
+        if field in EDITABLE_FIELDS:
             rec = self.records[index.row()] if index.row() < len(self.records) else {}
             try:
                 excel_row = int(rec.get("_ExcelRow", "0") or 0)
             except (TypeError, ValueError):
                 excel_row = 0
-            if excel_row not in self.pending_deletions:
+            if excel_row in self.pending_deletions:
+                return flags
+            if field == PROFILE_LOCATION_FIELD:
+                allowed = False
+                if self.virtual_editable_provider is not None:
+                    try:
+                        allowed = bool(self.virtual_editable_provider(index.row(), field))
+                    except Exception:
+                        allowed = False
+                if allowed:
+                    flags |= Qt.ItemIsEditable
+            else:
                 flags |= Qt.ItemIsEditable
         return flags
 
@@ -982,6 +1086,22 @@ class LibraryTableModel(QAbstractTableModel):
         if not excel_row or excel_row in self.pending_deletions:
             return False
         value = "" if value is None else str(value)
+
+        if field == PROFILE_LOCATION_FIELD:
+            if self.virtual_editable_provider is None or self.virtual_setter is None:
+                return False
+            try:
+                if not self.virtual_editable_provider(row, field):
+                    return False
+                changed = bool(self.virtual_setter(row, field, value))
+            except Exception:
+                return False
+            if not changed:
+                return False
+            self.notify_row_changed(row)
+            self.manualFieldEdited.emit(row, field, value)
+            return True
+
         row_pending = dict(self.pending_changes.get(excel_row, {}))
         if value == rec.get(field, ""):
             row_pending.pop(field, None)
@@ -1011,6 +1131,25 @@ class LibraryTableModel(QAbstractTableModel):
         value = "" if value is None else str(value)
         changed_rows: List[int] = []
         seen = set()
+
+        if field == PROFILE_LOCATION_FIELD:
+            if self.virtual_editable_provider is None or self.virtual_setter is None:
+                return []
+            for row in source_rows:
+                if row in seen or not (0 <= row < len(self.records)):
+                    continue
+                seen.add(row)
+                try:
+                    if not self.virtual_editable_provider(row, field):
+                        continue
+                    if self.effective_value(row, field) == value:
+                        continue
+                    if self.virtual_setter(row, field, value):
+                        changed_rows.append(row)
+                except Exception:
+                    continue
+            return changed_rows
+
         for row in source_rows:
             if row in seen or not (0 <= row < len(self.records)):
                 continue
@@ -1041,7 +1180,13 @@ class LibraryTableModel(QAbstractTableModel):
                 return _display_field_name(field)
             if role == Qt.ToolTipRole and field in EDITABLE_FIELDS:
                 label = _display_field_name(field)
-                return f"{label} — double-click a cell to edit"
+                if field == "CC Magic Profiles":
+                    return (
+                        "Profile Membership — shows every Profile this package belongs to. "
+                        "It does not change when Current Profile changes. "
+                        "Double-click to add another Profile; use Delete to clear memberships only after confirmation."
+                    )
+                return f"{label} — double-click to edit; drag a populated value down to copy it, or select rows in this column and press Delete to clear"
         return super().headerData(section, orientation, role)
 
     def record(self, row: int) -> Dict[str, str]:
@@ -1091,7 +1236,7 @@ class LibraryFilterProxy(QSortFilterProxyModel):
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
 
     def set_column_filters(self, filters: List[Dict[str, str]]):
-        """Set user-added filters from the universal + Add Filter… control."""
+        """Set user-added filters from the universal + Add Quick Filter… control."""
         self.beginFilterChange()
         self.column_filters = [dict(item) for item in (filters or [])]
         self.endFilterChange(QSortFilterProxyModel.Direction.Rows)
@@ -1284,15 +1429,25 @@ class RowOutlineDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
         field = index.model().headerData(index.column(), Qt.Horizontal, Qt.DisplayRole)
+        field = _storage_field_name(field)
         if field == "Profiles":
             field = "CC Magic Profiles"
-        if field in ("Status", "File Location", "CC Magic Profiles"):
+        if field in ("Status", "File Location", "CC Magic Profiles", PROFILE_LOCATION_FIELD):
             editor = QComboBox(parent)
-            editor.addItem("")
             options = self.options_provider(field) if self.options_provider else []
-            editor.addItems([str(v) for v in options if str(v)])
             if field == "CC Magic Profiles":
-                editor.setToolTip("Choose an existing Profile. Free typing is disabled in the table.")
+                editor.addItem("— Add Profile —", "")
+                for value in options:
+                    value = str(value or "").strip()
+                    if value:
+                        editor.addItem(value, value)
+                editor.setToolTip(
+                    "Choose a Profile to ADD to this package. Existing Profile memberships are preserved. "
+                    "Use Delete on the Profile Membership column if you intentionally want to clear memberships."
+                )
+            else:
+                editor.addItem("")
+                editor.addItems([str(v) for v in options if str(v)])
             editor.activated.connect(lambda *_: self._commit_combo(editor))
             return editor
         if field == "Notes":
@@ -1308,13 +1463,16 @@ class RowOutlineDelegate(QStyledItemDelegate):
 
     def setEditorData(self, editor, index):
         field = index.model().headerData(index.column(), Qt.Horizontal, Qt.DisplayRole)
+        field = _storage_field_name(field)
         if field == "Profiles":
             field = "CC Magic Profiles"
         value = index.model().data(index, Qt.EditRole) or ""
-        if field in ("Status", "File Location", "CC Magic Profiles") and isinstance(editor, QComboBox):
-            # Preserve an existing multi-profile value visually without enabling
-            # free text. Choosing a list item replaces the cell with that Profile;
-            # fill-down can then propagate the exact assignment to displayed rows.
+        if field in ("Status", "File Location", "CC Magic Profiles", PROFILE_LOCATION_FIELD) and isinstance(editor, QComboBox):
+            if field == "CC Magic Profiles":
+                # The cell itself already displays all memberships. The editor is
+                # intentionally an ADD control so choosing B never removes A.
+                editor.setCurrentIndex(0)
+                return
             if value and editor.findText(value) < 0:
                 editor.insertItem(1, value)
             editor.setCurrentText(value)
@@ -1327,13 +1485,20 @@ class RowOutlineDelegate(QStyledItemDelegate):
 
     def setModelData(self, editor, model, index):
         field = model.headerData(index.column(), Qt.Horizontal, Qt.DisplayRole)
+        field = _storage_field_name(field)
         if field == "Profiles":
             field = "CC Magic Profiles"
-        if field in ("Status", "File Location") and isinstance(editor, QComboBox):
+        if field in ("Status", "File Location", PROFILE_LOCATION_FIELD) and isinstance(editor, QComboBox):
             model.setData(index, editor.currentText(), Qt.EditRole)
             return
         if field == "CC Magic Profiles" and isinstance(editor, QComboBox):
-            model.setData(index, _normalise_cc_magic_profiles(editor.currentText()), Qt.EditRole)
+            selected = str(editor.currentData() or "").strip()
+            if not selected:
+                return
+            existing = _split_cc_magic_profiles(model.data(index, Qt.EditRole) or "")
+            if selected.casefold() not in {p.casefold() for p in existing}:
+                existing.append(selected)
+            model.setData(index, _normalise_cc_magic_profiles("; ".join(existing)), Qt.EditRole)
             return
         if field == "Notes" and isinstance(editor, QLineEdit):
             model.setData(index, editor.text(), Qt.EditRole)
@@ -1449,7 +1614,7 @@ class GalleryDelegate(QStyledItemDelegate):
         painter.drawText(name_rect, Qt.TextWordWrap | Qt.AlignTop | Qt.AlignLeft, display_name)
 
         health = rec.get("Health Status", "") or "—"
-        cc_type = rec.get("CC Type", "") or "—"
+        cc_type = _cc_type_label(rec.get("CC Type", "")) or "—"
         badge_rect = QRect(outer.left() + 9, outer.bottom() - 27, outer.width() - 18, 20)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor(self.theme["badge"]))
@@ -1472,8 +1637,90 @@ class GalleryDelegate(QStyledItemDelegate):
         painter.restore()
 
 
+class FrozenPackageTableView(QTableView):
+    """Frozen #/Package strip that mirrors the main table's row-selection outline."""
+
+    def __init__(self, theme: Dict[str, str], parent=None):
+        super().__init__(parent)
+        self.theme = theme
+
+    def set_theme(self, theme: Dict[str, str]):
+        self.theme = theme
+        self.viewport().update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        selection = self.selectionModel()
+        if not selection:
+            return
+        rows = selection.selectedRows()
+        if not rows:
+            return
+        painter = QPainter(self.viewport())
+        pen = QPen(QColor(self.theme.get("selection", "#4A90E2")))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        x1 = 0
+        x2 = self.viewport().width() - 1
+        for idx in rows:
+            row_rect = self.visualRect(idx)
+            if not row_rect.isValid():
+                continue
+            top = row_rect.top() + 1
+            bottom = row_rect.bottom() - 1
+            painter.drawLine(x1, top, x2, top)
+            painter.drawLine(x1, bottom, x2, bottom)
+            painter.drawLine(x1, top, x1, bottom)
+
+
+class ResizeAwareFrame(QFrame):
+    resized = Signal()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
+
+
+class DetailPanelSplitter(QSplitter):
+    detailPanelToggled = Signal(bool)
+
+    def __init__(self, orientation=Qt.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.detail_panel_collapsed = False
+        self.last_detail_panel_width = 353
+
+    def _refresh_handle(self):
+        # Compatibility hook used by the main window.  The collapse control now
+        # lives inside the existing Table/Gallery top row instead of on the
+        # splitter itself, so there is no overlay geometry to maintain here.
+        pass
+
+    def set_detail_panel_collapsed(self, collapsed: bool):
+        collapsed = bool(collapsed)
+        sizes = self.sizes()
+        total = sum(sizes) or max(1, self.width())
+        if len(sizes) >= 2 and sizes[1] > 0:
+            self.last_detail_panel_width = sizes[1]
+        self.detail_panel_collapsed = collapsed
+        if collapsed:
+            self.setSizes([max(1, total), 0])
+        else:
+            wanted = max(300, int(self.last_detail_panel_width or 353))
+            wanted = min(720, wanted)
+            if total > 1:
+                wanted = min(wanted, max(1, total - 220))
+            self.setSizes([max(1, total - wanted), max(1, wanted)])
+        self.detailPanelToggled.emit(collapsed)
+
+    def toggle_detail_panel(self):
+        self.set_detail_panel_collapsed(not self.detail_panel_collapsed)
+
+
 class OutlineTableView(QTableView):
     fillRequested = Signal(QModelIndex, QModelIndex)
+    clearSelectedFieldRequested = Signal()
+    deleteRequested = Signal()
+    resized = Signal()
 
     def __init__(self, theme: Dict[str, str], parent=None):
         super().__init__(parent)
@@ -1485,6 +1732,23 @@ class OutlineTableView(QTableView):
     def set_theme(self, theme: Dict[str, str]):
         self.theme = theme
         self.viewport().update()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Delete and not (event.modifiers() & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier)):
+            if event.modifiers() & Qt.ShiftModifier:
+                # Explicit shortcut for staged Library-record deletion.
+                self.deleteRequested.emit()
+            else:
+                # Safer default: Delete clears the current editable field across
+                # the selected rows. Read-only columns are never cleared.
+                self.clearSelectedFieldRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.resized.emit()
 
     def _fill_handle_rect(self, index: QModelIndex) -> QRect:
         if not index.isValid() or not (index.flags() & Qt.ItemIsEditable):
@@ -1515,8 +1779,6 @@ class OutlineTableView(QTableView):
     def mouseMoveEvent(self, event):
         point = event.position().toPoint()
         if self._fill_drag_source.isValid():
-            # Keep long fills usable without changing the source mapping: gently
-            # scroll when the pointer reaches the lower edge of the viewport.
             if point.y() >= self.viewport().height() - 18:
                 bar = self.verticalScrollBar()
                 bar.setValue(min(bar.maximum(), bar.value() + 1))
@@ -1597,6 +1859,7 @@ class OutlineTableView(QTableView):
 
         painter.end()
 
+
 class ResponsiveThumbnailLabel(QLabel):
     """Draw the complete original image inside the *actual visible widget box*.
 
@@ -1660,6 +1923,453 @@ class ResponsiveThumbnailLabel(QLabel):
         painter.end()
 
 
+
+class AttributionLookupThread(QThread):
+    resultsReady = Signal(object)
+    lookupFailed = Signal(str)
+
+    def __init__(self, filename: str, creator: str, converter: str, query: str, parent=None):
+        super().__init__(parent)
+        self.filename = filename
+        self.creator = creator
+        self.converter = converter
+        self.query = query
+
+    def run(self):
+        try:
+            data = lookup_attribution(
+                self.filename,
+                creator=self.creator,
+                converter=self.converter,
+                base_query=self.query,
+            )
+            self.resultsReady.emit(data)
+        except Exception as exc:
+            self.lookupFailed.emit(str(exc))
+
+
+class AttributionLookupDialog(QDialog):
+    """Review-only web attribution helper. Nothing is saved automatically."""
+
+    def __init__(self, owner, source_rows: List[int]):
+        super().__init__(owner)
+        self.owner = owner
+        self.source_rows = [row for row in source_rows if 0 <= row < len(owner.model.records)]
+        self.worker = None
+        self.result_source_row = None
+        self.cache: Dict[tuple, Dict[str, object]] = {}
+        self.setWindowTitle("Find Creator / Converter Online")
+        self.resize(1040, 700)
+
+        root = QVBoxLayout(self)
+        intro = QLabel(
+            "CAS Curator prepares a cleaned search phrase for Google. Review the results in your browser, then enter any confirmed Creator and/or Converter below. Nothing is saved automatically."
+        )
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        package_row = QHBoxLayout()
+        package_row.addWidget(QLabel("Package:"))
+        self.package_combo = QComboBox()
+        for row in self.source_rows:
+            rec = owner.model.record(row)
+            name = str(rec.get("Package", "") or f"Row {row + 1}")
+            self.package_combo.addItem(name, row)
+        package_row.addWidget(self.package_combo, 1)
+        root.addLayout(package_row)
+
+        self.existing_label = QLabel()
+        self.existing_label.setWordWrap(True)
+        root.addWidget(self.existing_label)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Web search:"))
+        self.query_edit = QLineEdit()
+        self.query_edit.setClearButtonEnabled(True)
+        self.query_edit.returnPressed.connect(self._open_browser_search)
+        search_row.addWidget(self.query_edit, 1)
+        self.search_btn = QPushButton("Search")
+        self.search_btn.clicked.connect(self._start_search)
+        self.search_btn.hide()
+        self.browser_btn = QPushButton("Open Google Search")
+        self.browser_btn.clicked.connect(self._open_browser_search)
+        search_row.addWidget(self.browser_btn)
+        root.addLayout(search_row)
+
+        self.status_label = QLabel("Choose a package, open the Google search, then enter any confirmed attribution below.")
+        self.status_label.setWordWrap(True)
+        root.addWidget(self.status_label)
+
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs, 1)
+        self.tabs.hide()
+
+        suggestions_page = QWidget()
+        suggestions_layout = QVBoxLayout(suggestions_page)
+        self.suggestions_table = QTableWidget(0, 6)
+        self.suggestions_table.setHorizontalHeaderLabels(["Use", "Field", "Suggested name", "Confidence", "Evidence", "Source"])
+        self.suggestions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.suggestions_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.suggestions_table.setAlternatingRowColors(True)
+        self.suggestions_table.verticalHeader().setVisible(False)
+        sheader = self.suggestions_table.horizontalHeader()
+        sheader.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        sheader.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        sheader.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        sheader.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        sheader.setSectionResizeMode(4, QHeaderView.Stretch)
+        sheader.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        suggestions_layout.addWidget(self.suggestions_table)
+        self.tabs.addTab(suggestions_page, "Suggestions")
+
+        results_page = QWidget()
+        results_layout = QVBoxLayout(results_page)
+        self.results_table = QTableWidget(0, 3)
+        self.results_table.setHorizontalHeaderLabels(["Result", "Snippet", "Source"])
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.results_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.verticalHeader().setVisible(False)
+        rheader = self.results_table.horizontalHeader()
+        rheader.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        rheader.setSectionResizeMode(1, QHeaderView.Stretch)
+        rheader.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        results_layout.addWidget(self.results_table)
+        self.tabs.addTab(results_page, "Search Results")
+
+        manual_group = QGroupBox("Manual attribution from your review")
+        manual_layout = QHBoxLayout(manual_group)
+        manual_layout.addWidget(QLabel("Creator:"))
+        self.manual_creator_edit = QLineEdit()
+        self.manual_creator_edit.setPlaceholderText("Type creator name if you can confirm it")
+        manual_layout.addWidget(self.manual_creator_edit, 1)
+        manual_layout.addWidget(QLabel("Converter:"))
+        self.manual_converter_edit = QLineEdit()
+        self.manual_converter_edit.setPlaceholderText("Type converter name if explicitly credited")
+        manual_layout.addWidget(self.manual_converter_edit, 1)
+        self.manual_stage_btn = QPushButton("Stage Manual Values")
+        self.manual_stage_btn.setToolTip("Stage the names you entered. You still need to use Save Changes afterwards.")
+        self.manual_stage_btn.clicked.connect(self._stage_manual_values)
+        manual_layout.addWidget(self.manual_stage_btn)
+        root.addWidget(manual_group)
+
+        buttons = QHBoxLayout()
+        self.open_source_btn = QPushButton("Open Selected Source")
+        self.open_source_btn.clicked.connect(self._open_selected_source)
+        buttons.addWidget(self.open_source_btn)
+        self.open_source_btn.hide()
+        buttons.addStretch(1)
+        self.apply_btn = QPushButton("Stage Checked Suggestions")
+        self.apply_btn.setToolTip("Stage Creator/Converter edits in the Library. You still need to use Save Changes afterwards.")
+        self.apply_btn.clicked.connect(self._apply_checked)
+        buttons.addWidget(self.apply_btn)
+        self.apply_btn.hide()
+        self.close_btn = QPushButton("Close")
+        self.close_btn.clicked.connect(self.reject)
+        buttons.addWidget(self.close_btn)
+        root.addLayout(buttons)
+
+        self.package_combo.currentIndexChanged.connect(self._package_changed)
+        self._package_changed()
+
+    def _current_row(self) -> Optional[int]:
+        try:
+            row = int(self.package_combo.currentData())
+        except (TypeError, ValueError):
+            return None
+        return row if 0 <= row < len(self.owner.model.records) else None
+
+    def _package_changed(self, *_):
+        row = self._current_row()
+        if row is None:
+            return
+        rec = self.owner.model.record(row)
+        filename = str(rec.get("Package", "") or "")
+        creator = self.owner.model.effective_value(row, "Creator").strip()
+        converter = self.owner.model.effective_value(row, "Converter").strip()
+        self.existing_label.setText(
+            f"Current attribution — Creator: <b>{html.escape(creator or '(blank)')}</b> &nbsp;&nbsp; "
+            f"Converter: <b>{html.escape(converter or '(blank)')}</b>"
+        )
+        self.query_edit.setText(clean_package_terms(filename))
+        self.suggestions_table.setRowCount(0)
+        self.results_table.setRowCount(0)
+        self.manual_creator_edit.clear()
+        self.manual_converter_edit.clear()
+        self.result_source_row = None
+        self.status_label.setText("Click Open Google Search, review the results in your browser, then enter any confirmed Creator/Converter below.")
+
+    def _set_busy(self, busy: bool):
+        self.search_btn.setEnabled(not busy)
+        self.package_combo.setEnabled(not busy)
+        self.query_edit.setEnabled(not busy)
+        self.browser_btn.setEnabled(not busy)
+        self.apply_btn.setEnabled(not busy)
+        self.manual_stage_btn.setEnabled(not busy)
+        self.close_btn.setEnabled(not busy)
+        if busy:
+            self.status_label.setText("Searching the web… this can take a few seconds.")
+
+    def _start_search(self):
+        if self.worker is not None and self.worker.isRunning():
+            return
+        row = self._current_row()
+        if row is None:
+            return
+        rec = self.owner.model.record(row)
+        filename = str(rec.get("Package", "") or "").strip()
+        if not filename:
+            QMessageBox.information(self, "Find Attribution Online", "This row has no package filename to search.")
+            return
+        query = clean_search_query(self.query_edit.text())
+        if not query:
+            query = clean_package_terms(filename)
+        self.query_edit.setText(query)
+        if not query:
+            QMessageBox.information(
+                self,
+                "Find Attribution Online",
+                "No distinctive search terms remain after generic Sims/version words were removed. "
+                "Enter a creator, converter or item name in Web search and try again.",
+            )
+            return
+        creator = self.owner.model.effective_value(row, "Creator").strip()
+        converter = self.owner.model.effective_value(row, "Converter").strip()
+        cache_key = (filename.casefold(), creator.casefold(), converter.casefold(), query.casefold())
+        cached = self.cache.get(cache_key)
+        if cached is not None:
+            self.result_source_row = row
+            self._show_results(cached, cached_note="Showing cached results from this dialog session.")
+            return
+        self._set_busy(True)
+        self.suggestions_table.setRowCount(0)
+        self.results_table.setRowCount(0)
+        self.worker = AttributionLookupThread(filename, creator, converter, query, self)
+        self.worker.resultsReady.connect(lambda data, key=cache_key, source_row=row: self._search_finished(data, key, source_row))
+        self.worker.lookupFailed.connect(self._search_failed)
+        self.worker.finished.connect(lambda: self._set_busy(False))
+        self.worker.start()
+
+    def _search_finished(self, data, cache_key, source_row):
+        if isinstance(data, dict):
+            self.cache[cache_key] = data
+        self.result_source_row = source_row
+        self._show_results(data if isinstance(data, dict) else {})
+
+    def _search_failed(self, message: str):
+        self.status_label.setText("Online lookup failed. You can still use Open Google Search and enter attribution manually.")
+        QMessageBox.warning(
+            self,
+            "Find Attribution Online",
+            "CAS Curator could not complete the web lookup.\n\n"
+            f"{message}\n\n"
+            "The search provider or your connection may be unavailable. Nothing was changed.",
+        )
+
+    def _show_results(self, data: Dict[str, object], cached_note: str = ""):
+        candidates = list(data.get("candidates", []) or [])
+        results = list(data.get("results", []) or [])
+        errors = list(data.get("errors", []) or [])
+        queries = list(data.get("queries", []) or [])
+
+        self.suggestions_table.setRowCount(0)
+        for candidate in candidates:
+            row_index = self.suggestions_table.rowCount()
+            self.suggestions_table.insertRow(row_index)
+            confidence = str(candidate.get("confidence", "Low"))
+            field = str(candidate.get("field", ""))
+            use_item = QTableWidgetItem("")
+            use_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+            # Even High-confidence suggestions require a deliberate user tick.
+            # Web attribution is assisted review, never an automatic decision.
+            should_check = False
+            use_item.setCheckState(Qt.Unchecked)
+            self.suggestions_table.setItem(row_index, 0, use_item)
+
+            field_item = QTableWidgetItem(field)
+            field_item.setFlags(field_item.flags() & ~Qt.ItemIsEditable)
+            self.suggestions_table.setItem(row_index, 1, field_item)
+            name_item = QTableWidgetItem(str(candidate.get("name", "")))
+            name_item.setToolTip("You can correct the suggested name before staging it.")
+            self.suggestions_table.setItem(row_index, 2, name_item)
+            conf_item = QTableWidgetItem(confidence)
+            conf_item.setFlags(conf_item.flags() & ~Qt.ItemIsEditable)
+            self.suggestions_table.setItem(row_index, 3, conf_item)
+            evidence_item = QTableWidgetItem(str(candidate.get("evidence", "")))
+            evidence_item.setFlags(evidence_item.flags() & ~Qt.ItemIsEditable)
+            evidence_item.setToolTip(evidence_item.text())
+            self.suggestions_table.setItem(row_index, 4, evidence_item)
+            source_text = str(candidate.get("title", "") or ("Package filename" if not candidate.get("url") else "Web result"))
+            source_item = QTableWidgetItem(source_text)
+            source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+            source_item.setData(Qt.UserRole, str(candidate.get("url", "")))
+            source_item.setToolTip(str(candidate.get("url", "")))
+            self.suggestions_table.setItem(row_index, 5, source_item)
+
+        self.results_table.setRowCount(0)
+        for result in results:
+            row_index = self.results_table.rowCount()
+            self.results_table.insertRow(row_index)
+            title_item = QTableWidgetItem(str(result.get("title", "")))
+            title_item.setFlags(title_item.flags() & ~Qt.ItemIsEditable)
+            self.results_table.setItem(row_index, 0, title_item)
+            snippet_item = QTableWidgetItem(str(result.get("snippet", "")))
+            snippet_item.setFlags(snippet_item.flags() & ~Qt.ItemIsEditable)
+            snippet_item.setToolTip(snippet_item.text())
+            self.results_table.setItem(row_index, 1, snippet_item)
+            source = str(result.get("provider", "Web"))
+            source_item = QTableWidgetItem(source)
+            source_item.setFlags(source_item.flags() & ~Qt.ItemIsEditable)
+            source_item.setData(Qt.UserRole, str(result.get("url", "")))
+            source_item.setToolTip(str(result.get("url", "")))
+            self.results_table.setItem(row_index, 2, source_item)
+
+        pieces = []
+        if cached_note:
+            pieces.append(cached_note)
+        pieces.append(f"Found {len(candidates):,} strong attribution suggestion(s) from {len(results):,} unique web result(s).")
+        if not candidates:
+            pieces.append("No attribution was clear enough to suggest automatically. Review Search Results and type Creator/Converter manually if you can confirm them, or use Open Google Search.")
+        if errors and not results:
+            pieces.append("Search providers returned errors; use Open Google Search for manual investigation.")
+        if queries:
+            pieces.append("Queries tried: " + " | ".join(str(q) for q in queries))
+        self.status_label.setText(" ".join(pieces))
+        self.tabs.setCurrentIndex(0 if candidates else 1)
+
+    def _selected_url(self) -> str:
+        table = self.suggestions_table if self.tabs.currentIndex() == 0 else self.results_table
+        row = table.currentRow()
+        if row < 0:
+            return ""
+        source_col = 5 if table is self.suggestions_table else 2
+        item = table.item(row, source_col)
+        raw = item.data(Qt.UserRole) if item else ""
+        return str(raw or "").strip()
+
+    def _open_selected_source(self):
+        url = self._selected_url()
+        if not url:
+            self.status_label.setText("Select a web result or suggestion with a source page first.")
+            return
+        if not QDesktopServices.openUrl(QUrl(url)):
+            QMessageBox.warning(self, "Open Source", "CAS Curator could not open that source in your default browser.")
+
+    def _open_browser_search(self):
+        query = clean_search_query(self.query_edit.text())
+        self.query_edit.setText(query)
+        if not query:
+            QMessageBox.information(
+                self,
+                "Open Google Search",
+                "No distinctive search terms remain after generic Sims/version words were removed.",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl(f"https://www.google.com/search?q={quote_plus(query)}")):
+            QMessageBox.warning(self, "Open Google Search", "CAS Curator could not open your default browser.")
+
+    def _stage_attribution_values(self, selected: Dict[str, str], source_label: str) -> bool:
+        row = self._current_row()
+        if row is None:
+            return False
+        cleaned: Dict[str, str] = {}
+        for field, value in selected.items():
+            name = re.sub(r"\s+", " ", str(value or "").strip())
+            if field in {"Creator", "Converter"} and name:
+                cleaned[field] = name
+        if not cleaned:
+            QMessageBox.information(self, "Find Attribution Online", "Enter or choose at least one Creator or Converter value first.")
+            return False
+
+        replacements = []
+        for field, value in cleaned.items():
+            current = self.owner.model.effective_value(row, field).strip()
+            if current and current != value:
+                replacements.append(f"{field}: '{current}' → '{value}'")
+        if replacements:
+            answer = QMessageBox.question(
+                self,
+                "Replace existing attribution?",
+                "These values would replace existing attribution:\n\n"
+                + "\n".join(replacements)
+                + "\n\nStage these changes? They will still remain unsaved until Save Changes.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return False
+
+        changed_fields = []
+        for field, value in cleaned.items():
+            changed = self.owner.model.stage_fill_value([row], field, value)
+            if changed:
+                changed_fields.append(field)
+        if not changed_fields:
+            self.status_label.setText("Those values already match this package; nothing needed changing.")
+            return False
+
+        self.owner.model.notify_row_changed(row)
+        if self.owner.current_source_row == row:
+            rec = self.owner.model.record(row)
+            if rec:
+                self.owner.show_record(rec)
+        self.owner._update_dirty_state()
+        self.owner._update_selected_dirty_label()
+        self.owner._apply_filters()
+        self.owner.statusBar().showMessage(
+            f"{source_label} attribution staged: " + ", ".join(changed_fields) + " — unsaved until Save Changes",
+            9000,
+        )
+        QMessageBox.information(
+            self,
+            "Attribution staged",
+            "Staged " + ", ".join(changed_fields) + ".\n\nReview the Library values, then use Save Changes when you are satisfied.",
+        )
+        self.accept()
+        return True
+
+    def _stage_manual_values(self):
+        selected = {
+            "Creator": self.manual_creator_edit.text(),
+            "Converter": self.manual_converter_edit.text(),
+        }
+        self._stage_attribution_values(selected, "Manual")
+
+    def _apply_checked(self):
+        row = self._current_row()
+        if row is None or self.result_source_row != row:
+            QMessageBox.information(self, "Find Attribution Online", "Search this package first, then review its suggestions.")
+            return
+        selected: Dict[str, str] = {}
+        for table_row in range(self.suggestions_table.rowCount()):
+            use_item = self.suggestions_table.item(table_row, 0)
+            if use_item is None or use_item.checkState() != Qt.Checked:
+                continue
+            field_item = self.suggestions_table.item(table_row, 1)
+            name_item = self.suggestions_table.item(table_row, 2)
+            field = str(field_item.text() if field_item else "").strip()
+            name = re.sub(r"\s+", " ", str(name_item.text() if name_item else "").strip())
+            if field not in {"Creator", "Converter"} or not name:
+                continue
+            if field in selected:
+                QMessageBox.information(
+                    self,
+                    "Find Attribution Online",
+                    f"More than one {field} suggestion is checked. Choose only one suggestion for each field.",
+                )
+                return
+            selected[field] = name
+        if not selected:
+            QMessageBox.information(self, "Find Attribution Online", "Check at least one strong Creator or Converter suggestion first, or use the Manual attribution fields below.")
+            return
+        self._stage_attribution_values(selected, "Online")
+
+    def reject(self):
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.information(self, "Find Attribution Online", "Wait for the current web lookup to finish before closing this window.")
+            return
+        super().reject()
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -1674,6 +2384,13 @@ class MainWindow(QMainWindow):
 
         self.advanced_features = _stored_bool("advanced_features", False) if IS_PUBLIC_BUILD else True
         self.experimental_features = _stored_bool("experimental_features", False) if IS_PUBLIC_BUILD else True
+        self.freeze_package_column = _stored_bool("freeze_package_column", False)
+        self.detail_panel_collapsed = _stored_bool("detail_panel_collapsed", False)
+        self.column_shortcuts_visible = _stored_bool("column_shortcuts_visible", True)
+        try:
+            self.detail_panel_width = max(300, min(720, int(self.settings.value("detail_panel_width", 353) or 353)))
+        except (TypeError, ValueError):
+            self.detail_panel_width = 353
         global _ADVANCED_FEATURES_ENABLED, _EXPERIMENTAL_FEATURES_ENABLED
         _ADVANCED_FEATURES_ENABLED = bool(self.advanced_features)
         _EXPERIMENTAL_FEATURES_ENABLED = bool(self.experimental_features)
@@ -1706,6 +2423,16 @@ class MainWindow(QMainWindow):
         self.profile_registry_saved: List[str] = []
         self.profile_registry_current: List[str] = []
         self.profile_registry_dirty = False
+        # Experimental Profile Layouts are stored separately from normal Profile
+        # membership and from the physical File Location field. Each tuple is
+        # (Profile, Package Hash, Package filename, desired File Location).
+        self.profile_layouts_saved: List[tuple[str, str, str, str]] = []
+        self.profile_layouts_current: List[tuple[str, str, str, str]] = []
+        self.profile_layouts_dirty = False
+        # The Current Profile is a UI context, separate from Profile membership
+        # filtering. It never moves files by itself. Saved Profile filter views
+        # are UI preferences stored per MDB/profile in QSettings.
+        self.active_profile_name = ""
         self.status_registry_dirty = False
         self.file_location_registry_saved: List[tuple[str, str]] = []
         self.file_location_registry_current: List[tuple[str, str]] = []
@@ -1713,6 +2440,11 @@ class MainWindow(QMainWindow):
         self.merge_profile_registry_saved: List[str] = []
         self.merge_profile_registry_current: List[str] = []
         self.merge_profile_registry_dirty = False
+        # Session-only suppression prevents the same remembered attribution suggestion
+        # from interrupting the user repeatedly after every Save/refresh. Choosing
+        # "Not now" allows it to appear again next launch, while the manual review
+        # command can always show all current suggestions.
+        self._attribution_memory_prompted_signatures: set[tuple] = set()
         self.current_source_row: Optional[int] = None
         self._loading_editor = False
         self.pinned_packages: List[Dict[str, str]] = []
@@ -1787,6 +2519,13 @@ class MainWindow(QMainWindow):
         self.model = LibraryTableModel(self)
         self.model.set_pending_changes(self.pending_changes)
         self.model.set_pending_deletions(self.pending_deletions)
+        self.model.set_virtual_field_handlers(
+            self._table_virtual_value,
+            self._table_virtual_editable,
+            self._table_virtual_set_value,
+            self._table_virtual_tooltip,
+            self._table_virtual_dirty,
+        )
         self.model.manualFieldEdited.connect(self._table_manual_edit_changed)
         self.proxy = LibraryFilterProxy(self)
         self.proxy.setSourceModel(self.model)
@@ -1854,6 +2593,8 @@ class MainWindow(QMainWindow):
         # after Qt finishes the resize layout so Notes/Merge Profiles stay compact.
         if hasattr(self, "cc_magic_profiles_edit") or hasattr(self, "notes_edit") or hasattr(self, "merge_profiles_edit"):
             QTimer.singleShot(0, self._update_dynamic_editor_heights)
+        if hasattr(self, "column_fold_restore_btn"):
+            QTimer.singleShot(0, self._position_column_fold_restore_btn)
 
     def _build_menus(self):
         file_menu = self.menuBar().addMenu("File")
@@ -1892,31 +2633,120 @@ class MainWindow(QMainWindow):
 
         self.columns_menu = self.menuBar().addMenu("Columns")
 
+        # Keep Tools compact by grouping related actions.  The same icon family is
+        # reused inside each submenu so frequent actions are easier to recognise.
         tools_menu = self.menuBar().addMenu("Tools")
-        zip_tools_action = QAction("Preview / Extract ZIP…", self)
-        zip_tools_action.setToolTip("Preview a ZIP archive safely, then extract it only after explicit confirmation.")
-        zip_tools_action.triggered.connect(self._choose_zip_preview_extract)
-        tools_menu.addAction(zip_tools_action)
-        tools_menu.addSeparator()
-        set_creator_selected_action = QAction("Set Creator for Selected…", self)
+
+        def tool_icon(name: str, fallback: str = "SP_FileIcon") -> QIcon:
+            enum = getattr(QStyle.StandardPixmap, name, None)
+            if enum is None:
+                enum = getattr(QStyle.StandardPixmap, fallback)
+            return self.style().standardIcon(enum)
+
+        scan_icon = tool_icon("SP_BrowserReload")
+        routing_icon = tool_icon("SP_ArrowForward")
+        locations_icon = tool_icon("SP_DirIcon")
+        maintenance_icon = tool_icon("SP_FileDialogDetailedView")
+        online_icon = tool_icon("SP_DriveNetIcon")
+        help_icon = tool_icon("SP_DialogHelpButton")
+
+        scanning_menu = tools_menu.addMenu(scan_icon, "Scanning")
+        routing_menu = tools_menu.addMenu(routing_icon, "Routing")
+        profiles_menu = tools_menu.addMenu(locations_icon, "Profiles && Locations")
+        maintenance_menu = tools_menu.addMenu(maintenance_icon, "Library / Maintenance")
+        attribution_menu = tools_menu.addMenu(online_icon, "Online / Attribution")
+        help_tools_menu = tools_menu.addMenu(help_icon, "Help")
+
+        run_scan_action = QAction(scan_icon, "Run Scan", self)
+        run_scan_action.setToolTip("Run the configured package scan using the current Scan-page source and MDB settings.")
+        run_scan_action.triggered.connect(self._start_scan_test)
+        scanning_menu.addAction(run_scan_action)
+        scanner_log_action = QAction(tool_icon("SP_FileIcon"), "Scanner Log", self)
+        scanner_log_action.setToolTip("Open the current Scanner Log in its resizable window.")
+        scanner_log_action.triggered.connect(self._open_scan_log_window)
+        scanning_menu.addAction(scanner_log_action)
+        open_scan_page_action = QAction(tool_icon("SP_FileDialogContentsView"), "Open Scan page", self)
+        open_scan_page_action.triggered.connect(lambda checked=False: self._set_app_page("scan"))
+        scanning_menu.addAction(open_scan_page_action)
+
+        preview_routing_action = QAction(tool_icon("SP_FileDialogContentsView"), "Preview Routing", self)
+        preview_routing_action.setToolTip("Calculate normal scanner routing destinations without moving files.")
+        preview_routing_action.triggered.connect(self._start_routing_preview)
+        routing_menu.addAction(preview_routing_action)
+        run_routing_action = QAction(routing_icon, "Run Routing", self)
+        run_routing_action.setToolTip("Run normal scanner routing. The Scan-page move acknowledgement is still required.")
+        run_routing_action.triggered.connect(self._start_real_routing_test)
+        routing_menu.addAction(run_routing_action)
+        routing_menu.addSeparator()
+
+        self.routing_structure_action = QAction(tool_icon("SP_DirOpenIcon"), "Routing Structure Builder…", self)
+        self.routing_structure_action.setToolTip(
+            "Experimental: build a folder hierarchy visually (for example Creator → CC Type → Subtype), preview exact destinations, "
+            "then route package files with SHA-256 verification."
+        )
+        self.routing_structure_action.setEnabled(bool(IS_DEV_BUILD or self.experimental_features))
+        self.routing_structure_action.triggered.connect(self._open_routing_structure_builder)
+        routing_menu.addAction(self.routing_structure_action)
+
+        move_selected_action = QAction(tool_icon("SP_ArrowForward"), "Move Selected to Location…", self)
+        move_selected_action.setToolTip("Preview and move selected original package files to a saved File Location, then update the MDB after hash verification.")
+        move_selected_action.triggered.connect(self.move_selected_to_location)
+        routing_menu.addAction(move_selected_action)
+
+        self.profile_layouts_action = QAction(tool_icon("SP_DirLinkIcon", "SP_DirIcon"), "Experimental Profile Layouts…", self)
+        self.profile_layouts_action.setToolTip(
+            "Plan different managed File Locations per Profile. Apply Profile Locations previews and performs the explicit verified batch moves."
+        )
+        self.profile_layouts_action.setEnabled(bool(IS_DEV_BUILD or self.experimental_features))
+        self.profile_layouts_action.triggered.connect(self._manage_profile_layouts)
+        routing_menu.addAction(self.profile_layouts_action)
+
+        manage_locations_action = QAction(locations_icon, "Manage File Locations…", self)
+        manage_locations_action.setToolTip("Manage the active MDB's shared File Location folders. Add Folder uses the selected Windows folder name automatically.")
+        manage_locations_action.triggered.connect(self.manage_file_locations)
+        profiles_menu.addAction(manage_locations_action)
+        set_creator_selected_action = QAction(tool_icon("SP_FileDialogInfoView"), "Set Creator for Selected…", self)
         set_creator_selected_action.setToolTip("Stage one Creator value for all selected Library packages. Changes remain unsaved until Save Changes.")
         set_creator_selected_action.triggered.connect(self.set_creator_for_selected)
-        tools_menu.addAction(set_creator_selected_action)
-        move_selected_action = QAction("Move Selected to Location…", self)
-        move_selected_action.setToolTip("Preview and move the selected original package files to a saved File Location, then update File Location in the MDB after hash verification.")
-        move_selected_action.triggered.connect(self.move_selected_to_location)
-        tools_menu.addAction(move_selected_action)
-        copy_dropin_action = QAction("Copy Selected to CC Magic Import…", self)
+        profiles_menu.addAction(set_creator_selected_action)
+        remembered_attribution_action = QAction(tool_icon("SP_MessageBoxInformation"), "Review Remembered Creator / Converter Suggestions…", self)
+        remembered_attribution_action.setToolTip(
+            "Review local Creator/Converter name matches learned from previously confirmed MDB values. Nothing is filled without your approval."
+        )
+        remembered_attribution_action.triggered.connect(self.review_remembered_attribution_suggestions)
+        profiles_menu.addAction(remembered_attribution_action)
+        profiles_menu.addSeparator()
+        set_dropin_action = QAction(tool_icon("SP_DialogOpenButton"), "Set CC Magic Import Folder…", self)
+        set_dropin_action.triggered.connect(self.set_cc_magic_dropin_folder)
+        profiles_menu.addAction(set_dropin_action)
+        open_dropin_action = QAction(tool_icon("SP_DirOpenIcon"), "Open CC Magic Import Folder", self)
+        open_dropin_action.triggered.connect(self.open_cc_magic_dropin_folder)
+        profiles_menu.addAction(open_dropin_action)
+
+        zip_tools_action = QAction(tool_icon("SP_FileIcon"), "Preview / Extract ZIP…", self)
+        zip_tools_action.setToolTip("Preview a ZIP archive safely, then extract it only after explicit confirmation.")
+        zip_tools_action.triggered.connect(self._choose_zip_preview_extract)
+        maintenance_menu.addAction(zip_tools_action)
+        copy_dropin_action = QAction(tool_icon("SP_ArrowRight", "SP_ArrowForward"), "Copy Selected to CC Magic Import…", self)
         copy_dropin_action.setToolTip("Copy selected original package files to the configured CC Magic Import folder. Originals remain in place and File Location is not changed.")
         copy_dropin_action.triggered.connect(self.copy_selected_to_cc_magic_dropin)
-        tools_menu.addAction(copy_dropin_action)
-        tools_menu.addSeparator()
-        set_dropin_action = QAction("Set CC Magic Import Folder…", self)
-        set_dropin_action.triggered.connect(self.set_cc_magic_dropin_folder)
-        tools_menu.addAction(set_dropin_action)
-        open_dropin_action = QAction("Open CC Magic Import Folder", self)
-        open_dropin_action.triggered.connect(self.open_cc_magic_dropin_folder)
-        tools_menu.addAction(open_dropin_action)
+        maintenance_menu.addAction(copy_dropin_action)
+
+        find_attribution_action = QAction(online_icon, "Find Creator / Converter Online…", self)
+        find_attribution_action.setToolTip("Open Google directly for the selected package to help identify its Creator and/or Converter.")
+        find_attribution_action.triggered.connect(self.find_attribution_online)
+        attribution_menu.addAction(find_attribution_action)
+
+        guide_tools_action = QAction(help_icon, "Guide", self)
+        guide_tools_action.triggered.connect(lambda checked=False: self._set_app_page("guide"))
+        help_tools_menu.addAction(guide_tools_action)
+        help_tools_menu.addSeparator()
+        about_action = QAction(tool_icon("SP_MessageBoxInformation"), "About CAS Curator…", self)
+        about_action.triggered.connect(self._show_about_dialog)
+        help_tools_menu.addAction(about_action)
+        copy_version_action = QAction(tool_icon("SP_DialogSaveButton", "SP_FileIcon"), "Copy version info", self)
+        copy_version_action.triggered.connect(self._copy_version_info)
+        help_tools_menu.addAction(copy_version_action)
 
         options_menu = self.menuBar().addMenu("Options")
 
@@ -1943,7 +2773,7 @@ class MainWindow(QMainWindow):
             self.advanced_features_action = QAction("Enable Advanced features", self, checkable=True)
             self.advanced_features_action.setChecked(bool(self.advanced_features))
             self.advanced_features_action.setToolTip(
-                "Show extra technical information such as CASP IDs, Biggest Texture, HQ/Poly warnings, Risk, Health Issues, Last Scanned, Package Hash and All fields."
+                "Show extra technical information such as CASP IDs, Biggest Texture, HQ/Poly warnings, Health Issues, Last Scanned, Package Hash and All fields."
             )
             self.advanced_features_action.toggled.connect(self._set_advanced_features)
             options_menu.addAction(self.advanced_features_action)
@@ -1951,7 +2781,8 @@ class MainWindow(QMainWindow):
             self.experimental_features_action = QAction("Enable Experimental features", self, checkable=True)
             self.experimental_features_action.setChecked(bool(self.experimental_features))
             self.experimental_features_action.setToolTip(
-                "Show provisional scanner-derived classifications such as Subtype, Skin Type, Outfit Category and EA Resource Status. Experimental results never control Routing automatically."
+                "Show provisional scanner-derived classifications and Experimental Profile Layouts. "
+                "Experimental classifications never control Routing automatically; Profile Layouts move files only through an explicit previewed Apply action."
             )
             self.experimental_features_action.toggled.connect(self._set_experimental_features)
             options_menu.addAction(self.experimental_features_action)
@@ -1985,16 +2816,17 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Experimental features",
-                    "Experimental features show scanner-derived information that is still being validated. "
-                    "Results may be incomplete or incorrect. They are for review and testing only and do not change Routing or move package files automatically.",
+                    "Experimental features include provisional scanner-derived information, Profile Layouts and the Routing Structure Builder. "
+                    "The Routing Structure Builder uses stored MDB fields you choose, previews every destination, and moves files only after explicit confirmation. "
+                    "Profile Layouts can move package files only when you explicitly choose Apply Profile Locations and confirm its preview.",
                 )
                 self.settings.setValue("experimental_warning_seen", True)
         self.settings.sync()
         self._refresh_feature_visibility()
         self.statusBar().showMessage(
-            "Experimental features enabled — provisional fields are available for review."
+            "Experimental features enabled — provisional fields and Profile Layouts are available."
             if checked else
-            "Experimental features disabled — provisional fields are hidden, not deleted.",
+            "Experimental features disabled — provisional fields/Profile Layouts are hidden, not deleted.",
             9000,
         )
 
@@ -2002,15 +2834,27 @@ class MainWindow(QMainWindow):
         """Apply Advanced/Experimental display layers without touching workbook data."""
         if hasattr(self, "all_fields_tab_index"):
             self.tabs.setTabVisible(self.all_fields_tab_index, bool(IS_DEV_BUILD or self.advanced_features))
+        if hasattr(self, "profile_layouts_action"):
+            self.profile_layouts_action.setEnabled(bool(IS_DEV_BUILD or self.experimental_features))
+        if hasattr(self, "routing_structure_action"):
+            self.routing_structure_action.setEnabled(bool(IS_DEV_BUILD or self.experimental_features))
+        self._refresh_profile_layout_editor_visibility()
 
         if not self.mdb:
             return
 
         allowed = {"#", "Thumbnail"}
-        allowed.update(field for field in self.mdb.headers if _public_field_visible(field))
+        allowed.update(_available_public_columns_for_mdb(self.mdb))
         filtered = [field for field in self.visible_columns if field in allowed]
         if not filtered:
             filtered = [field for field in DEFAULT_COLUMNS if field in allowed]
+        if (IS_DEV_BUILD or self.experimental_features) and PROFILE_LOCATION_FIELD in allowed:
+            introduced = str(self.settings.value("planned_profile_location_column_introduced", "") or "").strip().lower()
+            if introduced not in {"1", "true", "yes", "on"} and PROFILE_LOCATION_FIELD not in filtered:
+                insert_at = filtered.index("File Location") + 1 if "File Location" in filtered else len(filtered)
+                filtered.insert(insert_at, PROFILE_LOCATION_FIELD)
+                self.settings.setValue("planned_profile_location_column_introduced", True)
+                self.settings.sync()
         self.visible_columns = filtered
         self.model.set_columns(self.visible_columns)
         self._persist_visible_columns()
@@ -2600,16 +3444,28 @@ class MainWindow(QMainWindow):
         stats.addWidget(self.thumbs_label)
         stats.addSpacing(10)
         stats.addWidget(self.unsaved_label)
+        stats.addSpacing(8)
+        self.manage_locations_global_btn = QPushButton("Locations…")
+        self.manage_locations_global_btn.setToolTip(
+            "Manage the File Locations saved in the active Master Database. Add Folder uses the selected Windows folder name automatically."
+        )
+        self.manage_locations_global_btn.setMinimumWidth(86)
+        self.manage_locations_global_btn.setMaximumHeight(28)
+        self.manage_locations_global_btn.setEnabled(False)
+        self.manage_locations_global_btn.clicked.connect(self.manage_file_locations)
+        # Keep Locations as a general Library action, but place it beside
+        # Profiles in the filter/action row rather than the stats strip.
         stats.addStretch(1)
 
         self.view_label = QLabel("View:")
         self.view_label.setObjectName("ViewLabel")
         self.table_view_btn = QPushButton("Table")
         self.gallery_view_btn = QPushButton("Gallery")
-        # RC58: retain the compact RC42 control sizing, but group actions by
-        # function instead of forcing unlike controls into vertical columns.
-        # View toggles therefore sit together as one compact pair.
-        for button in (self.table_view_btn, self.gallery_view_btn):
+        self.detail_panel_header_btn = QPushButton("◀" if self.detail_panel_collapsed else "Details")
+        # Keep the three compact Library view controls together.  Details is a
+        # normal top-row toggle rather than an overlay on the splitter, so it
+        # cannot steal width from either the Table/Gallery or the details pane.
+        for button in (self.table_view_btn, self.gallery_view_btn, self.detail_panel_header_btn):
             button.setObjectName("ViewToggle")
             button.setCheckable(True)
             button.setMinimumWidth(68)
@@ -2617,6 +3473,9 @@ class MainWindow(QMainWindow):
 
         self.table_view_btn.clicked.connect(lambda checked=False: self._set_library_view("table"))
         self.gallery_view_btn.clicked.connect(lambda checked=False: self._set_library_view("gallery"))
+        self.detail_panel_header_btn.setChecked(not self.detail_panel_collapsed)
+        self.detail_panel_header_btn.setToolTip("Hide details panel" if not self.detail_panel_collapsed else "Show details panel")
+        self.detail_panel_header_btn.clicked.connect(self._header_detail_panel_toggled)
         view_actions = QWidget()
         view_actions.setObjectName("LibraryActionGroup")
         view_actions_layout = QHBoxLayout(view_actions)
@@ -2624,6 +3483,7 @@ class MainWindow(QMainWindow):
         view_actions_layout.setSpacing(6)
         view_actions_layout.addWidget(self.table_view_btn)
         view_actions_layout.addWidget(self.gallery_view_btn)
+        view_actions_layout.addWidget(self.detail_panel_header_btn)
         stats.addWidget(self.view_label)
         stats.addWidget(view_actions)
 
@@ -2634,7 +3494,8 @@ class MainWindow(QMainWindow):
 
         self.library_header_widgets = [
             self.packages_label, self.shown_label, self.thumbs_label, self.unsaved_label,
-            self.view_label, self.table_view_btn, self.gallery_view_btn,
+            self.manage_locations_global_btn, self.view_label, self.table_view_btn, self.gallery_view_btn,
+            self.detail_panel_header_btn,
         ]
         card_layout.addLayout(stats)
 
@@ -2679,16 +3540,28 @@ class MainWindow(QMainWindow):
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Filename, CASP ID, type, notes…")
         self.search_edit.setMinimumWidth(230)
-        # Native trailing X clears only the search text; Reset filters clears search plus every filter.
+        # Native trailing X clears only the search text; Clear Quick Filters clears search plus every temporary Library filter.
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.textChanged.connect(self._apply_filters)
 
         self.filter_boxes: Dict[str, QComboBox] = {}
         for field, _label in FILTER_FIELDS:
             box = ArrowComboBox()
-            box.setMinimumWidth(160 if field == "CC Magic Profiles" else (190 if field == "File Location" else (135 if field == "CC Magic Import" else 120)))
+            # Creator names are often longer than Status/CC Type values. Give
+            # the permanent Creator filter enough room to show common creator
+            # names (for example "Simlicious") without clipping against the
+            # themed 40 px drop-down button, while keeping the other filters
+            # compact.
+            box.setMinimumWidth(
+                180 if field == "Creator" else
+                (160 if field == "CC Magic Profiles" else
+                 (190 if field == "File Location" else
+                  (135 if field == "CC Magic Import" else 120)))
+            )
             box.addItem("All")
             box.currentTextChanged.connect(self._apply_filters)
+            if field == "CC Magic Profiles":
+                box.currentTextChanged.connect(self._profile_layout_context_changed)
             self.filter_boxes[field] = box
 
         # Compact two-row filter layout. Labels are right-aligned inside their
@@ -2699,35 +3572,46 @@ class MainWindow(QMainWindow):
             label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             return label
 
-        clear_btn = QPushButton("Reset filters")
+        clear_btn = QPushButton("Clear Quick Filters")
         clear_btn.clicked.connect(self.clear_filters)
-        clear_btn.setFixedWidth(108)
-        clear_btn.setToolTip("Clear Search, permanent filters and all filters added with + Add Filter…")
+        # Keep the utility pair visually balanced and compact, but wide enough
+        # for the full labels at normal Windows scaling.
+        clear_btn.setFixedWidth(126)
+        clear_btn.setToolTip("Clear Search, the visible Quick Filters and all filters added with + Add Quick Filter…")
 
-        self.new_profile_btn = QPushButton("New Profile…")
-        self.new_profile_btn.setToolTip("Create an empty general Profile before assigning any packages. Profiles can represent playthroughs, themes, saves, testing groups, or other organisational groups.")
-        self.new_profile_btn.clicked.connect(self._create_profile)
-        self.new_profile_btn.setMinimumWidth(100)
-        self.new_profile_btn.setMaximumWidth(125)
-        self.manage_profiles_btn = QPushButton("Manage Profiles…")
-        self.manage_profiles_btn.setToolTip("Rename or remove general Profiles and review how many packages use each one. This does not restore the old bulk Profile Tools workflow.")
-        self.manage_profiles_btn.clicked.connect(self._manage_cc_magic_profiles)
-        self.manage_profiles_btn.setMinimumWidth(120)
-        self.manage_profiles_btn.setMaximumWidth(150)
+        self.profiles_btn = QPushButton("Manage Profiles…")
+        self.profiles_btn.setToolTip("Open Profile management. Changing the Current Profile never moves package files.")
+        self.profiles_btn.setFixedWidth(128)
+        self.profiles_btn.clicked.connect(self._manage_cc_magic_profiles)
+
+        # Keep the two management buttons paired without forcing the shorter
+        # Locations label to fill the wider Quick Filter action width.
+        self.manage_locations_global_btn.setFixedWidth(128)
+
+        self.current_profile_caption = QLabel("Current Profile:")
+        self.current_profile_caption.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.current_profile_combo = ArrowComboBox()
+        # Keep Current Profile compact and stable so long profile names cannot
+        # push or overlap the management buttons. Full names remain in tooltip.
+        self.current_profile_combo.setFixedWidth(160)
+        self.current_profile_combo.setToolTip("Choose the Current Profile. This changes Profile context only and never moves package files.")
+        self.current_profile_combo.currentIndexChanged.connect(self._current_profile_combo_changed)
+        self._update_current_profile_indicator()
 
         if IS_PUBLIC_BUILD:
             # Keep only broad, everyday filters permanently visible. More
             # specific metadata (Health, File Location, CC Magic Import, CAS
             # classifications, Advanced/Experimental fields, etc.) lives under
-            # + Add Filter… instead of consuming permanent toolbar space.
-            # RC61 keeps the preferred RC58 grouping, but shortens the left
-            # Search/CC Type field area enough to give the three permanent
-            # filter groups proper columns. Status now sits directly above
-            # Profile, while Creator keeps its own middle column.
-            self.add_filter_btn = QPushButton("+ Add Filter…")
-            self.add_filter_btn.setToolTip("Filter by any data field currently available in this Library mode.")
-            self.add_filter_btn.setFixedWidth(112)
-            self.add_filter_btn.clicked.connect(self._add_column_filter)
+            # + Add Quick Filter… instead of consuming permanent toolbar space.
+            # Keep only Search, Status, CC Type and Creator as permanent public
+            # controls. Profile membership moves to + Add Quick Filter… while Profiles…
+            # selects the Current Profile context.
+            self.add_filter_btn = QPushButton("+ Add Quick Filter…")
+            self.add_filter_btn.setToolTip("Add a temporary Quick Filter, use a suggested filter, or save/reuse Quick Filter presets.")
+            self.add_filter_btn.setFixedWidth(126)
+            self.add_filter_menu = QMenu(self.add_filter_btn)
+            self.add_filter_menu.aboutToShow.connect(self._rebuild_add_filter_menu)
+            self.add_filter_btn.setMenu(self.add_filter_menu)
 
             filter_actions = QWidget()
             filter_actions.setObjectName("LibraryActionGroup")
@@ -2737,37 +3621,76 @@ class MainWindow(QMainWindow):
             filter_actions_layout.addWidget(self.add_filter_btn)
             filter_actions_layout.addWidget(clear_btn)
 
+            # Right side is two aligned action rows:
+            #   top    Status -> Locations -> Add Quick Filter
+            #   bottom Current Profile -> Manage Profiles -> Clear Quick Filters
+            # The shorter Status selector sits above the longer Current Profile
+            # selector, which gives the two rows a more natural visual weight.
+            status_actions = QWidget()
+            status_actions.setObjectName("LibraryActionGroup")
+            status_actions_layout = QHBoxLayout(status_actions)
+            status_actions_layout.setContentsMargins(0, 0, 8, 0)
+            status_actions_layout.setSpacing(6)
+            status_actions_layout.addWidget(filter_label("Status:"))
+            status_actions_layout.addWidget(self.filter_boxes["Status"])
+            # Shift only the Status label/dropdown left so its dropdown starts
+            # in line with Current Profile. Locations and Add Quick Filter stay
+            # exactly where they already are.
+            status_actions_layout.addSpacing(18)
+            status_actions_layout.addWidget(self.manage_locations_global_btn)
+            status_actions_layout.addWidget(self.add_filter_btn)
+
             profile_actions = QWidget()
             profile_actions.setObjectName("LibraryActionGroup")
             profile_actions_layout = QHBoxLayout(profile_actions)
-            profile_actions_layout.setContentsMargins(0, 0, 0, 0)
+            profile_actions_layout.setContentsMargins(0, 0, 8, 0)
             profile_actions_layout.setSpacing(6)
-            profile_actions_layout.addWidget(self.new_profile_btn)
-            profile_actions_layout.addWidget(self.manage_profiles_btn)
+            profile_actions_layout.addWidget(self.current_profile_caption)
+            profile_actions_layout.addWidget(self.current_profile_combo)
+            profile_actions_layout.addWidget(self.profiles_btn)
+            profile_actions_layout.addWidget(clear_btn)
 
-            # Keep the RC61 Status/Profile alignment, but let Search use the
-            # otherwise-empty Creator columns on the first row. This makes the
-            # Search field wider without moving the aligned Status/Profile pair.
+            # Fine-tuned balance pass: Search and Creator gain a little room,
+            # Status matches the visual weight of Current Profile more closely,
+            # and the two Quick Filter action buttons are noticeably shorter.
+            self.current_profile_combo.setFixedWidth(160)
+            self.filter_boxes["Status"].setFixedWidth(160)
+            self.filter_boxes["CC Type"].setFixedWidth(170)
+            self.filter_boxes["Creator"].setFixedWidth(240)
+            self.search_edit.setFixedWidth(485)
+
+            # Keep management buttons compact; Quick Filter buttons only need
+            # enough width for their full labels and menu arrow.
+            # Keep Manage Profiles exactly the same width as Locations so
+            # their left edges align across the two rows. Keep the Quick
+            # Filter actions visibly compact; fixed widths here avoid later
+            # minimum-width calls undoing the shorter sizing.
+            self.profiles_btn.setFixedWidth(128)
+            self.manage_locations_global_btn.setFixedWidth(120)
+            self.add_filter_btn.setFixedWidth(126)
+            clear_btn.setFixedWidth(136)
+
+            # Top-left: Search. Top-right: Status / Locations / Add Quick Filter.
             filters.addWidget(filter_label("Search:"), 0, 0)
             filters.addWidget(self.search_edit, 0, 1, 1, 3)
-            filters.addWidget(filter_label("Status:"), 0, 4)
-            filters.addWidget(self.filter_boxes["Status"], 0, 5)
-            filters.addWidget(filter_actions, 0, 6)
+            filters.addWidget(status_actions, 0, 4, 1, 3, Qt.AlignRight)
 
+            # Bottom-left: CC Type and Creator. Bottom-right: Current Profile / Manage / Clear.
             filters.addWidget(filter_label("CC Type:"), 1, 0)
             filters.addWidget(self.filter_boxes["CC Type"], 1, 1)
             filters.addWidget(filter_label("Creator:"), 1, 2)
             filters.addWidget(self.filter_boxes["Creator"], 1, 3)
-            filters.addWidget(filter_label("Profile:"), 1, 4)
-            filters.addWidget(self.filter_boxes["CC Magic Profiles"], 1, 5)
-            filters.addWidget(profile_actions, 1, 6)
+            filters.addWidget(profile_actions, 1, 4, 1, 3, Qt.AlignRight)
 
+            # Left-side fields use fixed practical widths. Any spare space goes
+            # into the separator before the right-side action groups instead of
+            # stretching Search / CC Type / Creator and squeezing the buttons.
             filters.setColumnStretch(0, 0)
-            filters.setColumnStretch(1, 4)
+            filters.setColumnStretch(1, 0)
             filters.setColumnStretch(2, 0)
-            filters.setColumnStretch(3, 1)
-            filters.setColumnStretch(4, 0)
-            filters.setColumnStretch(5, 1)
+            filters.setColumnStretch(3, 0)
+            filters.setColumnStretch(4, 1)
+            filters.setColumnStretch(5, 0)
             filters.setColumnStretch(6, 0)
         else:
             # DEV retains its existing compact technical quick-filter row.
@@ -2790,8 +3713,8 @@ class MainWindow(QMainWindow):
             profile_actions_layout = QHBoxLayout(profile_actions)
             profile_actions_layout.setContentsMargins(0, 0, 0, 0)
             profile_actions_layout.setSpacing(6)
-            profile_actions_layout.addWidget(self.new_profile_btn)
-            profile_actions_layout.addWidget(self.manage_profiles_btn)
+            profile_actions_layout.addWidget(self.profiles_btn)
+            profile_actions_layout.addWidget(self.manage_locations_global_btn)
             filters.addWidget(profile_actions, 1, 8)
             filters.setColumnStretch(1, 1)
             filters.setColumnStretch(3, 0)
@@ -2857,7 +3780,9 @@ class MainWindow(QMainWindow):
         # The pinned strip belongs to the Library side only. Keep its height fixed so it
         # can never absorb spare vertical space above the package table.
 
-        self.splitter = QSplitter(Qt.Horizontal)
+        self.splitter = DetailPanelSplitter(Qt.Horizontal)
+        self.splitter.setObjectName("MainLibrarySplitter")
+        self.splitter.last_detail_panel_width = self.detail_panel_width
         root_layout.addWidget(self.splitter, 1)
 
         self.scan_page = self._build_scan_shell_page()
@@ -2874,7 +3799,8 @@ class MainWindow(QMainWindow):
             root_layout.addWidget(self.random_sim_page, 1)
 
         # Main library table.
-        left = QFrame()
+        left = ResizeAwareFrame()
+        self.library_left_panel = left
         left.setObjectName("MainPanel")
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -2893,13 +3819,20 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setHighlightSections(False)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setWordWrap(False)
+        # Wide Library tables are much easier to inspect when horizontal movement
+        # is pixel-based rather than jumping a whole column at a time.
+        self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.table.horizontalScrollBar().setSingleStep(18)
         self.table.setEditTriggers(QTableView.DoubleClicked | QTableView.EditKeyPressed)
-        self.table.setToolTip("Double-click an editable cell to edit it. To copy a value down, select an editable cell and drag the small fill handle at its lower-right corner across the displayed rows. Fill-down respects sorting/filtering and remains unsaved until Save Changes. Blank source values are blocked to prevent accidental clearing. Ctrl+click selects individual packages; Shift+click selects a range. Right-click a row to open its assigned File Location, search the web for the package or its filled Creator, copy its file name or stage Delete Record. Deletions require Save Changes and create a backup; package files are never deleted. Unsaved rows get an amber marker at the left.")
+        self.table.setToolTip("Double-click an editable cell to edit it. To copy a populated value down, select an editable cell and drag the small fill handle at its lower-right corner across the displayed rows. Fill-down respects sorting/filtering and remains unsaved until Save Changes. To clear one editable field in several rows, Ctrl/Shift-select the rows in that column and press Delete; CAS Curator asks for confirmation first. Shift+Delete stages Library record deletion. Current File Location is read-only in the Table; use Planned Location for profile-specific editing. Unsaved rows get an amber marker at the left.")
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_context_menu)
         self.table.fillRequested.connect(self._table_fill_requested)
+        self.table.clearSelectedFieldRequested.connect(self._clear_selected_table_field)
         self.table.clicked.connect(self._show_selected)
         self.table.selectionModel().selectionChanged.connect(lambda *_: self._show_selected())
+        self.table.deleteRequested.connect(self._stage_delete_selected_records)
+        self._init_frozen_package_view()
 
         self.gallery = QListView()
         self.gallery.setObjectName("GalleryView")
@@ -2914,6 +3847,11 @@ class MainWindow(QMainWindow):
         self.gallery.setUniformItemSizes(True)
         self.gallery.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.gallery.setSelectionModel(self.table.selectionModel())
+        # Match Table convenience actions in Gallery too. Both views share the
+        # same selection model, so the Routing Structure Builder opens against
+        # exactly the packages the user right-clicked/selected.
+        self.gallery.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.gallery.customContextMenuRequested.connect(self._show_gallery_context_menu)
         self.gallery_delegate = GalleryDelegate(self.proxy, self.model, self.gallery)
         self.gallery.setItemDelegate(self.gallery_delegate)
         self.gallery.clicked.connect(self._gallery_clicked)
@@ -2927,83 +3865,123 @@ class MainWindow(QMainWindow):
         column_fold_layout = QHBoxLayout(self.column_fold_bar)
         column_fold_layout.setContentsMargins(6, 3, 6, 3)
         column_fold_layout.setSpacing(5)
-        column_fold_label = QLabel("Columns:")
+
+        # Tuck the collapse affordance directly above the Columns label so the
+        # arrow reads as a tiny tab attached to the shortcut strip rather than
+        # as another button floating in the row. The tab stays inside the same
+        # 29 px control height, so it does not make the bar taller.
+        column_label_stack = QWidget(self.column_fold_bar)
+        column_label_stack.setObjectName("ColumnFoldLabelStack")
+        column_label_stack.setFixedSize(82, 29)
+        column_fold_label = QLabel("Columns:", column_label_stack)
         column_fold_label.setObjectName("ColumnFoldLabel")
-        column_fold_layout.addWidget(column_fold_label)
+        column_fold_label.setGeometry(0, 9, 82, 20)
+        self.column_fold_collapse_btn = QPushButton("▲", column_label_stack)
+        self.column_fold_collapse_btn.setObjectName("ColumnFoldCollapseButton")
+        # Arrow-first micro-tab: the box should almost disappear, with the
+        # crisp ▲ glyph carrying the visual meaning.
+        self.column_fold_collapse_btn.setFixedSize(28, 13)
+        # Centre the micro-tab over the actual rendered word “Columns:” rather
+        # than over the wider fixed label container. This keeps the arrow
+        # visually centred at different Windows scaling/font sizes.
+        column_text_width = column_fold_label.fontMetrics().horizontalAdvance("Columns:")
+        column_tab_x = max(0, int((column_text_width - self.column_fold_collapse_btn.width()) / 2))
+        self.column_fold_collapse_btn.move(column_tab_x, 0)
+        self.column_fold_collapse_btn.setToolTip("Hide the column shortcut bar.")
+        self.column_fold_collapse_btn.clicked.connect(lambda checked=False: self._set_column_shortcuts_visible(False))
+        column_fold_layout.addWidget(column_label_stack)
         self.column_fold_buttons = {}
         for group_name in COLUMN_FOLD_GROUPS:
             button = QPushButton(f"{group_name} +")
             button.setObjectName("ColumnFoldButton")
-            button.setMaximumHeight(25)
-            button.setMinimumWidth(78 if group_name != "Organise" else 92)
+            # Keep the column-fold controls compact while still avoiding the
+            # clipping seen at 25 px on common Windows scaling.
+            button.setFixedHeight(29)
+            button.setMinimumWidth(72 if group_name != "Organise" else 86)
             button.clicked.connect(lambda checked=False, g=group_name: self._toggle_column_fold_group(g))
             self.column_fold_buttons[group_name] = button
             column_fold_layout.addWidget(button)
         column_fold_layout.addStretch(1)
         self.column_fold_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        # FIX46 Gallery quick-filter visual layout. Keep the release single-row
-        # control order, labels, margins, spacing and control widths exactly.
+        # Hidden-state restore control: keep it OUT of the layout entirely so
+        # collapsing the shortcut strip removes every pixel of that row.  The
+        # small ▼ is floated over whichever table header is actually on top
+        # (normal Table or the frozen #/Package overlay) and positioned over
+        # the # header cell.  Because it is a child of the table view itself
+        # and raised above the header, Qt cannot clip it behind the header's
+        # private viewport the way the earlier overlay attempts could.
+        self.column_fold_restore_btn = QPushButton("▼", self.table)
+        self.column_fold_restore_btn.setObjectName("ColumnFoldCollapseButton")
+        self.column_fold_restore_btn.setProperty("columnRestore", True)
+        self.column_fold_restore_btn.setFixedSize(28, 13)
+        self.column_fold_restore_btn.setFocusPolicy(Qt.NoFocus)
+        self.column_fold_restore_btn.setToolTip("Show the column shortcut bar.")
+        self.column_fold_restore_btn.clicked.connect(lambda checked=False: self._set_column_shortcuts_visible(True))
+        self.column_fold_restore_btn.hide()
+        self.table.resized.connect(lambda: QTimer.singleShot(0, self._position_column_fold_restore_btn))
+        self.table.horizontalHeader().sectionResized.connect(lambda *_: QTimer.singleShot(0, self._position_column_fold_restore_btn))
+        self.table.horizontalScrollBar().valueChanged.connect(lambda *_: QTimer.singleShot(0, self._position_column_fold_restore_btn))
+
+        # Gallery-only quick filters. Status and CC Type already live in the
+        # main Library filter row, so do not duplicate them here. Keep only
+        # Gallery-specific shortcuts to reduce crowding and make the strip fit.
         self.gallery_quick_bar = QFrame()
         self.gallery_quick_bar.setObjectName("GalleryQuickBar")
         gallery_quick_layout = QHBoxLayout(self.gallery_quick_bar)
-        gallery_quick_layout.setContentsMargins(7, 4, 7, 4)
-        gallery_quick_layout.setSpacing(5)
-        gallery_quick_label = QLabel("Gallery filters:")
-        gallery_quick_label.setObjectName("GalleryQuickLabel")
-        gallery_quick_layout.addWidget(gallery_quick_label)
+        gallery_quick_layout.setContentsMargins(5, 2, 5, 2)
+        gallery_quick_layout.setSpacing(4)
 
-        self.gallery_status_buttons = {}
-        for status_name in PUBLIC_STATUS_OPTIONS:
-            button = QPushButton(status_name)
-            button.setObjectName("GalleryQuickButton")
-            button.setCheckable(True)
-            button.clicked.connect(lambda checked=False, s=status_name: self._gallery_status_filter_clicked(s, checked))
-            self.gallery_status_buttons[status_name] = button
-            gallery_quick_layout.addWidget(button)
-
-        gallery_type_label = QLabel("CC Type:")
-        gallery_type_label.setObjectName("GalleryQuickLabel")
-        gallery_quick_layout.addWidget(gallery_type_label)
-
-        self.gallery_type_filter = ArrowComboBox()
-        self.gallery_type_filter.setObjectName("GalleryQuickCombo")
-        self.gallery_type_filter.setMinimumWidth(130)
-        self.gallery_type_filter.setMaximumWidth(170)
-        self.gallery_type_filter.addItem("All")
-        self.gallery_type_filter.currentTextChanged.connect(self._apply_gallery_quick_filters)
-        gallery_quick_layout.addWidget(self.gallery_type_filter)
-
-        self.gallery_thumb_filter_btn = QPushButton("Has thumbnail")
+        self.gallery_thumb_filter_btn = QPushButton("Thumbnail")
         self.gallery_thumb_filter_btn.setObjectName("GalleryQuickButton")
         self.gallery_thumb_filter_btn.setCheckable(True)
+        self.gallery_thumb_filter_btn.setToolTip("Show only packages that have a thumbnail.")
         self.gallery_thumb_filter_btn.clicked.connect(self._apply_gallery_quick_filters)
-        gallery_quick_layout.addWidget(self.gallery_thumb_filter_btn)
 
         self.gallery_pinned_filter_btn = QPushButton("Pinned")
         self.gallery_pinned_filter_btn.setObjectName("GalleryQuickButton")
         self.gallery_pinned_filter_btn.setCheckable(True)
+        self.gallery_pinned_filter_btn.setToolTip("Show only pinned packages.")
         self.gallery_pinned_filter_btn.clicked.connect(self._apply_gallery_quick_filters)
-        gallery_quick_layout.addWidget(self.gallery_pinned_filter_btn)
 
         self.gallery_unsaved_filter_btn = QPushButton("Unsaved")
         self.gallery_unsaved_filter_btn.setObjectName("GalleryQuickButton")
         self.gallery_unsaved_filter_btn.setCheckable(True)
+        self.gallery_unsaved_filter_btn.setToolTip("Show only packages with unsaved edits.")
         self.gallery_unsaved_filter_btn.clicked.connect(self._apply_gallery_quick_filters)
-        gallery_quick_layout.addWidget(self.gallery_unsaved_filter_btn)
+
+        self.gallery_quick_clear_btn = QPushButton("Clear")
+        self.gallery_quick_clear_btn.setObjectName("GalleryQuickClear")
+        self.gallery_quick_clear_btn.setToolTip("Clear the Gallery quick filters.")
+        self.gallery_quick_clear_btn.clicked.connect(self._clear_gallery_quick_filters)
+
+        # Gallery shortcuts should read like a small toolbar, not a second full
+        # filter row. Keep the three filter toggles grouped on the left. Clear
+        # is a separate utility action on the far right and only appears when
+        # at least one Gallery quick filter is active.
+        for button in (
+            self.gallery_thumb_filter_btn,
+            self.gallery_pinned_filter_btn,
+            self.gallery_unsaved_filter_btn,
+        ):
+            button.setMinimumWidth(68)
+            button.setMaximumWidth(104)
+            button.setFixedHeight(24)
+            button.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+            gallery_quick_layout.addWidget(button, 0)
 
         gallery_quick_layout.addStretch(1)
-        self.gallery_quick_clear_btn = QPushButton("Clear quick")
-        self.gallery_quick_clear_btn.setObjectName("GalleryQuickClear")
-        self.gallery_quick_clear_btn.clicked.connect(self._clear_gallery_quick_filters)
-        gallery_quick_layout.addWidget(self.gallery_quick_clear_btn)
+        self.gallery_quick_clear_btn.setMinimumWidth(54)
+        self.gallery_quick_clear_btn.setMaximumWidth(72)
+        self.gallery_quick_clear_btn.setFixedHeight(24)
+        self.gallery_quick_clear_btn.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.gallery_quick_clear_btn.setVisible(False)
+        gallery_quick_layout.addWidget(self.gallery_quick_clear_btn, 0)
 
-        # Preserve the DEV splitter fix without changing the FIX46 visual row.
-        # Keep overflow inside an invisible viewport so the right-side details
-        # panel remains freely draggable/widenable.  The horizontal scrollbar is
-        # deliberately hidden: showing it steals vertical space from the FIX46
-        # row and makes the Gallery filter band taller than the release layout.
-        self.gallery_quick_bar.setMinimumWidth(self.gallery_quick_bar.sizeHint().width())
+        # Keep the right-side Details panel freely draggable/widenable without
+        # introducing a second horizontal scrollbar row in Gallery.
+        self.gallery_quick_bar.setMinimumWidth(0)
+        self.gallery_quick_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.gallery_quick_scroll = QScrollArea()
         self.gallery_quick_scroll.setObjectName("GalleryQuickScroll")
         self.gallery_quick_scroll.setFrameShape(QFrame.NoFrame)
@@ -3012,7 +3990,7 @@ class MainWindow(QMainWindow):
         self.gallery_quick_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.gallery_quick_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.gallery_quick_scroll.setMinimumWidth(0)
-        self.gallery_quick_scroll.setFixedHeight(self.gallery_quick_bar.sizeHint().height())
+        self.gallery_quick_scroll.setFixedHeight(32)
         self.gallery_quick_scroll.viewport().setAutoFillBackground(False)
         self.gallery_quick_scroll.setWidget(self.gallery_quick_bar)
         self.gallery_quick_scroll.setVisible(False)
@@ -3020,15 +3998,71 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.gallery_quick_scroll, 0)
         left_layout.addWidget(self.pinned_bar, 0)
 
+        self.table_page = QWidget()
+        self.table_page.setObjectName("TablePage")
+        table_page_layout = QVBoxLayout(self.table_page)
+        table_page_layout.setContentsMargins(0, 0, 0, 0)
+        table_page_layout.setSpacing(0)
+        table_page_layout.addWidget(self.table, 1)
+
+        # Use one dedicated horizontal-scroll row instead of trying to float
+        # child buttons on QTableView's private scrollbar.  The internal bar is
+        # hidden but remains the source of the real table range/value.  This row
+        # replaces the vertical space the native scrollbar would have used, so
+        # the nudge buttons are visibly part of the scrollbar row rather than a
+        # second row or an overlay on the package cells.
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.table_scroll_row = QFrame()
+        self.table_scroll_row.setObjectName("TableHorizontalScrollRow")
+        table_scroll_layout = QHBoxLayout(self.table_scroll_row)
+        table_scroll_layout.setContentsMargins(0, 0, 0, 0)
+        table_scroll_layout.setSpacing(1)
+        self.table_external_hbar = QScrollBar(Qt.Horizontal)
+        self.table_external_hbar.setObjectName("TableExternalHorizontalScrollBar")
+        self.table_external_hbar.setSingleStep(18)
+        table_scroll_layout.addWidget(self.table_external_hbar, 1)
+
+        self.table_scroll_left_btn = QPushButton("‹")
+        self.table_scroll_left_btn.setObjectName("TableScrollNudgeButton")
+        self.table_scroll_left_btn.setToolTip("Nudge the Table left")
+        self.table_scroll_left_btn.setFocusPolicy(Qt.NoFocus)
+        self.table_scroll_left_btn.setAutoRepeat(True)
+        self.table_scroll_left_btn.setAutoRepeatDelay(300)
+        self.table_scroll_left_btn.setAutoRepeatInterval(70)
+        self.table_scroll_left_btn.setFixedSize(20, 22)
+        table_scroll_layout.addWidget(self.table_scroll_left_btn, 0)
+
+        self.table_scroll_right_btn = QPushButton("›")
+        self.table_scroll_right_btn.setObjectName("TableScrollNudgeButton")
+        self.table_scroll_right_btn.setToolTip("Nudge the Table right")
+        self.table_scroll_right_btn.setFocusPolicy(Qt.NoFocus)
+        self.table_scroll_right_btn.setAutoRepeat(True)
+        self.table_scroll_right_btn.setAutoRepeatDelay(300)
+        self.table_scroll_right_btn.setAutoRepeatInterval(70)
+        self.table_scroll_right_btn.setFixedSize(20, 22)
+        table_scroll_layout.addWidget(self.table_scroll_right_btn, 0)
+        self.table_scroll_row.setFixedHeight(22)
+        table_page_layout.addWidget(self.table_scroll_row, 0)
+
+        internal_hbar = self.table.horizontalScrollBar()
+        internal_hbar.rangeChanged.connect(self._sync_table_external_scrollbar)
+        internal_hbar.valueChanged.connect(self._sync_table_external_scrollbar_value)
+        self.table_external_hbar.valueChanged.connect(self._set_table_horizontal_from_external)
+        self.table_scroll_left_btn.clicked.connect(lambda: self._nudge_table_horizontal(-36))
+        self.table_scroll_right_btn.clicked.connect(lambda: self._nudge_table_horizontal(36))
+        self.table.resized.connect(lambda: QTimer.singleShot(0, self._sync_table_external_scrollbar))
+        self.table.horizontalHeader().sectionResized.connect(lambda *_: QTimer.singleShot(0, self._sync_table_external_scrollbar))
+
         self.library_stack = QStackedWidget()
         self.library_stack.setObjectName("LibraryStack")
-        self.library_stack.addWidget(self.table)
+        self.library_stack.addWidget(self.table_page)
         self.library_stack.addWidget(self.gallery)
         left_layout.addWidget(self.library_stack, 1)
         self.splitter.addWidget(left)
 
         # Right details card.
         right = QFrame()
+        self.detail_panel = right
         right.setObjectName("DetailPanel")
         # Slightly wider than the old compact pane, but still leaves most space to the Library.
         right.setMinimumWidth(300)
@@ -3124,6 +4158,14 @@ class MainWindow(QMainWindow):
         overview_layout.setContentsMargins(5, 1, 5, 5)
         overview_layout.setSpacing(7)
 
+        # Overview uses a user-resizable vertical splitter: the thumbnail can stay
+        # large when wanted, while Age/Gender/Creator and other summary metadata
+        # can be given more room instead of being trapped in a tiny fixed card.
+        self.overview_splitter = QSplitter(Qt.Vertical)
+        self.overview_splitter.setObjectName("OverviewVerticalSplitter")
+        self.overview_splitter.setChildrenCollapsible(False)
+        self.overview_splitter.setHandleWidth(9)
+
         self.thumbnail_card = QFrame()
         self.thumbnail_card.setObjectName("ThumbnailCard")
         thumb_layout = QVBoxLayout(self.thumbnail_card)
@@ -3131,15 +4173,16 @@ class MainWindow(QMainWindow):
         self.thumbnail_label = ResponsiveThumbnailLabel("No thumbnail")
         self.thumbnail_label.setObjectName("ThumbnailImage")
         self.thumbnail_label.setAlignment(Qt.AlignCenter)
-        # Make the preview the flexible, high-priority area. Do not enlarge its
-        # minimum every time the title gains another line: the image will be
-        # drawn to fit whatever *visible* height remains.
-        self.thumbnail_label.setMinimumHeight(180)
+        # Keep only a small safety minimum here.  The parent splitter should be
+        # able to give almost all available height to either the thumbnail or
+        # the summary card when the user drags the divider.
+        self.thumbnail_label.setMinimumHeight(60)
         self.thumbnail_label.setMaximumHeight(1000)
         self.thumbnail_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        self.thumbnail_card.setMinimumHeight(78)
         self.thumbnail_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         thumb_layout.addWidget(self.thumbnail_label, 1)
-        overview_layout.addWidget(self.thumbnail_card, 1)
+        self.overview_splitter.addWidget(self.thumbnail_card)
 
         self.info_card = QFrame()
         self.info_card.setObjectName("InfoCard")
@@ -3151,17 +4194,33 @@ class MainWindow(QMainWindow):
         self.info_browser.setOpenExternalLinks(False)
         self.info_browser.anchorClicked.connect(self._open_random_sim_usage_link)
         info_layout.addWidget(self.info_browser)
-        # Keep the info card compact because its QTextBrowser already scrolls.
-        # Otherwise an expanding info area can take half the available height,
-        # leaving the portrait preview clipped after a long title appears.
-        # The browser inside already scrolls. Return some of its former height
-        # to the thumbnail so the displayed photo can be bigger, never smaller.
-        self.info_card.setMinimumHeight(95)
-        self.info_card.setMaximumHeight(120)
-        self.info_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        overview_layout.addWidget(self.info_card, 0)
-        overview_layout.setStretch(0, 1)
-        overview_layout.setStretch(1, 0)
+        # QTextBrowser already scrolls when needed, so a small minimum gives the
+        # splitter a genuinely useful range instead of trapping the divider in
+        # a narrow band.
+        self.info_card.setMinimumHeight(78)
+        self.info_card.setMaximumHeight(16777215)
+        self.info_card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.overview_splitter.addWidget(self.info_card)
+        self.overview_splitter.setStretchFactor(0, 3)
+        self.overview_splitter.setStretchFactor(1, 1)
+
+        raw_overview_sizes = self.settings.value("overview_splitter_sizes", [360, 250])
+        if isinstance(raw_overview_sizes, str):
+            try:
+                parsed = json.loads(raw_overview_sizes)
+                raw_overview_sizes = parsed if isinstance(parsed, list) else [360, 250]
+            except (TypeError, ValueError):
+                raw_overview_sizes = [360, 250]
+        try:
+            overview_sizes = [max(1, int(v)) for v in list(raw_overview_sizes)[:2]]
+        except (TypeError, ValueError):
+            overview_sizes = [360, 250]
+        if len(overview_sizes) != 2:
+            overview_sizes = [360, 250]
+        self.overview_splitter.setSizes(overview_sizes)
+        self.overview_splitter.splitterMoved.connect(self._save_overview_splitter_sizes)
+        overview_layout.addWidget(self.overview_splitter, 1)
+        QTimer.singleShot(0, lambda sizes=overview_sizes: self.overview_splitter.setSizes(sizes))
 
         # If someone makes the window very short, scroll the Overview page as
         # a whole instead of showing a physically cut-off image/info panel.
@@ -3251,11 +4310,15 @@ class MainWindow(QMainWindow):
 
         self.status_edit = QComboBox()
         self.creator_edit = QLineEdit()
-        self.creator_edit.setPlaceholderText("Creator / site name…")
-        self.creator_edit.setToolTip("Optional manual creator name. CAS Curator does not guess this value automatically.")
+        self.creator_edit.setPlaceholderText("Original creator / mesher…")
+        self.creator_edit.setToolTip("Optional manual original creator or mesh author. CAS Curator does not guess this value automatically.")
+        self.converter_edit = QLineEdit()
+        self.converter_edit.setPlaceholderText("Converter / conversion by…")
+        self.converter_edit.setToolTip("Optional manual converter name for CC converted between Sims games/versions. Leave blank when the item is not a conversion.")
         self.file_location_edit = QComboBox()
         self.file_location_edit.setToolTip(
-            "Choose the folder containing the original, unmerged package. This records a location only; it does not move the file."
+            "Current physical File Location recorded for the original, unmerged package. "
+            "Editing this records the association only; use a managed Move action when you want CAS Curator to move the file."
         )
         self.file_location_manage_btn = QPushButton("Manage Locations…")
         self.file_location_manage_btn.setToolTip("Add named folders and manage their saved paths in the Master Database.")
@@ -3283,7 +4346,7 @@ class MainWindow(QMainWindow):
         self.cc_magic_profiles_edit.setPlaceholderText("No profiles assigned")
         self.cc_magic_profiles_edit.setToolTip(
             "Read-only list of Profiles currently assigned to this package. "
-            "Use Add to / Choose Profile above to add membership; use the table Profile dropdown or fill-down for row changes."
+            "Use Add to above to add membership, or Remove from above to remove one safely."
         )
         self.cc_magic_profiles_edit.setMinimumHeight(44)
         self.cc_magic_profiles_edit.setMaximumHeight(150)
@@ -3299,7 +4362,37 @@ class MainWindow(QMainWindow):
         self.notes_edit.textChanged.connect(self._update_dynamic_editor_heights)
         form.addRow("Status:", self.status_edit)
         form.addRow("Creator:", self.creator_edit)
-        form.addRow("File Location:", file_location_tools)
+        form.addRow("Converter:", self.converter_edit)
+        self.current_file_location_label = QLabel("Current File Location:")
+        form.addRow(self.current_file_location_label, file_location_tools)
+
+        # Experimental Profile Layouts keep a desired location per Profile without
+        # pretending the file physically exists in several places at once. This row
+        # appears only when Experimental is enabled and a Current Profile is chosen
+        # from Profiles….
+        self.profile_location_edit = QComboBox()
+        self.profile_location_edit.setToolTip(
+            "Route packages into managed File Locations first. Then choose the desired managed File Location for the selected Profile. "
+            "Save Changes stores the plan only; no package file moves until Tools > Experimental Profile Layouts > Apply Profile Locations."
+        )
+        self.profile_location_help = QLabel(
+            "Planned Location for the selected Profile only. Save stores the plan; Apply Profile Locations performs moves."
+        )
+        self.profile_location_help.setWordWrap(True)
+        self.profile_location_help.setObjectName("EditHelp")
+        self.profile_location_tools = QWidget()
+        profile_location_layout = QVBoxLayout(self.profile_location_tools)
+        profile_location_layout.setContentsMargins(0, 0, 0, 0)
+        profile_location_layout.setSpacing(4)
+        profile_location_layout.addWidget(self.profile_location_edit)
+        profile_location_layout.addWidget(self.profile_location_help)
+        self.profile_location_label = QLabel("Planned Location:")
+        form.addRow(self.profile_location_label, self.profile_location_tools)
+        try:
+            form.setRowVisible(self.profile_location_tools, False)
+        except AttributeError:
+            self.profile_location_label.setVisible(False)
+            self.profile_location_tools.setVisible(False)
 
         # Merge Profiles are a separate managed grouping. A package can belong
         # to several merged collections at once; that assignment itself indicates
@@ -3357,8 +4450,19 @@ class MainWindow(QMainWindow):
         # the table fill-down feature instead of separate selected/shown buttons.
         self.cc_magic_profile_quick = QComboBox()
         self.cc_magic_profile_quick.setEditable(False)
-        self.cc_magic_profile_quick.setToolTip("Choose an existing Profile to add to this package.")
+        self.cc_magic_profile_quick.setToolTip(
+            "Shows only Profiles not already assigned to this package. Choosing one adds it; existing memberships are preserved."
+        )
         form.addRow("Add to:", self.cc_magic_profile_quick)
+
+        self.cc_magic_profile_remove_quick = QComboBox()
+        self.cc_magic_profile_remove_quick.setEditable(False)
+        self.cc_magic_profile_remove_quick.setToolTip(
+            "Choose one of this package's existing Profile memberships to remove. "
+            "The change stays staged until Save Changes."
+        )
+        form.addRow("Remove from:", self.cc_magic_profile_remove_quick)
+
         # Assignment area always uses plural because the control supports multiple Profiles.
         self.profiles_assigned_label = QLabel("Profiles assigned to this package:")
         form.addRow(self.profiles_assigned_label, self.cc_magic_profiles_edit)
@@ -3396,7 +4500,9 @@ class MainWindow(QMainWindow):
 
         self.status_edit.currentTextChanged.connect(self._status_editor_changed)
         self.creator_edit.textChanged.connect(self._editor_changed)
+        self.converter_edit.textChanged.connect(self._editor_changed)
         self.file_location_edit.currentTextChanged.connect(self._editor_changed)
+        self.profile_location_edit.currentIndexChanged.connect(self._profile_location_editor_changed)
         self.file_location_manage_btn.clicked.connect(self.manage_file_locations)
         self.file_location_open_btn.clicked.connect(self.open_selected_file_location)
         self.merge_profiles_set_btn.clicked.connect(self._choose_merge_profiles_for_current)
@@ -3405,6 +4511,7 @@ class MainWindow(QMainWindow):
         self.preview_image_add_btn.clicked.connect(self._choose_manual_preview_image)
         self.preview_image_clear_btn.clicked.connect(self._clear_manual_preview_image)
         self.cc_magic_profile_quick.activated.connect(self._cc_profile_quick_selected)
+        self.cc_magic_profile_remove_quick.activated.connect(self._cc_profile_remove_quick_selected)
         self._set_editor_enabled(False)
 
         self.all_fields_page = QWidget()
@@ -3426,10 +4533,22 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(0, 1)
         self.splitter.setStretchFactor(1, 0)
         self.splitter.setChildrenCollapsible(False)
-        self.splitter.setHandleWidth(7)
-        self.splitter.setSizes([1192, 353])
-        self.splitter.splitterMoved.connect(lambda *_: self._fit_detail_title())
+        self.splitter.setCollapsible(0, False)
+        self.splitter.setCollapsible(1, True)
+        # Keep only a slim draggable divider. The hide/show controls live inside
+        # the existing Table/Gallery top rows, so the divider itself never looks
+        # like an extra UI column.
+        self.splitter.setHandleWidth(4)
+        self.splitter.setSizes([1192, self.detail_panel_width])
+        # Do not overlay a hide/show chevron on the splitter.  Even a tiny
+        # floating control can affect/obscure the narrow Table/Gallery edge at
+        # some DPI scales.  The top-row Details toggle owns collapse/restore.
+        self.splitter.splitterMoved.connect(self._main_library_splitter_moved)
+        self.splitter.detailPanelToggled.connect(self._detail_panel_toggled)
         self._set_library_view(self.view_mode, persist=False)
+        QTimer.singleShot(0, self._restore_detail_panel_state)
+        QTimer.singleShot(0, self._sync_table_external_scrollbar)
+        QTimer.singleShot(0, self._update_detail_panel_toggle_buttons)
 
         self.statusBar().showMessage("Open Sims3_CC_Master_Database.xlsx — editable manual fields: Status / File Location / Profiles / Notes")
 
@@ -4135,6 +5254,98 @@ class MainWindow(QMainWindow):
             detail_info_text = _button_text_for(detail_info_fill, dark=t["text"], light="#FFFFFF")
         button_text = _button_text_for(filter_button, dark=t["text"], light="#FFFFFF")
         arrow_color = _button_text_for(filter_button, dark="#3F3F3F", light="#FFFFFF")
+        # Hidden Details restore control: stay very close to the normal themed
+        # view-button colour, with only a subtle tone shift so it reads as a
+        # related control rather than a bright accent.
+        if _luma_hex(filter_button) < 145:
+            detail_restore_fill = _mix_hex(filter_button, "#FFFFFF", 0.06)
+        else:
+            detail_restore_fill = _mix_hex(filter_button, "#000000", 0.06)
+        # Match the Details restore chevron to the theme's normal font family:
+        # themes that use dark text get a true black arrow instead of a
+        # contrast-selected white arrow on the coloured restore button.
+        detail_restore_uses_black = _luma_hex(t["text"]) < 128
+        detail_restore_text = "#000000" if detail_restore_uses_black else _button_text_for(
+            detail_restore_fill, dark=t["text"], light="#FFFFFF"
+        )
+        detail_restore_hover = (
+            _mix_hex(detail_restore_fill, "#FFFFFF", 0.05)
+            if _luma_hex(detail_restore_fill) < 145
+            else _mix_hex(detail_restore_fill, "#000000", 0.05)
+        )
+        detail_restore_border = scrollbar_color
+        # Theme-specific restore-button polish. Keep the compact 20 px control,
+        # but let these two plum themes stay visually tied to their neighbouring
+        # view buttons instead of looking washed out or overly luminous.
+        if self.theme_name == "Plum Ice":
+            detail_restore_fill = filter_button
+            detail_restore_text = t["text"]
+            detail_restore_border = scrollbar_color
+            detail_restore_hover = _mix_hex(filter_button, t["accent"], 0.05)
+        elif self.theme_name == "Night Plum":
+            detail_restore_fill = filter_button
+            detail_restore_text = "#000000"
+            detail_restore_border = "#443650"
+            detail_restore_hover = _mix_hex(filter_button, "#000000", 0.04)
+
+        # Aqua Depth and Black Cherry use light text on their themed buttons,
+        # so the compact Details restore chevron should match that button text
+        # rather than the darker general theme text colour.
+        if self.theme_name in {"Aqua Depth", "Black Cherry"}:
+            detail_restore_text = "#FFFFFF"
+
+        # Column-shortcut micro-tab: keep the control compact and easy to find
+        # without letting the arrow dominate the header. Borders are a little
+        # clearer in every theme, while very dark/black arrow colours are
+        # softened to dark grey on light backgrounds.
+        if _luma_hex(top_fill) < 125:
+            column_collapse_fill = _mix_hex(top_fill, filter_button, 0.20)
+            column_collapse_border = _mix_hex(top_fill, scrollbar_color, 0.45)
+            column_collapse_hover = _mix_hex(top_fill, filter_button, 0.30)
+            column_collapse_text = _button_text_for(top_fill, dark=t["text"], light="#FFFFFF")
+        else:
+            column_collapse_fill = "transparent"
+            column_collapse_border = _mix_hex(top_fill, t["text"], 0.18)
+            column_collapse_hover = _mix_hex(top_fill, filter_button, 0.07)
+            column_collapse_text = t["text"]
+            if _luma_hex(column_collapse_text) < 90:
+                column_collapse_text = "#5A5A5A"
+        # Very light/white glyphs read optically larger than dark glyphs at the
+        # same nominal size, so trim them by one pixel for visual balance.
+        column_collapse_font_size = 6 if _luma_hex(column_collapse_text) > 220 else 7
+
+        # Hidden shortcut-row cue: when the Columns shortcut row is collapsed,
+        # the floating ▼ tab gets a subtle fill derived from the current theme
+        # plus a clearer border. Cherry Blossom Pink uses only a very light tint
+        # so the cue is visible without becoming a prominent filled button.
+        if self.theme_name == "Cherry Blossom Pink":
+            column_restore_fill = _mix_hex(top_fill, filter_button, 0.08)
+            column_restore_border = _mix_hex(top_fill, column_collapse_border, 0.12)
+            column_restore_hover = _mix_hex(top_fill, filter_button, 0.14)
+            column_restore_hover_border = _mix_hex(top_fill, column_collapse_border, 0.35)
+        else:
+            restore_mix = 0.30 if _luma_hex(top_fill) < 125 else 0.20
+            column_restore_fill = _mix_hex(top_fill, filter_button, restore_mix)
+            column_restore_hover = _mix_hex(top_fill, filter_button, min(restore_mix + 0.10, 0.45))
+            if _luma_hex(top_fill) < 125:
+                column_restore_border = _mix_hex(column_collapse_border, "#FFFFFF", 0.20)
+            else:
+                column_restore_border = _mix_hex(column_collapse_border, t["text"], 0.18)
+            column_restore_hover_border = column_restore_border
+
+        # These three cool themes looked too prominent with a filled hidden-row
+        # restore tab. Keep the border cue, but return the idle interior to
+        # transparent so it blends back into the header.
+        if self.theme_name in {"Aqua Depth", "Blue Grey Rose", "Carbon Blue"}:
+            column_restore_fill = "transparent"
+
+        # Aqua Depth's transparent tab only needs a gentle outline. Soften its
+        # restore border toward the surrounding aqua without changing the arrow
+        # or the shared border treatment used by any other theme.
+        if self.theme_name == "Aqua Depth":
+            column_restore_border = _mix_hex(column_restore_border, top_fill, 0.18)
+            column_restore_hover_border = column_restore_border
+
         badge_fill = "#FFFFFF"
         badge_text = t["text"]
         tab_fill = header_fill
@@ -4885,6 +6096,40 @@ class MainWindow(QMainWindow):
                 color: {button_text};
                 border: 1px solid {strong_button_border if self.theme_name == "Cherry Blossom Pink" else scrollbar_color};
             }}
+            QPushButton#ViewToggle[detailsRestore="true"] {{
+                background: {detail_restore_fill};
+                color: {detail_restore_text};
+                border: 1px solid {detail_restore_border};
+                border-radius: 7px;
+                padding: 2px 1px;
+                font-weight: 700;
+            }}
+            QPushButton#ViewToggle[detailsRestore="true"]:hover {{
+                background: {detail_restore_hover};
+                color: {"#000000" if detail_restore_uses_black else _button_text_for(detail_restore_hover, dark=t["text"], light="#FFFFFF")};
+            }}
+            QPushButton#ColumnFoldCollapseButton {{
+                background: {column_collapse_fill};
+                color: {column_collapse_text};
+                border: 1px solid {column_collapse_border};
+                border-radius: 3px;
+                padding: 0px;
+                font-size: {column_collapse_font_size}px;
+                font-weight: 900;
+            }}
+            QPushButton#ColumnFoldCollapseButton:hover {{
+                background: {column_collapse_hover};
+                color: {column_collapse_text};
+                border-color: {column_collapse_border};
+            }}
+            QPushButton#ColumnFoldCollapseButton[columnRestore="true"] {{
+                background: {column_restore_fill};
+                border-color: {column_restore_border};
+            }}
+            QPushButton#ColumnFoldCollapseButton[columnRestore="true"]:hover {{
+                background: {column_restore_hover};
+                border-color: {column_restore_hover_border};
+            }}
             QLabel#ViewLabel {{ background: transparent; color: {surface_text}; }}
 
             QFrame#MainPanel {{ background: {main_fill}; border: 1px solid #C9C9C9; border-radius: 5px; }}
@@ -4892,8 +6137,8 @@ class MainWindow(QMainWindow):
             QFrame#GalleryQuickBar {{
                 background: {header_fill};
                 border: 1px solid #C9C9C9;
-                border-radius: 7px;
-                margin: 4px 4px 0px 4px;
+                border-radius: 6px;
+                margin: 1px 4px 0px 4px;
             }}
             QLabel#GalleryQuickLabel {{ background: transparent; color: {header_text}; font-weight: 650; }}
             QComboBox#GalleryQuickCombo {{
@@ -4914,20 +6159,62 @@ class MainWindow(QMainWindow):
                 border-bottom-right-radius: 6px;
             }}
             QComboBox#GalleryQuickCombo::down-arrow {{ image: none; width: 0px; height: 0px; }}
-            QPushButton#GalleryQuickButton, QPushButton#GalleryQuickClear {{
+            QPushButton#GalleryQuickButton {{
                 background: #FFFFFF;
                 color: {t['text']};
                 border: 1px solid {button_border};
-                border-radius: 9px;
-                padding: 4px 9px;
+                border-radius: 7px;
+                padding: 1px 7px;
             }}
             QPushButton#GalleryQuickButton:checked {{
                 background: {filter_button};
                 color: {button_text};
                 border: 1px solid {strong_button_border if self.theme_name == "Cherry Blossom Pink" else scrollbar_color};
             }}
-            QPushButton#GalleryQuickButton:hover, QPushButton#GalleryQuickClear:hover {{ border-color: {scrollbar_color}; }}
+            QPushButton#GalleryQuickButton:hover {{ border-color: {scrollbar_color}; }}
+            QPushButton#GalleryQuickClear {{
+                background: transparent;
+                color: {header_text};
+                border: 1px solid {_mix_hex(header_fill, scrollbar_color, 0.55)};
+                border-radius: 7px;
+                padding: 1px 7px;
+                font-weight: 650;
+            }}
+            QPushButton#GalleryQuickClear:hover {{
+                background: {_mix_hex(header_fill, '#FFFFFF', 0.20)};
+                border-color: {scrollbar_color};
+            }}
             QStackedWidget#LibraryStack {{ background: {main_fill}; border: none; }}
+            QWidget#TablePage {{ background: {main_fill}; border: none; }}
+            QFrame#TableHorizontalScrollRow {{ background: #F3F3F3; border: none; }}
+            QScrollBar#TableExternalHorizontalScrollBar:horizontal {{
+                background: #F3F3F3; height: 22px;
+                margin: 1px; border: none; border-radius: 10px;
+            }}
+            QScrollBar#TableExternalHorizontalScrollBar::handle:horizontal {{
+                background: {scrollbar_color}; min-width: 42px; border: none;
+                border-radius: 8px; margin: 4px 3px;
+            }}
+            QScrollBar#TableExternalHorizontalScrollBar::handle:horizontal:hover {{ background: {scrollbar_hover}; }}
+            QScrollBar#TableExternalHorizontalScrollBar::add-line:horizontal,
+            QScrollBar#TableExternalHorizontalScrollBar::sub-line:horizontal {{ width: 0px; background: transparent; border: none; }}
+            QScrollBar#TableExternalHorizontalScrollBar::add-page:horizontal,
+            QScrollBar#TableExternalHorizontalScrollBar::sub-page:horizontal {{ background: transparent; }}
+            QPushButton#TableScrollNudgeButton {{
+                padding: 0px; font-size: 10pt; font-weight: 700;
+                background: #FFFFFF; color: {t['text']};
+                border: 1px solid {button_border}; border-radius: 3px;
+            }}
+            QPushButton#TableScrollNudgeButton:hover {{ border-color: {scrollbar_color}; }}
+            QPushButton#TableScrollNudgeButton:disabled {{ color: #A0A0A0; background: #EEEEEE; }}
+            QSplitter#MainLibrarySplitter::handle:horizontal {{ background: {main_fill}; }}
+            QSplitter#MainLibrarySplitter::handle:horizontal:hover {{ background: {_mix_hex(scrollbar_color, '#FFFFFF', 0.75)}; }}
+            QPushButton#DetailPanelEdgeToggleButton {{
+                min-width: 18px; max-width: 18px; min-height: 27px; max-height: 27px;
+                padding: 0px; border-radius: 5px; font-size: 10pt; font-weight: 700;
+                background: {filter_button}; color: {button_text}; border: 1px solid {button_border};
+            }}
+            QPushButton#DetailPanelEdgeToggleButton:hover {{ border-color: {scrollbar_color}; }}
             QListView#GalleryView {{
                 background: {main_fill};
                 border: none;
@@ -4990,6 +6277,12 @@ class MainWindow(QMainWindow):
                 color: {thumbnail_text};
             }}
             QFrame#InfoCard {{ background: {detail_info_fill}; border: 1px solid {info_card_border}; border-radius: 8px; }}
+            QSplitter#OverviewVerticalSplitter::handle:vertical {{
+                background: {info_card_border};
+                margin: 2px 54px;
+                border-radius: 3px;
+            }}
+            QSplitter#OverviewVerticalSplitter::handle:vertical:hover {{ background: {scrollbar_color}; }}
             QTextBrowser#InfoBrowser {{ background: {detail_info_fill}; color: {detail_info_text}; border: none; padding: 4px; }}
             QTableWidget {{ background: #FFFFFF; color: {t['text']}; border: 1px solid #C9C9C9; gridline-color: {row_line}; }}
             QDialog {{ background: #FFFFFF; }}
@@ -5049,6 +6342,11 @@ class MainWindow(QMainWindow):
         for box in self.filter_boxes.values():
             if isinstance(box, ArrowComboBox):
                 box.set_arrow_color(arrow_color)
+        # Current Profile is also an ArrowComboBox, but it lives outside the
+        # main filter_boxes collection. Keep its chevron visually consistent
+        # with Status / CC Type / Creator for every theme.
+        if hasattr(self, "current_profile_combo") and isinstance(self.current_profile_combo, ArrowComboBox):
+            self.current_profile_combo.set_arrow_color(arrow_color)
         if hasattr(self, "gallery_type_filter") and isinstance(self.gallery_type_filter, ArrowComboBox):
             self.gallery_type_filter.set_arrow_color(arrow_color)
         if hasattr(self, "gallery_quick_scroll") and hasattr(self, "gallery_quick_bar"):
@@ -5070,6 +6368,20 @@ class MainWindow(QMainWindow):
             delegate.set_options_provider(self._table_editor_options)
         self.table.set_theme(theme_for_rows)
         self.table.viewport().update()
+        if hasattr(self, "frozen_package_table"):
+            frozen_delegate = self.frozen_package_table.itemDelegate()
+            if not isinstance(frozen_delegate, RowOutlineDelegate):
+                frozen_delegate = RowOutlineDelegate(
+                    self.frozen_package_table, theme_for_rows, self._table_editor_options, self.frozen_package_table
+                )
+                self.frozen_package_table.setItemDelegate(frozen_delegate)
+            else:
+                frozen_delegate.set_theme(theme_for_rows)
+                frozen_delegate.set_options_provider(self._table_editor_options)
+            if isinstance(self.frozen_package_table, FrozenPackageTableView):
+                self.frozen_package_table.set_theme(theme_for_rows)
+            else:
+                self.frozen_package_table.viewport().update()
         if hasattr(self, "gallery_delegate"):
             self.gallery_delegate.set_theme({
                 "card": "#FFFFFF",
@@ -5083,6 +6395,244 @@ class MainWindow(QMainWindow):
                 "dirty": "#E09A32",
             })
 
+    def _init_frozen_package_view(self):
+        """Overlay a read-only frozen #/Package strip on the Library table."""
+        self.frozen_package_table = FrozenPackageTableView(self.theme, self.table)
+        frozen = self.frozen_package_table
+        frozen.setObjectName("FrozenPackageTable")
+        frozen.setModel(self.proxy)
+        frozen.setSelectionModel(self.table.selectionModel())
+        frozen.setSelectionBehavior(QTableView.SelectRows)
+        frozen.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        frozen.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        frozen.setFocusPolicy(Qt.NoFocus)
+        frozen.setAlternatingRowColors(False)
+        frozen.setShowGrid(False)
+        frozen.setFrameShape(QFrame.NoFrame)
+        frozen.verticalHeader().setVisible(False)
+        frozen.verticalHeader().setDefaultSectionSize(27)
+        frozen.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        frozen.horizontalHeader().setSectionsMovable(False)
+        frozen.horizontalHeader().setHighlightSections(False)
+        frozen.horizontalHeader().setStretchLastSection(False)
+        frozen.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        frozen.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        frozen.setWordWrap(False)
+        frozen.setContextMenuPolicy(Qt.CustomContextMenu)
+        frozen.customContextMenuRequested.connect(self._show_frozen_table_context_menu)
+        frozen.horizontalHeader().sectionClicked.connect(self._sort_from_frozen_header)
+        frozen.horizontalHeader().sectionResized.connect(self._frozen_package_section_resized)
+        self.table.verticalScrollBar().valueChanged.connect(frozen.verticalScrollBar().setValue)
+        frozen.verticalScrollBar().valueChanged.connect(self.table.verticalScrollBar().setValue)
+        self.table.horizontalHeader().sectionResized.connect(lambda *_: self._sync_frozen_package_view())
+        self.table.resized.connect(self._update_frozen_package_geometry)
+        frozen.hide()
+
+    def _frozen_package_section_resized(self, logical: int, _old: int, new: int):
+        if not self.freeze_package_column or new <= 0:
+            return
+        frozen_fields = {"Package"}
+        if "#" in self.visible_columns:
+            frozen_fields.add("#")
+        if 0 <= logical < len(self.visible_columns) and self.visible_columns[logical] in frozen_fields:
+            if self.table.columnWidth(logical) != new:
+                self.table.setColumnWidth(logical, new)
+
+    def _set_freeze_package_column(self, checked: bool):
+        self.freeze_package_column = bool(checked)
+        self.settings.setValue("freeze_package_column", self.freeze_package_column)
+        self.settings.sync()
+        self._sync_frozen_package_view()
+
+    def _sync_frozen_package_view(self):
+        if not hasattr(self, "frozen_package_table"):
+            return
+        frozen = self.frozen_package_table
+        package_visible = "Package" in self.visible_columns
+        should_show = bool(self.freeze_package_column and package_visible and self.view_mode == "table")
+        if not should_show:
+            frozen.hide()
+            if hasattr(self, "column_fold_restore_btn"):
+                QTimer.singleShot(0, self._position_column_fold_restore_btn)
+            return
+        frozen_columns = []
+        if "#" in self.visible_columns:
+            frozen_columns.append(self.visible_columns.index("#"))
+        frozen_columns.append(self.visible_columns.index("Package"))
+        keep = set(frozen_columns)
+        for column in range(self.proxy.columnCount()):
+            frozen.setColumnHidden(column, column not in keep)
+        for column in frozen_columns:
+            frozen.setColumnWidth(column, self.table.columnWidth(column))
+        frozen.verticalHeader().setDefaultSectionSize(self.table.verticalHeader().defaultSectionSize())
+        self._update_frozen_package_geometry()
+        frozen.show()
+        frozen.raise_()
+        if hasattr(self, "column_fold_restore_btn"):
+            QTimer.singleShot(0, self._position_column_fold_restore_btn)
+
+    def _update_frozen_package_geometry(self):
+        if not hasattr(self, "frozen_package_table"):
+            return
+        frozen_columns = []
+        if "#" in self.visible_columns:
+            frozen_columns.append(self.visible_columns.index("#"))
+        if "Package" in self.visible_columns:
+            frozen_columns.append(self.visible_columns.index("Package"))
+        if not frozen_columns:
+            self.frozen_package_table.hide()
+            return
+        width = sum(self.table.columnWidth(column) for column in frozen_columns)
+        frame = self.table.frameWidth()
+        header_height = self.table.horizontalHeader().height()
+        height = header_height + self.table.viewport().height()
+        self.frozen_package_table.setGeometry(frame, frame, max(1, width), max(1, height))
+        self.frozen_package_table.horizontalHeader().setFixedHeight(header_height)
+        self.frozen_package_table.raise_()
+
+    def _sort_from_frozen_header(self, section: int):
+        if section < 0 or section >= self.proxy.columnCount():
+            return
+        current = self.proxy.sortColumn()
+        order = self.proxy.sortOrder()
+        new_order = Qt.DescendingOrder if current == section and order == Qt.AscendingOrder else Qt.AscendingOrder
+        self.table.sortByColumn(section, new_order)
+        self.frozen_package_table.horizontalHeader().setSortIndicator(section, new_order)
+
+    def _show_frozen_table_context_menu(self, pos):
+        self._show_library_table_context_menu(self.frozen_package_table, pos)
+
+    def _set_table_horizontal_from_external(self, value: int):
+        if not hasattr(self, "table"):
+            return
+        internal = self.table.horizontalScrollBar()
+        if internal.value() != int(value):
+            internal.setValue(int(value))
+        self._update_table_scroll_nudge_buttons()
+
+    def _sync_table_external_scrollbar_value(self, value: int):
+        if not hasattr(self, "table_external_hbar"):
+            return
+        if self.table_external_hbar.value() != int(value):
+            self.table_external_hbar.blockSignals(True)
+            self.table_external_hbar.setValue(int(value))
+            self.table_external_hbar.blockSignals(False)
+        self._update_table_scroll_nudge_buttons()
+
+    def _sync_table_external_scrollbar(self, *_):
+        if not hasattr(self, "table_external_hbar") or not hasattr(self, "table"):
+            return
+        internal = self.table.horizontalScrollBar()
+        external = self.table_external_hbar
+        external.blockSignals(True)
+        external.setRange(internal.minimum(), internal.maximum())
+        external.setPageStep(max(1, internal.pageStep()))
+        external.setSingleStep(18)
+        external.setValue(internal.value())
+        external.blockSignals(False)
+        has_scroll = internal.maximum() > internal.minimum()
+        if hasattr(self, "table_scroll_row"):
+            self.table_scroll_row.setVisible(has_scroll)
+        self._update_table_scroll_nudge_buttons()
+
+    def _nudge_table_horizontal(self, delta: int):
+        if not hasattr(self, "table_external_hbar"):
+            return
+        bar = self.table_external_hbar
+        bar.setValue(max(bar.minimum(), min(bar.maximum(), bar.value() + int(delta))))
+
+    def _position_table_scroll_nudge_buttons(self):
+        # Retained as a compatibility no-op for older queued calls.  The buttons
+        # now live in the same layout row as the scrollbar and need no overlay
+        # positioning.
+        pass
+
+    def _update_table_scroll_nudge_buttons(self):
+        if not hasattr(self, "table_external_hbar"):
+            return
+        bar = self.table_external_hbar
+        active = bar.maximum() > bar.minimum()
+        if hasattr(self, "table_scroll_left_btn"):
+            self.table_scroll_left_btn.setEnabled(active and bar.value() > bar.minimum())
+        if hasattr(self, "table_scroll_right_btn"):
+            self.table_scroll_right_btn.setEnabled(active and bar.value() < bar.maximum())
+
+    def _header_detail_panel_toggled(self, checked=False):
+        if not hasattr(self, "splitter"):
+            return
+        self.splitter.set_detail_panel_collapsed(not bool(checked))
+
+    def _position_detail_panel_toggle_button(self):
+        # Compatibility no-op for any older queued call.  The hide/show control
+        # now lives in the normal top Library row, not on the splitter.
+        pass
+
+    def _update_detail_panel_toggle_buttons(self):
+        collapsed = bool(getattr(self, "detail_panel_collapsed", False))
+        button = getattr(self, "detail_panel_header_btn", None)
+        if button is not None:
+            button.blockSignals(True)
+            button.setChecked(not collapsed)
+            button.blockSignals(False)
+            button.setToolTip("Show details panel" if collapsed else "Hide details panel")
+            # Keep the normal Details label while visible.  When the right-side
+            # panel is hidden, switch this top-row control to a compact restore
+            # chevron instead of showing a disabled-looking Details button.
+            button.setText("◀" if collapsed else "Details")
+            button.setToolTip("Show details panel" if collapsed else "Hide details panel")
+            button.setProperty("detailsRestore", collapsed)
+            button.setProperty("detailsOff", False)
+            button.setFixedWidth(20 if collapsed else 68)
+            button.style().unpolish(button)
+            button.style().polish(button)
+            button.update()
+
+    def _restore_detail_panel_state(self):
+        if not hasattr(self, "splitter"):
+            return
+        self.splitter.last_detail_panel_width = self.detail_panel_width
+        self.splitter.set_detail_panel_collapsed(self.detail_panel_collapsed)
+        self._update_detail_panel_toggle_buttons()
+        QTimer.singleShot(0, self._sync_table_external_scrollbar)
+
+    def _detail_panel_toggled(self, collapsed: bool):
+        self.detail_panel_collapsed = bool(collapsed)
+        self.settings.setValue("detail_panel_collapsed", self.detail_panel_collapsed)
+        if not self.detail_panel_collapsed:
+            self.detail_panel_width = max(300, min(720, int(self.splitter.last_detail_panel_width or 353)))
+            self.settings.setValue("detail_panel_width", self.detail_panel_width)
+        self.settings.sync()
+        self._update_detail_panel_toggle_buttons()
+        self._fit_detail_title()
+        self._update_frozen_package_geometry()
+        QTimer.singleShot(0, self._sync_table_external_scrollbar)
+
+    def _main_library_splitter_moved(self, *_):
+        sizes = self.splitter.sizes() if hasattr(self, "splitter") else []
+        if len(sizes) >= 2:
+            collapsed = sizes[1] <= 0
+            self.splitter.detail_panel_collapsed = collapsed
+            self.detail_panel_collapsed = collapsed
+            if sizes[1] > 0:
+                self.detail_panel_width = max(300, min(720, int(sizes[1])))
+                self.splitter.last_detail_panel_width = self.detail_panel_width
+                self.settings.setValue("detail_panel_width", self.detail_panel_width)
+            self.settings.setValue("detail_panel_collapsed", collapsed)
+            self.settings.sync()
+            self.splitter._refresh_handle()
+            self._update_detail_panel_toggle_buttons()
+        self._fit_detail_title()
+        self._update_frozen_package_geometry()
+        QTimer.singleShot(0, self._sync_table_external_scrollbar)
+
+    def _save_overview_splitter_sizes(self, *_):
+        if not hasattr(self, "overview_splitter"):
+            return
+        sizes = self.overview_splitter.sizes()
+        if len(sizes) >= 2 and all(size > 0 for size in sizes[:2]):
+            self.settings.setValue("overview_splitter_sizes", sizes[:2])
+            self.settings.sync()
+
     def _set_library_view(self, mode: str, persist: bool = True):
         mode = "gallery" if mode == "gallery" else "table"
         self.view_mode = mode
@@ -5094,8 +6644,10 @@ class MainWindow(QMainWindow):
             # Compatibility fallback for older DEV layouts.
             self.gallery_quick_bar.setVisible(mode == "gallery")
         if hasattr(self, "column_fold_bar"):
-            self.column_fold_bar.setVisible(mode == "table")
-        if hasattr(self, "gallery_status_buttons"):
+            self.column_fold_bar.setVisible(mode == "table" and bool(self.column_shortcuts_visible))
+        if hasattr(self, "column_fold_restore_btn"):
+            QTimer.singleShot(0, self._position_column_fold_restore_btn)
+        if hasattr(self, "gallery_thumb_filter_btn"):
             self._apply_gallery_quick_filters()
         if hasattr(self, "table_view_btn"):
             self.table_view_btn.blockSignals(True)
@@ -5113,16 +6665,7 @@ class MainWindow(QMainWindow):
                 self.gallery.scrollTo(current, QAbstractItemView.PositionAtCenter)
             elif mode == "table":
                 self.table.scrollTo(current, QTableView.PositionAtCenter)
-
-    def _gallery_status_filter_clicked(self, status_name: str, checked: bool):
-        # Only one status shortcut at a time; the other Gallery filters can stack.
-        if checked:
-            for name, button in self.gallery_status_buttons.items():
-                if name != status_name:
-                    button.blockSignals(True)
-                    button.setChecked(False)
-                    button.blockSignals(False)
-        self._apply_gallery_quick_filters()
+        self._sync_frozen_package_view()
 
     def _gallery_pinned_source_rows(self):
         rows = set()
@@ -5133,19 +6676,28 @@ class MainWindow(QMainWindow):
         return rows
 
     def _apply_gallery_quick_filters(self, *_):
-        if not hasattr(self, "gallery_status_buttons"):
+        if not hasattr(self, "gallery_thumb_filter_btn"):
             return
-        # Keep the shortcuts truly Gallery-only. Switching back to Table restores
-        # the ordinary global filters without losing the checked Gallery chips.
+        quick_active = any(
+            button.isChecked()
+            for button in (
+                self.gallery_thumb_filter_btn,
+                self.gallery_pinned_filter_btn,
+                self.gallery_unsaved_filter_btn,
+            )
+        )
+        if hasattr(self, "gallery_quick_clear_btn"):
+            self.gallery_quick_clear_btn.setVisible(quick_active)
+
+        # Gallery-specific shortcuts stack with the main Library filters.
+        # Status and CC Type are intentionally controlled only by the main row.
         if getattr(self, "view_mode", "table") != "gallery":
             self.proxy.set_gallery_quick_filters()
             self.shown_label.setText(f"Shown: {self.proxy.rowCount():,}")
             return
-        status = next((name for name, button in self.gallery_status_buttons.items() if button.isChecked()), "")
-        cc_type = self.gallery_type_filter.currentText() if hasattr(self, "gallery_type_filter") else "All"
         self.proxy.set_gallery_quick_filters(
-            status=status,
-            cc_type="" if cc_type == "All" else cc_type,
+            status="",
+            cc_type="",
             thumbnails_only=self.gallery_thumb_filter_btn.isChecked(),
             pinned_only=self.gallery_pinned_filter_btn.isChecked(),
             dirty_only=self.gallery_unsaved_filter_btn.isChecked(),
@@ -5154,18 +6706,10 @@ class MainWindow(QMainWindow):
         self.shown_label.setText(f"Shown: {self.proxy.rowCount():,}")
 
     def _clear_gallery_quick_filters(self):
-        for button in self.gallery_status_buttons.values():
-            button.blockSignals(True)
-            button.setChecked(False)
-            button.blockSignals(False)
         for button in (self.gallery_thumb_filter_btn, self.gallery_pinned_filter_btn, self.gallery_unsaved_filter_btn):
             button.blockSignals(True)
             button.setChecked(False)
             button.blockSignals(False)
-        if hasattr(self, "gallery_type_filter"):
-            self.gallery_type_filter.blockSignals(True)
-            self.gallery_type_filter.setCurrentText("All")
-            self.gallery_type_filter.blockSignals(False)
         self._apply_gallery_quick_filters()
 
     def _gallery_clicked(self, index: QModelIndex):
@@ -5404,8 +6948,8 @@ class MainWindow(QMainWindow):
         self.load_file(target)
 
     def _build_guide_page(self):
-        # Public-release oriented SBS guide. DEV-only experimental tools are
-        # intentionally not documented here.
+        # User-facing SBS guide. Experimental features that are intentionally
+        # exposed in this build are documented clearly and marked Experimental.
         page = QWidget()
         page.setObjectName("GuidePage")
         layout = QVBoxLayout(page)
@@ -5418,10 +6962,10 @@ class MainWindow(QMainWindow):
 
         subtitle_text = (
             "CAS Curator is intended for CAS custom content. Keep script/gameplay mods outside the folder you scan. "
-            "Profiles are optional organisational groups and do not move files."
+            "Choosing/filtering Profiles does not move files; Experimental Profile Layouts move files only through their explicit Apply action."
             if IS_PUBLIC_BUILD else
             "CAS Curator DEV keeps the full development toolset. Use the compact topic menus below to jump straight to the instructions you need. "
-            "Profiles remain optional organisational groups and do not move files."
+            "Choosing/filtering Profiles does not move files; Profile Layouts move files only through their explicit Apply action."
         )
         subtitle = QLabel(subtitle_text)
         subtitle.setObjectName("GuideSubtitle")
@@ -5498,7 +7042,7 @@ class MainWindow(QMainWindow):
         )
         self.guide_browser.setHtml(r'''
 <h1><a name="start"></a>CAS Curator — Step-by-step Guide</h1>
-<p>CAS Curator helps you browse, organise, scan and safely sort Sims 3 CAS custom content. Use the two compact topic menus below to jump straight to the instructions you need.</p>
+<p>CAS Curator helps you browse, organise, scan and safely sort Sims 3 CAS custom content. Use the two compact topic menus below to jump straight to the instructions you need.</p><p><b>Guide style:</b> action features use direct step-by-step instructions that tell you where to click, what to select, what to save, and what should happen next. Explanations are kept alongside the steps rather than replacing them.</p>
 <p><b>New user?</b> You do not need to make a spreadsheet yourself. If you do not already have a Master Database, click <b>Create new MDB…</b>, choose where to save it, then run your first Scan. CAS Curator will add the scanned packages to the new database.</p>
 <p><b>Important:</b> Run Scan generates direct CASP IDs, supported CC Type values and Highest Polys from readable GEOM resources, extracts a dedicated THUM preview when one is available, and records the exact package hash and scan time. Whether a package contains or overlaps with EA resources is not assessed. Skin type, script/gameplay status, general IMG texture purpose and performance-risk ratings are also not supported scan results. Filenames are never used as evidence for the supported classifications.</p>
 
@@ -5528,30 +7072,33 @@ class MainWindow(QMainWindow):
 <li>Click <b>Table</b> at the top right of the Library.</li>
 <li>Click a column heading to sort by that column.</li>
 <li>Drag column headings left or right if you prefer a different order.</li>
-<li>The <b>Columns</b> menu can hide or show individual columns whenever you want; it does not change the data. In Table view, the compact <b>CAS + / −</b>, <b>Health + / −</b> and <b>Organise + / −</b> buttons quickly show or fold related column groups. Your visible-column choices are remembered. Use <b>Columns &gt; Reset to default visible columns</b> whenever you want to restore the normal set. Advanced and Experimental columns are offered only while those options are enabled.</li>
+<li>The <b>Columns</b> menu can hide or show individual columns whenever you want; it does not change the data. In Table view, the compact <b>CAS + / −</b>, <b>Health + / −</b> and <b>Organise + / −</b> buttons quickly show or fold related column groups. Hide that shortcut row with its small ▲ tab and restore it with the ▼ tab over the # header; the choice is remembered. Your visible-column choices are remembered. Use <b>Columns &gt; Freeze Package column</b> to keep the Package name visible while scrolling horizontally; the # column stays beside it when visible. In <b>Columns &gt; Choose visible columns…</b>, use <b>Select all</b>, <b>Deselect all</b> or <b>Default</b> to prepare the ticks before pressing OK. Advanced and Experimental columns are offered only while those options are enabled.</li>
 </ol>
 <h3>Gallery</h3>
 <ol>
 <li>Click <b>Gallery</b>.</li>
-<li>Use the Gallery quick buttons for <b>In Game Use</b>, <b>To Keep</b>, <b>To Review</b>, <b>Has thumbnail</b>, <b>Pinned</b> or <b>Unsaved</b>.</li>
-<li>Use the Gallery <b>CC Type</b> box to narrow the visual list further.</li>
-<li>Gallery quick filters stack with Search, the permanent Library filters and any <b>+ Add Filter…</b> chips that are already active.</li>
-<li>Click <b>Clear quick</b> to remove only the Gallery quick filters; your normal Library filters stay in place.</li>
+<li>Use the compact Gallery quick buttons for <b>Thumbnail</b>, <b>Pinned</b> or <b>Unsaved</b>.</li>
+<li>Use the normal Library <b>Status</b>, <b>CC Type</b> and <b>Creator</b> filters above Gallery when you want to narrow the visual list further.</li>
+<li>Gallery quick filters stack with Search, the permanent Library filters and any <b>+ Add Quick Filter…</b> chips that are already active.</li>
+<li><b>Clear</b> appears at the far right only while at least one Gallery quick filter is active. Click it to remove the Gallery quick filters; your normal Library filters stay in place.</li>
 </ol>
 
 <h2><a name="filters"></a>Search and filters</h2>
 <p>Narrow a large Library to the packages you actually want to work with without filling the top panel with dozens of permanent controls.</p>
 <ol>
 <li>Type in <b>Search</b> to look through package names and indexed text such as CASP IDs, types and notes.</li>
-<li>Use the permanent <b>Status</b>, <b>CC Type</b>, <b>Creator</b> and <b>Profile</b> boxes for common everyday filtering.</li>
-<li>For any other available data field, click <b>+ Add Filter…</b>, choose a field, condition and value, then click <b>Add Filter</b>.</li>
-<li>Added filters appear as removable chips below the filter bar. Click a chip to remove just that filter. You can stack several added filters together with Search and the permanent filters.</li>
-<li>The list of fields follows the current Library mode. Advanced and Experimental fields become filterable only while those options are enabled.</li>
+<li>Use the permanent <b>Status</b>, <b>CC Type</b> and <b>Creator</b> boxes as quick filters for common everyday browsing. Those same fields also remain available under <b>Add custom filter…</b> for conditions such as <b>is not</b>, <b>contains</b> or <b>is blank</b>, and for saved multi-filter combinations.</li>
+<li>Click <b>+ Add Quick Filter…</b> for one-click <b>Suggested</b> choices, reusable <b>Saved Quick Filters</b>, or <b>Add custom Quick Filter…</b> for any other available field.</li>
+<li>Profile membership is a normal custom Quick Filter under <b>+ Add Quick Filter… &gt; Add custom Quick Filter… &gt; Profiles</b>. This is separate from the <b>Current Profile</b> selector, which changes Profile context rather than filtering package membership.</li>
+<li>Added filters appear as removable chips below the filter bar. Several filters can be stacked together with Search and the permanent filters; a package must match all active filters to remain shown.</li>
+<li>Use <b>+ Add Quick Filter… &gt; Save current Quick Filters…</b> to save a reusable Quick Filter preset. Saved presets can be reused regardless of the Current Profile. Search text is intentionally not included.</li>
+<li>A Current Profile can also remember its own Library filter view and preferred visible Table columns with <b>Manage Profiles… &gt; Profile Rules &gt; Save Current View</b>. Returning to that Current Profile restores its saved view without moving any package files.</li>
+<li>The list of custom-filter fields follows the current Library mode. Advanced and Experimental fields become filterable only while those options are enabled.</li>
 <li>The <b>Shown</b> counter tells you how many packages match.</li>
-<li>Click the small <b>×</b> inside Search to clear only the search text, or <b>Reset filters</b> to clear Search, permanent filters and all added-filter chips.</li>
+<li>Click the small <b>×</b> inside Search to clear only the search text, or <b>Clear Quick Filters</b> to clear Search, permanent filters and all added-filter chips.</li>
 </ol>
 <p><b>How the conditions work:</b> <b>is</b> means an exact match; <b>contains</b> means the typed value appears anywhere inside the field. <b>is not</b> and <b>does not contain</b> are their opposites. <b>is blank</b> and <b>is not blank</b> do not need a Value. Text matching is not case-sensitive.</p>
-<p>Examples: <b>Creator is Nightcrawler</b>, <b>Package contains lipstick</b>, <b>Age contains Teen</b>, <b>Outfit Category contains Formal</b>, or <b>CC Magic Import is Not in Import</b>. Several active filters work together: a package must match <b>all</b> of them to remain shown. The value box suggests existing values when practical, but you can also type your own text.</p>
+<p>Examples: <b>Creator is Nightcrawler</b>, <b>Package contains lipstick</b>, <b>Age contains Teen</b>, <b>Outfit Category contains Formal</b>, or <b>CC Magic Import is Not in Import</b>. The value box suggests existing values when practical, but you can also type your own text.</p>
 <p>If you turn Advanced or Experimental features off, added filters that depend on those hidden fields are removed automatically.</p>
 <p>Older MDBs may still physically contain legacy analysis/internal columns. CAS Curator preserves that data on disk but hides unsupported/internal fields from the normal Library views.</p>
 
@@ -5583,14 +7130,15 @@ class MainWindow(QMainWindow):
 <li><b>Edit:</b> manual fields you are allowed to change.</li>
 <li><b>All fields:</b> available when <b>Advanced features</b> are enabled; it shows the currently enabled user-facing stored fields in read-only form.</li>
 </ul>
-<p>Drag the vertical divider whenever you want more room for the Library or details panel.</p>
+<p>Drag the vertical divider whenever you want more room for the Library or details panel. Click <b>Details</b> in the Library controls to hide the right-side panel; while it is hidden, use the compact ◀ restore button in the same top-control area to bring it back. CAS Curator remembers the hidden/shown state. In <b>Overview</b>, drag the horizontal divider between the thumbnail and the summary card to choose how much height each gets; CAS Curator remembers your choice.</p>
 
 <h2><a name="edit"></a>Edit and save manual information</h2>
 <p>Add your own organisation without changing the package itself.</p>
 <ol>
 <li>Select a package and open <b>Edit</b>.</li>
-<li>Edit <b>Status</b>, <b>Creator</b>, <b>File Location</b>, <b>Merge Profiles</b> and/or <b>Notes</b>. Use <b>Add to:</b> for general Profile membership.</li>
+<li>Edit <b>Status</b>, <b>Creator</b>, <b>Converter</b>, <b>Current File Location</b>, <b>Merge Profiles</b> and/or <b>Notes</b>. Use <b>Add to:</b> for general Profile membership. When Experimental Profile Layouts are enabled and a Current Profile is selected from <b>Manage Profiles…</b>, a separate <b>Planned Location</b> box can store that Profile's desired managed location.</li>
 <li>Use <b>Add / Replace image…</b> when you want your own preview. Choose a JPG, JPEG, PNG or BMP. A manual image takes priority over an automatically extracted package preview.</li>
+<li>Automatic scanner thumbnails are stored in a <b>Thumbnails</b> folder beside the active MDB. If you move the MDB, keep that Thumbnails folder with it; CAS Curator can repair a broken automatic thumbnail link from the matching package hash in the new beside-MDB folder. Manual preview images stay linked to the location you chose and are not relocated automatically.</li>
 <li>Click <b>Clear image</b> if you want to remove the manual image and let CAS Curator fall back to an automatically extracted package preview, if one exists.</li>
 <li>An unsaved marker appears and the Unsaved counter increases.</li>
 <li>Use <b>Revert this</b> to discard changes for the focused package, or <b>File &gt; Revert All Unsaved Changes</b> for everything.</li>
@@ -5599,10 +7147,12 @@ class MainWindow(QMainWindow):
 <h3>What the organisation fields mean</h3>
 <ul>
 <li><b>Status</b> — what you intend to do with the CC, such as In Game Use, To Keep or To Review.</li>
-<li><b>Creator</b> — the creator or site you manually attribute the package to.</li>
+<li><b>Creator</b> — the original creator or mesh author when known.</li>
+<li><b>Converter</b> — the person who converted the item between Sims games/versions (for example Sims 4 → Sims 3). Leave blank for non-conversions.</li>
 <li><b>Profile</b> — any general group you create, such as a playthrough, testing set or style collection.</li>
 <li><b>Merge Profile</b> — which merged collection or collections contain that package.</li>
-<li><b>File Location</b> — the physical folder where the original unmerged package is stored.</li>
+<li><b>Current File Location</b> — the physical managed folder where the original unmerged package is stored now. There is only one current physical location.</li>
+<li><b>Planned Location</b> — Experimental only; a saved desired managed location for one Profile. It is a plan, not a claim that the file currently exists there.</li>
 </ul>
 <p>These fields are separate on purpose: changing one does not silently change the others.</p>
 <h3>Status</h3>
@@ -5614,14 +7164,16 @@ class MainWindow(QMainWindow):
 </ul>
 <p>Status describes what you intend to do with the CC; it is not a folder location.</p>
 <p>If an older MDB still contains legacy Status labels, use <b>File &gt; Review legacy Status values…</b>. CAS Curator first shows a preview and stages the safe conversions rather than writing immediately: <b>Keep → To Keep</b>, <b>Review → To Review</b>, and old Favourite/Unreviewed/In Merge labels → blank. Legacy Delete/Deleted values are deliberately left unchanged. The normal backed-up <b>Save Changes</b> is still required.</p>
-<h3>Creator</h3>
-<p>Creator is optional manual information. CAS Curator does not guess or infer it automatically. Type the creator or site name yourself in Edit, edit the Creator cell in the Table, or select several packages and use <b>Set Creator for Selected…</b> from Tools or the Table right-click menu. Bulk Creator edits remain pending until <b>Save Changes</b>, so they can still be reverted before saving. Creator names are included in normal Library search, and <b>Creator</b> also has its own permanent filter at the top of Library.</p>
-<p>When Creator is filled, <b>Search Web for Package</b> includes it in the search query, and the row right-click menu also offers <b>Search Web for Creator</b>.</p>
+<h3>Creator and Converter</h3>
+<p><b>Creator</b> is the original creator or mesh author when known. <b>Converter</b> is the person who converted the content between Sims games/versions, such as Sims 4 → Sims 3 or Sims 2 → Sims 3. A package can therefore have both names recorded separately. CAS Curator does not guess either value automatically.</p>
+<p>Type Creator and Converter in <b>Edit</b>, or edit their Table cells directly. Creator still has the permanent Library filter; Converter is available through <b>+ Add Quick Filter…</b> (including the suggested <b>Converter not assigned</b> filter). Both fields are searchable and can be used as levels in the Experimental Routing Structure Builder, for example <b>Converter → Creator → CC Type</b>. Changes remain pending until <b>Save Changes</b>.</p>
+<p><b>Remembered Creator / Converter names:</b> CAS Curator keeps a local user-level vocabulary of Creator and Converter values that are already saved in your MDBs. When a later package has a blank attribution field and its filename contains a remembered name, CAS Curator can offer that name as a suggestion. It never fills the field silently: review the suggestion first, then stage it and use <b>Save Changes</b>. The memory is stored in CAS Curator settings so it can help across different MDBs and future app updates.</p>
+<p>When Creator is filled, <b>Search Web for Package</b> includes it in the search query. For attribution work, right-click <b>Find Creator / Converter Online…</b>. CAS Curator opens Google directly with a focused search such as <b>Sims 3 CC &quot;package name&quot; creator converter</b>. The package/item name is quoted so Google can focus on the exact CC, while the final Creator/Converter terms steer the results toward attribution. Game/version words already present in the filename (for example Sims 2, Sims 3, Sims 4, TS3, 4t3 or 2t3) are kept inside the quoted name.</p>
 <h3>File Location</h3>
-<p>File Location records the physical folder containing the original, unmerged package. Choosing a File Location records the association only; it does not move, copy or delete the file.</p>
-<p>Use <b>Manage Locations…</b> to create friendly location names and link each name to its real folder. Each saved location has its own <b>Open</b> button, and the dialog shows the currently selected location explicitly for rename/path/remove actions. <b>Open Folder</b> in Edit opens exactly the saved folder for the selected package. You can also right-click a package row with a File Location assigned and choose <b>Open File Location</b>. If that folder is unavailable, CAS Curator reports it as unavailable and does not guess or substitute another folder. Older Library Location categories are preserved separately and are never treated as physical paths.</p>
+<p><b>Current File Location</b> records the physical managed folder containing the original, unmerged package now. Choosing or editing it records the association only; it does not move, copy or delete the file. Use the explicit managed Move actions when you want CAS Curator to move package files.</p>
+<p>Use the Library <b>Locations…</b> button beside <b>Manage Profiles…</b> (or <b>Tools &gt; Profiles &amp; Locations &gt; Manage File Locations…</b>) as the general place to manage shared File Locations. <b>Add Folder…</b> opens the Windows folder picker and automatically uses the selected folder's real name as the location name, so you do not have to type it; use <b>Rename…</b> only when you want a different display label. The Edit panel keeps a <b>Manage Locations…</b> shortcut for convenience. Current File Location and Experimental Planned Location are both drop-downs populated from this same managed list. Each saved location has its own <b>Open</b> button, and the dialog shows the currently selected location explicitly for rename/path/remove actions. <b>Open Folder</b> in Edit opens exactly the saved folder for the selected package. You can also right-click a package row with a File Location assigned and choose <b>Open File Location</b>. If that folder is unavailable, CAS Curator reports it as unavailable and does not guess or substitute another folder. Older Library Location categories are preserved separately and are never treated as physical paths.</p>
 <p><b>Controlled managed moves:</b> select one or more packages and use <b>Move Selected to Location…</b> from Tools or the Table right-click menu. CAS Curator resolves the original package conservatively, previews every destination, refuses overwrite/name conflicts, copies and verifies SHA-256 before deleting the original, then writes the new File Location to the MDB with the normal backup. If the MDB update fails, CAS Curator attempts to roll the physical move back.</p>
-<p><b>CC Magic Import is copy-only:</b> first set the destination with <b>Tools &gt; Set CC Magic Import Folder…</b>, then use <b>Copy Selected to CC Magic Import…</b>. The organised original stays in place and File Location does not change. The live <b>CC Magic Import</b> column is derived from the real Import folder and is not written into the MDB. When you want to filter by it, use <b>+ Add Filter… &gt; CC Magic Import</b>.</p>
+<p><b>CC Magic Import is copy-only:</b> first set the destination with <b>Tools &gt; Set CC Magic Import Folder…</b>, then use <b>Copy Selected to CC Magic Import…</b>. The organised original stays in place and File Location does not change. The live <b>CC Magic Import</b> column is derived from the real Import folder and is not written into the MDB. When you want to filter by it, use <b>+ Add Quick Filter… &gt; CC Magic Import</b>.</p>
 <p><b>CC Magic Import and File Location are different:</b> CC Magic Import is the destination for a deployment copy; <b>File Location</b> tells CAS Curator where the original/master package lives. Scanning records package metadata but does not guarantee that a managed File Location has been assigned. If Copy to CC Magic says the original has no valid File Location, either <b>route the package first</b> so CAS Curator records its routed folder, or select the package and assign <b>File Location</b> in <b>Edit</b> (use <b>Manage Locations…</b> there first if you need to add the folder).</p>
 <ul>
 <li><b>In Import</b> — a same-name Import copy is present and matches the package identity/hash CAS Curator can verify.</li>
@@ -5636,9 +7188,25 @@ class MainWindow(QMainWindow):
 <p>Merge Profiles record which merged collections contain the package. A package can belong to several Merge Profiles at once. Merge membership is separate from Status and from general Profiles.</p>
 <p>Use <b>Set Merge Profiles…</b> to choose one or several Merge Profiles for the focused package. <b>Manage Merge Profiles…</b> lets you create, rename or remove names in the managed list. Assignment and list changes remain pending until <b>Save Changes</b>.</p>
 <h3>Fill-down</h3>
-<p>Select an editable source cell and drag its small fill handle downward across displayed rows. CAS Curator copies the exact value to those displayed records, respects sorting/filtering, and keeps the edits pending until Save Changes. Blank source values are blocked. Use <b>Options &gt; Confirm before fill-down</b> if you want a confirmation before each fill operation; turn it off if you prefer direct fill-down.</p>
-<h3>Delete Record</h3>
-<p>Right-click a Table row and choose <b>Delete Record…</b> to stage removal of the CAS Curator Library/MDB record only. Saving creates the normal MDB backup. The actual <code>.package</code> file is never deleted or moved. If that physical package is scanned again later, CAS Curator can create a Library record for it again.</p>
+<h3>Fill or clear several rows — step by step</h3>
+<p><b>Copy one value down:</b></p>
+<ol>
+<li>In Table view, click an <b>editable cell that already contains the value</b> you want to copy.</li>
+<li>Drag the small fill handle at its lower-right corner downward across the displayed rows.</li>
+<li>CAS Curator copies that exact value to the eligible rows.</li>
+<li>Click <b>Save Changes</b> to commit, or Revert to cancel.</li>
+</ol>
+<p><b>Clear one field in several rows:</b></p>
+<ol>
+<li>In the editable column you want to clear, use <b>Ctrl+click</b> to select separate package rows or <b>Shift+click</b> to select a range.</li>
+<li>Make sure the current cell is in that same editable column.</li>
+<li>Press <b>Delete</b>.</li>
+<li>Read the confirmation, then confirm the clear.</li>
+<li>Click <b>Save Changes</b> to commit, or Revert to cancel.</li>
+</ol>
+<p><b>Current File Location</b> is intentionally read-only in the Table and cannot be bulk-cleared. <b>Planned Location</b> can be cleared only for selected rows that meet its Current Profile/membership conditions; ineligible rows are skipped. <b>Shift+Delete</b> stages deletion of the selected Library record(s). Physical <code>.package</code> files are never deleted by that record action.</p>
+<h3>Delete Record(s)</h3>
+<p>Select one or several Table rows, then right-click and choose <b>Delete Record…</b> / <b>Delete Selected Records…</b>, or press <b>Shift+Delete</b>. This stages removal of the CAS Curator Library/MDB record(s) only. Saving creates the normal MDB backup. The actual <code>.package</code> files are never deleted or moved. <b>Revert All Unsaved Changes</b> cancels staged deletions before saving. If a physical package is scanned again later, CAS Curator can create a Library record for it again.</p>
 
 <h3>Add or replace a preview image</h3>
 <p>If a package has no automatic preview, or you prefer a different picture, you can add one manually.</p>
@@ -5652,17 +7220,162 @@ class MainWindow(QMainWindow):
 
 <h2><a name="profiles"></a>Profiles</h2>
 <p>Profiles are optional groups for a playthrough, theme, CC Magic setup, testing set, merge plan, character style, or anything else you choose. A package can belong to more than one Profile.</p>
+
+<h3>Create and select a Profile — step by step</h3>
 <ol>
-<li>Create an empty Profile with <b>New Profile…</b>.</li>
-<li>For the focused package, use <b>Add to:</b> and choose an existing Profile.</li>
-<li><b>Profiles assigned to this package</b> is read-only; it shows the current membership but is not a second editing box.</li>
-<li><b>Manage Profiles…</b> lets you create, rename or delete Profiles and see how many packages use each one.</li>
-<li>To apply the same Profile assignment to several displayed packages, prepare one source row and use fill-down.</li>
-<li>Profile changes stay pending until <b>Save Changes</b>.</li>
+<li>Open the <b>Library</b>.</li>
+<li>Click <b>Manage Profiles…</b>.</li>
+<li>Click <b>New Profile…</b>, type the Profile name, and confirm.</li>
+<li>Select the new Profile in the list.</li>
+<li>Click <b>Use Selected</b>. It now becomes the <b>Current Profile</b>.</li>
+<li>Close Manage Profiles. The same Profile is shown in the <b>Current Profile</b> box at the top of Library.</li>
+<li>Click the main <b>Save Changes</b> button when you are ready to write staged Profile changes to the MDB.</li>
 </ol>
+<p><b>Important:</b> changing the Current Profile changes context only. It never moves package files.</p>
+
+<h3>Add a package to a Profile — step by step</h3>
+<ol>
+<li>Select the package in Table or Gallery.</li>
+<li>Open the right-side <b>Edit</b> tab.</li>
+<li>Under <b>Add to:</b>, choose the Profile you want. The list shows only Profiles this package does <b>not</b> already belong to.</li>
+<li>Check <b>Profiles assigned to this package</b> to confirm the membership.</li>
+<li>Click <b>Save Changes</b>.</li>
+</ol>
+<p>A package can belong to more than one Profile. <b>Profiles assigned to this package</b> is a read-only summary, not a second editing box.</p>
+
+<h3>Remove a package from a Profile — step by step</h3>
+<ol>
+<li>Select the package.</li>
+<li>Open the right-side <b>Edit</b> tab.</li>
+<li>Under <b>Remove from:</b>, choose one of the Profiles currently assigned to that package.</li>
+<li>Confirm the removal.</li>
+<li>Click <b>Save Changes</b> to commit it, or Revert to cancel.</li>
+</ol>
+<p>If that Profile has a saved <b>Planned Location</b> for the package, CAS Curator warns you before removal because saving the membership removal also removes that Profile-specific plan.</p>
+<h3>What Profile Membership means</h3>
+<p><b>Profile Membership</b> tells CAS Curator which Profiles this package belongs to.</p>
+<ul>
+<li>If a package belongs to Profile A, Profile A can store its own <b>Planned Location</b> for that package.</li>
+<li>If the same package also belongs to Profile B, Profile B can store a different Planned Location for the same file.</li>
+<li>When you later use <b>Apply Profile Locations…</b> for a Profile, CAS Curator uses that Profile's membership and saved Planned Locations to decide which member packages have a move planned.</li>
+<li>Membership by itself does <b>not</b> move the file. It only makes that package part of the Profile and eligible for that Profile's saved plan.</li>
+</ul>
+<p>The <b>Profile Membership</b> column therefore shows the package's full membership list and does <b>not</b> change when you switch Current Profile. <b>Current Profile</b> controls which Profile's Planned Location, Profile Rules and preferred columns you are viewing.</p>
+<p>In Table view, double-clicking <b>Profile Membership</b> now <b>adds</b> the chosen Profile without removing existing memberships. This prevents accidentally replacing Profile A with Profile B and losing A's saved Planned Location when the Library is saved.</p>
+
+<h3>Use Profile Rules — step by step</h3>
+<ol>
+<li>Choose the Profile in the top <b>Current Profile</b> box, or select it through <b>Manage Profiles… &gt; Use Selected</b>.</li>
+<li>Set the Library view you want with Status / CC Type / Creator and any <b>Add Quick Filter…</b> filters.</li>
+<li>Open <b>Columns &gt; Choose visible columns…</b> and show/hide the Table columns you want for this Profile.</li>
+<li>Open <b>Manage Profiles…</b>.</li>
+<li>Under <b>Profile Rules</b>, click <b>Save Current View</b>.</li>
+<li>Later, choose that Current Profile. CAS Curator clears the previous Profile's Library filter view first, then restores this Profile's saved filters and visible Table columns when Profile Rules exist.</li>
+<li>You can also click <b>Apply Rules</b> to restore them manually.</li>
+<li>Use <b>Clear Rules</b> if you no longer want that Profile to remember the view. It removes the saved Profile Rules and clears the currently applied rule filters; Search text is left unchanged.</li>
+</ol>
+<p>Different Profiles can therefore keep different filter views and visible-column layouts. Profile Rules save the Library filters they control — including the permanent Status / CC Type / Creator filters and added column filters — plus visible Table columns. They do not change Profile membership and never move package files. Search text is not saved as a Profile Rule.</p>
+
+<h3>Filter by Profile membership — step by step</h3>
+<ol>
+<li>Click <b>Add Quick Filter…</b>.</li>
+<li>Choose <b>Add custom Quick Filter…</b>.</li>
+<li>Choose <b>Profiles</b>.</li>
+<li>Choose the condition and Profile value you want.</li>
+<li>Apply the filter. It appears as a removable filter chip below the main filter bar.</li>
+</ol>
+<p>This is separate from <b>Current Profile</b>: Current Profile changes Profile context; the Quick Filter controls which package rows are shown.</p>
+
+<h3>Experimental Profile Layouts — step by step</h3>
+<p>Profile Layouts let different Profiles remember different desired managed folders for the same package. They are intentionally separate from normal Profile membership.</p>
+
+<p><b>A. Prepare the packages first</b></p>
+<ol>
+<li>Go to <b>Scan</b>.</li>
+<li>Run <b>Run Scan → Preview Routing → Run Routing</b>.</li>
+<li>Return to <b>Library</b>.</li>
+<li>Select a package and confirm its <b>Current File Location</b> matches the folder where the package physically exists now.</li>
+<li>If the managed locations you need do not exist yet, click <b>Locations…</b> and add them first.</li>
+<li>Go to <b>Options</b> and enable <b>Experimental features</b>.</li>
+</ol>
+
+<p><b>B. Make the Planned Location editable</b></p>
+<ol>
+<li>Create the Profile if needed with <b>Manage Profiles… &gt; New Profile…</b>.</li>
+<li>Make it the <b>Current Profile</b> with <b>Use Selected</b> or the top Current Profile selector.</li>
+<li>Select the package.</li>
+<li>Open <b>Edit</b>.</li>
+<li>Add that package to the same Profile using <b>Add to:</b> if it is not already a member.</li>
+<li>After the package belongs to the Current Profile, <b>Planned Location</b> becomes editable. If it is greyed out, check the package's Profile membership first.</li>
+</ol>
+
+<p><b>C. Set a planned location for one package</b></p>
+<ol>
+<li>With the correct <b>Current Profile</b> selected, select the package.</li>
+<li>Open <b>Edit</b>.</li>
+<li>Choose the desired folder in <b>Planned Location</b>.</li>
+<li>Click <b>Save Changes</b>.</li>
+<li>Nothing should move yet. Save Changes stores the plan only.</li>
+<li>Switch to another Current Profile to give the same package a different planned location for that Profile.</li>
+</ol>
+
+<p><b>D. Set planned locations for several packages</b></p>
+<ol>
+<li>Open <b>Tools &gt; Routing &gt; Experimental Profile Layouts…</b>.</li>
+<li>Choose the Profile at the top.</li>
+<li>Select one or more package rows in the Profile Layouts table.</li>
+<li>Click <b>Set Selected Profile Location…</b>.</li>
+<li>Choose the desired managed location.</li>
+<li>Repeat for other packages as needed.</li>
+<li>Close the window and click the main <b>Save Changes</b> button before applying the layout.</li>
+</ol>
+
+<p><b>E. Physically apply a Profile layout</b></p>
+<ol>
+<li>Open <b>Tools &gt; Routing &gt; Experimental Profile Layouts…</b>.</li>
+<li>Choose the Profile whose layout you want to apply.</li>
+<li>Read each row left to right as <b>Current Location → Planned Location</b>. The arrow shows exactly where the package is now and where this Profile will move it.</li>
+<li>Click <b>Apply Profile Locations…</b>.</li>
+<li>Read the full move preview before confirming.</li>
+<li>Confirm only when the source and destination locations are correct.</li>
+<li>Let CAS Curator finish the verified batch move.</li>
+<li>Return to Library and confirm <b>Current File Location</b> now matches the files' real physical location.</li>
+</ol>
+
+<h3>Edit Profile locations directly in the Table — step by step</h3>
+<ol>
+<li>Enable <b>Experimental features</b>.</li>
+<li>Choose a <b>Current Profile</b> at the top of Library.</li>
+<li>Find the <b>Planned Location</b> column in Table view. You do not need to add Profile Membership first: choosing a non-blank Planned Location automatically adds the Current Profile to Profile Membership if needed.</li>
+<li>Double-click the Planned Location cell and choose one of the saved managed locations.</li>
+<li>Click <b>Save Changes</b>. This stores the plan only.</li>
+<li>Use <b>Apply Profile Locations…</b> later when you actually want the files moved.</li>
+</ol>
+<p>The <b>Current File Location</b> column is intentionally read-only in Table view because it represents the package's physical location now. Route first so CAS Curator records it automatically. If the recorded location genuinely needs correcting, select the package and use the <b>Edit</b> tab rather than bulk-editing the Current File Location column.</p>
+<p>If a Planned Location cell is grey/read-only, check that Experimental features are enabled and a Current Profile is selected. Setting a non-blank Planned Location automatically adds that Profile to Profile Membership.</p>
+
+<p><b>What the two location fields mean:</b> <b>Current File Location</b> is the physical truth now and is shared across all Profiles. <b>Planned Location</b> is Profile-specific. Changing Current Profile, changing membership, or saving a planned location never moves files. <b>Apply Profile Locations…</b> is the only Profile Layout action that performs physical moves.</p>
+<p>CAS Curator preflights the whole batch first, blocks conflicts, missing locations and read-only source packages before any move begins, preserves subfolders below the current managed root where possible, copies and verifies SHA-256 before deleting each original, and never overwrites an existing different destination file. Packages with no saved Planned Location are left where they are. If an unexpected apply failure still occurs part-way through, CAS Curator attempts to roll back package moves already completed in that batch and cleans up incomplete destination copies where possible.</p>
 
 <h2><a name="workflows"></a>What can I do with CAS Curator?</h2>
 <p>CAS Curator's tools are designed to work together. You can use the Library to find a group, Profiles and Creator to describe it, File Location to track where the physical packages live, and controlled Move/Copy actions when you deliberately want to reorganise files.</p>
+<h3>Remembered Creator / Converter names — step by step</h3>
+<ol>
+<li>Enter a confirmed name in the <b>Creator</b> or <b>Converter</b> column and click <b>Save Changes</b>. CAS Curator remembers the saved name locally.</li>
+<li>When another package has a blank Creator/Converter field and its filename contains that remembered name, CAS Curator shows a review table. Filename matching is case-insensitive and uses conservative word/phrase or distinctive prefix matching.</li>
+<li>Untick any suggestion you do not want, then click <b>Stage Checked Suggestions</b> and confirm. Nothing is written yet.</li>
+<li>Review the Library and click <b>Save Changes</b> when satisfied.</li>
+<li>If you dismissed the automatic review, use <b>Tools → Profiles & Locations → Review Remembered Creator / Converter Suggestions…</b> to open it again.</li>
+</ol>
+<p>Existing nonblank Creator/Converter fields are never replaced by this helper. Remembered names do not come from web search and are not treated as proof of authorship; they are suggestions based on names you previously confirmed.</p>
+<h3>Find Creator / Converter online — step by step</h3>
+<ol>
+<li>Right-click the package in the Library and choose <b>Find Creator / Converter Online…</b>. (The same command is also available under Tools → Online / Attribution.)</li>
+<li>CAS Curator opens Google immediately with a focused search such as <b>Sims 3 CC &quot;package name&quot; creator converter</b>. The package/item name stays quoted, and Creator/Converter are added at the end to steer Google toward attribution.</li>
+<li>Review the Google results. When you can confirm the attribution, return to CAS Curator and type the name directly into the <b>Creator</b> and/or <b>Converter</b> column (or the Edit tab).</li>
+<li>Click <b>Save Changes</b> when you are satisfied.</li>
+</ol>
+<p>CAS Curator does not scrape Google or automatically guess attribution from the search results. <b>Creator</b> is for the original creator/mesh author; <b>Converter</b> is for the person who converted the item between Sims games/versions.</p>
 <h3>Group one creator's CC into a folder</h3>
 <ol>
 <li>Select the matching packages and use <b>Set Creator for Selected…</b> to assign the creator once. The Table fill handle remains available when a contiguous fill-down is more convenient.</li>
@@ -5672,23 +7385,25 @@ class MainWindow(QMainWindow):
 </ol>
 <p>Routing already provides automatic evidence-based sorting by supported type. Managed Locations are most useful for deliberate organisation such as creator folders, Testing, Archive or another collection structure that you choose yourself.</p>
 <h3>Move a filtered group together</h3>
-<p>Filter by <b>CC Type</b>, <b>Status</b>, <b>Creator</b> or <b>Profile</b> directly, or use <b>+ Add Filter…</b> for fields such as <b>File Location</b>, Age, Gender or any other currently available column. Select the rows you want, then use <b>Move Selected to Location…</b>. CAS Curator verifies package identity and SHA-256 before completing controlled moves.</p>
+<p>Filter directly with <b>CC Type</b>, <b>Status</b> or <b>Creator</b>, or use <b>+ Add Quick Filter…</b> for Profile membership, <b>File Location</b>, Age, Gender or any other currently available field. Select the rows you want, then use <b>Move Selected to Location…</b>. CAS Curator verifies package identity and SHA-256 before completing controlled moves.</p>
+<h3>Prepare several folder layouts and apply one later</h3>
+<p>Enable Experimental features and use <b>Experimental Profile Layouts</b> when you want a Profile to remember different desired managed locations for many packages. Save the Planned Locations first; switching the Current Profile or filtering by Profile membership does not move anything. When you are ready, open <b>Tools &gt; Routing &gt; Experimental Profile Layouts…</b> and use <b>Apply Profile Locations…</b> to preview and perform only the moves needed for that Profile.</p>
 <h3>Prepare a group for CC Magic</h3>
-<p>Click <b>+ Add Filter…</b> and choose <b>CC Magic Import is Not in Import</b>, then select the packages you want and use <b>Copy Selected to CC Magic Import…</b>. The Import folder is only a deployment drop-in location. Once CC Magic processes those files, use CC Magic itself to manage or remove them. CAS Curator does not delete files from CC Magic-managed storage.</p>
+<p>Click <b>+ Add Quick Filter…</b> and choose <b>CC Magic Import is Not in Import</b>, then select the packages you want and use <b>Copy Selected to CC Magic Import…</b>. The Import folder is only a deployment drop-in location. Once CC Magic processes those files, use CC Magic itself to manage or remove them. CAS Curator does not delete files from CC Magic-managed storage.</p>
 <h3>Bring in a folder of new downloads</h3>
 <p>Use the recommended sequence <b>Run Scan → Preview Routing → Run Routing</b>. Scan adds or refreshes MDB knowledge; Preview Routing shows exactly where files would go; Run Routing performs the physical move. When ZIPs are present, Scan can extract them beside the original archives first so newly extracted packages join the same scan. When Sims3Packs are present, CAS Curator can analyse their manifests, avoid extracting a CAS package when an identical standalone <code>.package</code> is already present, and optionally extract missing CAS package copies while leaving the original Sims3Pack untouched.</p>
 <h3>Find an item again later</h3>
 <p>Use Creator, package-name search, Profiles, Status and File Location to narrow the Library.</p>
-<p><b>Useful package shortcuts:</b> right-click a Table row for <b>Copy package name</b>, <b>Search Web for Package</b>, <b>Search Web for Creator</b> when Creator is filled, <b>Open File Location</b> when a physical folder is tracked, Pin/Unpin and the available managed Move/CC Magic actions.</p>
+<p><b>Useful package shortcuts:</b> right-click a Table row for <b>Copy package name</b>, <b>Search Web for Package</b>, <b>Find Creator / Converter Online…</b>, <b>Open File Location</b> when a physical folder is tracked, Pin/Unpin and the available managed Move/CC Magic actions.</p>
 <h3>Review provisional metadata without letting it organise files</h3>
-<p>Enable <b>Experimental features</b> to inspect Subtype, Skin Type, Outfit Category and EA Resource Status. These fields are review information only and never control Routing automatically.</p>
+<p>Enable <b>Experimental features</b> to inspect Subtype, Skin Type, Outfit Category and EA Resource Status. These metadata fields are review information only and never control Routing automatically. Experimental Profile Layouts are separate and move files only when you explicitly run <b>Apply Profile Locations…</b>.</p>
 
 <h2><a name="advanced"></a>Advanced and experimental features</h2>
 <p>Advanced and Experimental are optional and are off by default. Turning them off hides the extra information; it does not delete anything from the Master Database. Age and Gender are normal metadata and do not require either option.</p>
 <ul>
-<li><b>Options &gt; Enable Advanced features</b> shows extra stored technical information such as CASP Instance IDs, Biggest Texture, HQ/Poly warnings, Risk, Health Issues, Duplicate Files, Last Scanned, Package Hash and the All fields tab. Some of these are legacy/technical fields and are not regenerated by the conservative scanner.</li>
+<li><b>Options &gt; Enable Advanced features</b> shows extra stored technical information such as CASP Instance IDs, Biggest Texture, HQ/Poly warnings, Health Issues, Duplicate Files, Last Scanned, Package Hash and the All fields tab. Some of these are legacy/technical fields and are not regenerated by the conservative scanner.</li>
 <li><b>Age</b> and <b>Gender</b> are normal read-only package metadata derived from direct CASP observations.</li>
-<li><b>Options &gt; Enable Experimental features</b> shows provisional scanner-derived information such as Subtype, Skin Type, Outfit Category and EA Resource Status when available. These results are still being validated and may be incomplete or incorrect.</li>
+<li><b>Options &gt; Enable Experimental features</b> shows provisional scanner-derived information such as Subtype, Skin Type, Outfit Category and EA Resource Status when available, and also enables the separate <b>Experimental Profile Layouts</b> workflow. Scanner-derived results may be incomplete or incorrect and never control Routing. Profile Layouts perform file movement only through their explicit previewed Apply action.</li>
 <li><b>Subtype</b> is still Experimental. Current Build/Buy subtype values such as Wall, Rug or Lighting are filename hints and can be wrong when a filename contains several descriptive words. Scripted Object subtypes use package/script evidence. The Overview identifies which kind of evidence produced the displayed subtype.</li>
 <li><b>Skin Type</b> is still Experimental. A TONE resource can directly identify a package as Skin, but the current Default Replacement / Non-Default Skin Type label is inferred from filename clues. If no direct Skin classification is present, the stored value may come from the broader possible-skin heuristic. The Overview identifies which evidence path applies.</li>
 <li><b>Outfit Category</b> is Experimental display metadata read directly from each CASP ClothingCategory observation and combined for the package. It currently shows the seven normal CAS filters: Everyday, Formal, Sleepwear, Swimwear, Athletic, Career and Outerwear. Technical/special-purpose CASP flags such as ValidForRandom are intentionally not included in this summary.</li>
@@ -5696,7 +7411,7 @@ class MainWindow(QMainWindow):
 </ul>
 <h3>CASP observations</h3>
 <p><b>CASP</b> means <b>Create-a-Sim Part</b>. The CASP observations tab shows information read directly from CASP resources in the package rather than guessed from its filename. This can include CASP Instance IDs, CC Type, Age, Gender and, while Experimental features are enabled, Outfit Category. A package can contain more than one CASP, so CAS Curator may combine the observed values into a concise package summary. These observations describe the CASP resources that were found; they do not claim to describe every other resource in the package.</p>
-<p>Experimental information is for review and testing only. It does not change Routing or move package files automatically.</p>
+<p>Experimental scanner-derived information is for review and testing only and never changes Routing. Experimental Profile Layouts are a separate user-controlled workflow: they do not move files when you choose/filter a Profile or save a plan, but <b>Apply Profile Locations…</b> can perform the explicitly previewed managed moves.</p>
 
 <h1>Scan &amp; file sorting</h1>
 <h2><a name="scanner"></a>Scan</h2>
@@ -5716,7 +7431,7 @@ class MainWindow(QMainWindow):
 <h2><a name="results"></a>Understand scan results</h2>
 <ul>
 <li><b>CASP IDs:</b> direct CASP resource identifiers observed in the package.</li>
-<li><b>CC Type:</b> generated from the CASP Clothing metadata when every observed CASP in that package can be mapped safely. Mixed valid types are shown as <b>Mixed CAS</b>.</li>
+<li><b>CC Type:</b> generated from the CASP Clothing metadata when every observed CASP in that package can be mapped safely. Friendly clothing labels are shown as <b>Tops</b>, <b>Bottoms</b> and <b>Full Body</b> where applicable. Mixed valid types are shown as <b>Mixed CAS</b>.</li>
 <li><b>Highest Polys:</b> the highest GEOM <b>Faces.Count</b> found in the package. The value is withheld if any GEOM resource could not be read.</li>
 <li><b>Thumbnail:</b> extracted only from validated dedicated Sims 3 THUM / ICON / SNAP preview-resource families. CAS Curator chooses the best supported dedicated preview and does not use a random IMG texture. If there is no supported preview, you can add your own image later from Edit.</li>
 <li><b>Package Hash:</b> an exact SHA-256 fingerprint used for identity and safety checks.</li>
@@ -5726,6 +7441,27 @@ class MainWindow(QMainWindow):
 <li><b>Held for review:</b> the package identity/evidence was not safe enough for the normal write path.</li>
 </ul>
 <p><b>Not part of the supported scan results:</b> Whether a package contains or overlaps with EA resources is not assessed. Script/gameplay status, general IMG texture purpose, poly-count performance risk, texture-size performance risk and new Health/Risk ratings are also not supported results. Experimental features may expose provisional classifications such as Skin Type, Outfit Category and EA Resource Status for testing, but they are not treated as supported scanner findings and never control Routing automatically. CC Type, Highest Polys and dedicated preview extraction are direct supported scanner results, not performance/safety ratings.</p>
+
+<h2>Experimental Routing Structure Builder</h2>
+<p>The Routing Structure Builder creates a folder hierarchy from MDB fields you choose. It is useful when you want a structure such as <b>Creator → CC Type → Subtype</b> or <b>Converter → Creator → CC Type</b> instead of the standard evidence-routing folders.</p>
+<h3>Build and preview a structure — step by step</h3>
+<ol>
+<li>Route/scan your packages first so the MDB has reliable metadata and Current File Locations.</li>
+<li>Enable <b>Options &gt; Enable Experimental features</b>.</li>
+<li>Open <b>Tools &gt; Routing &gt; Routing Structure Builder…</b>.</li>
+<li>Choose the managed <b>Destination location</b>.</li>
+<li>Scope defaults to <b>Selected packages</b>; switch to <b>All packages in MDB</b> only when you intentionally want the wider scope.</li>
+<li>Drag fields from <b>Available folder levels</b> into <b>Folder structure</b>. Yellow fields are main-folder-only, green fields are subfolder-only, blue fields can be either, grey fields are unavailable in the current position, and purple marks validated custom folders. The order is literal.</li>
+<li>Use <b>+ Custom fixed folder…</b> if you want a manually named folder level.</li>
+<li>Choose what to do when a field is blank: use <b>Unassigned</b>, skip that level, or block that package. Outfit Category has a separate multi-value rule because it can naturally contain several categories.</li>
+<li>The preview updates automatically. Use <b>Refresh Preview</b> only when you want to force a manual refresh, then inspect the destination paths.</li>
+<li>Use <b>Save Structure</b> if you want to reuse the hierarchy later. CAS Curator automatically names it from the folder structure.</li>
+<li>When the preview is correct, click <b>Route with Structure…</b> and confirm the full move preview.</li>
+</ol>
+<p>CAS Curator preflights the full batch, never overwrites an existing destination, copies first, verifies SHA-256, then removes the original. If a move or MDB save fails, completed moves are rolled back where possible. The frozen scanner core is not changed by this feature; the builder operates from the MDB information already available in CAS Curator.</p>
+<h3>Save the routed result as a Profile</h3>
+<p>Tick <b>Save result as Profile</b> and enter a Profile name before routing. After a successful route, every mapped package becomes a member of that Profile and receives the chosen destination root as its Planned Location. The Creator/Type/etc folder structure remains physically underneath that managed root, so later Profile moves can preserve it.</p>
+<p>Setting a non-blank <b>Planned Location</b> manually also adds the Current Profile to <b>Profile Membership</b> automatically if needed. Clearing Planned Location does not remove membership; use <b>Remove from:</b> for that.</p>
 
 <h2><a name="routing"></a>Sort files — Preview Routing, then Run Routing</h2>
 <p>Sort a reviewed folder into evidence-based subfolders while seeing every destination before anything moves.</p>
@@ -5752,10 +7488,11 @@ class MainWindow(QMainWindow):
 <li>Click <b>Run Routing</b> and let it finish without manually moving the same files.</li>
 </ol>
 <p>After a successful routing run, CAS Curator uses its own move manifest to record the exact routed folder for each safely matched <code>.package</code> row as a File Location. This lets later <b>Open File Location</b> and <b>Move Selected to Location…</b> actions work without rescanning just to rediscover a move CAS Curator already performed. If <b>Recover Last Routing</b> later restores those files, CAS Curator also restores safely matched File Location records to the original folders. Ambiguous matches are skipped rather than guessed.</p>
-<p>Routes such as <b>CASP_OBSERVED/Hair</b> describe observed CASP evidence; they are not a claim that every resource in the whole package has been classified. Exact duplicate copies are routed separately to <b>DUPLICATES</b>.</p>
+<p><b>Risk Score and textual Risk do not control Routing.</b> They remain review information only. Normal non-broken custom content with direct CASP identity is routed under folders such as <b>CASP_OBSERVED/Hair</b>; other identified non-CAS custom content is grouped under <b>CUSTOM_CONTENT/&lt;type&gt;</b>. Unknown custom content remains separate under <b>UNIDENTIFIED_CC</b>. Exact duplicate copies are routed separately to <b>DUPLICATES</b>.</p>
+<p>Routes such as <b>CASP_OBSERVED/Hair</b> describe observed CASP evidence; they are not a claim that every resource in the whole package has been classified.</p>
 <p>Loose image files are routed under <b>IMAGES</b> while keeping the selected source-folder name and any subfolders beneath it. For example, an image from a selected folder named <b>Nightcrawler</b> is kept under <b>IMAGES/Nightcrawler/...</b> rather than being flattened into the IMAGES root.</p>
 <p><b>ZIPs found during Scan:</b> when the selected Scan folder contains ZIP archives, CAS Curator asks before Scan starts. Choose <b>Extract &amp; Continue</b> to unpack each archive into its own folder beside the ZIP and include newly extracted package files in the same Scan, or <b>Keep Packed</b> to leave them untouched for normal ARCHIVES routing later. The prompt is the extraction decision; there is no second extraction confirmation or completion popup. Original ZIPs are never deleted or overwritten.</p>
-<p><b>ZIP preview/extract:</b> you can also use <b>Tools &gt; Preview / Extract ZIP…</b>, or right-click a ZIP in Routing Preview. CAS Curator previews the archive first, preserves an existing single top-level folder, and uses the ZIP filename as an outer folder when files are loose or use multiple roots. Extraction is explicit, keeps the original ZIP, rejects unsafe paths, and does not overwrite existing files.</p>
+<p><b>ZIP preview/extract:</b> you can also use <b>Tools &gt; Library / Maintenance &gt; Preview / Extract ZIP…</b>, or right-click a ZIP in Routing Preview. CAS Curator previews the archive first, preserves an existing single top-level folder, and uses the ZIP filename as an outer folder when files are loose or use multiple roots. Extraction is explicit, keeps the original ZIP, rejects unsafe paths, and does not overwrite existing files.</p>
 <p><b>Sims3Packs found during Scan:</b> CAS Curator can read the Sims3Pack manifest without modifying the original file. For the conservative CAS workflow, only Sims3Packs declared as <b>CASpart</b> are eligible for package-copy extraction. If an identical standalone <code>.package</code> is already somewhere in the selected Scan tree, CAS Curator recognises it by SHA-256 and does not extract the same embedded package again. If a CASpart Sims3Pack has no equivalent standalone package, choose <b>Extract CAS &amp; Continue</b> to place the embedded package copy inside a folder named after the Sims3Pack, beside the untouched original. Extracted files use the original Sims3Pack name instead of the internal hexadecimal package name. A Sims3Pack can contain several CAS package parts; CAS Curator reports these as one multi-part set, duplicate-checks every part separately, and extracts all missing parts together using stable <code>__1</code>, <code>__2</code> and so on. The parts are not merged. Choose <b>Keep Packed &amp; Continue</b> to make no extraction changes. The prompt is the Sims3Pack decision; there is no extra extraction-complete popup before Scan continues.</p>
 <p><b>Protected Sims3Packs:</b> Lots, worlds, Sims/households, patterns, objects and unknown/mixed types are deliberately kept packed in this first conservative implementation. CAS Curator does not try to turn them into Mods/Packages content. The existing Routing system can continue to move the original Sims3Pack intact to <b>SIMS3PACK</b>. This restriction is intentionally stricter than a general Sims3Pack converter because CAS Curator is focused on safe CAS review.</p>
 
@@ -5786,7 +7523,7 @@ class MainWindow(QMainWindow):
 <p><b>Scan reports an MDB compatibility issue:</b> some spreadsheet programs save extra workbook information that the scanner cannot safely read. Choose <b>Create compatible copy…</b>. CAS Curator leaves your original workbook untouched, creates and verifies a separate compatible copy, and switches Scan to that copy. If the affected MDB was open in Library, the compatible copy is opened there too. Run Scan again after the copy is ready.</p>
 <p><b>Run Routing is unavailable:</b> choose a valid source and separate destination, create a fresh Routing Preview, then tick the move acknowledgement.</p>
 <p><b>Routing says Changed since scan / Not in MDB:</b> choose <b>Run Scan First</b> when you want current scanner-derived metadata and reliable tracking. <b>Continue Routing Anyway</b> is available for deliberate cases, but stale or unknown packages may not have complete MDB information.</p>
-<p><b>Gallery looks empty:</b> click <b>Clear quick</b>, then <b>Reset filters</b> if needed.</p>
+<p><b>Gallery looks empty:</b> use <b>Clear Quick Filters</b> if needed.</p>
 <p><b>Older fields say Unverified (legacy):</b> that means the value came from an older workflow and has not been regenerated by the current conservative scanner. Re-scan to generate the supported core fields.</p>
 <p><b>A package was held for review:</b> CAS Curator did not have enough safe identity/evidence to make the normal scanner write. Do not rename it to force a result; filenames are not classification evidence.</p>
 <p><b>A routing preview looks wrong:</b> do not run routing. Change the setup or leave the package for review.</p>
@@ -6832,7 +8569,7 @@ class MainWindow(QMainWindow):
         usages = selected_usages_for_record(record, self.random_sim_usage_registry)
         fields = [
             ("Package", record.get("Package", "")),
-            ("CC Type", record.get("CC Type", "")),
+            ("CC Type", _cc_type_label(record.get("CC Type", ""))),
             ("Subtype", subtype_label(record)),
             ("CASP Instance IDs", record.get("CASP Instance IDs", "")),
             ("Health", record.get("Health Status", "")),
@@ -7445,7 +9182,7 @@ class MainWindow(QMainWindow):
                         thumbnail_loaded = True
             if not thumbnail_loaded:
                 if record is not None:
-                    cc_type = str(record.get("CC Type", "") or category_text)
+                    cc_type = _cc_type_label(record.get("CC Type", "")) or str(category_text)
                     subtype = str(record.get("Subtype", "") or "")
                     casp = str(record.get("CASP Instance IDs", "") or "")
                     casp_short = casp if len(casp) <= 42 else casp[:39] + "…"
@@ -7538,6 +9275,94 @@ class MainWindow(QMainWindow):
             return
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(manifest_path)))
 
+
+    def _version_info_text(self) -> str:
+        return (
+            f"{APP_NAME} {VERSION}\n"
+            f"Build date: {BUILD_DATE}\n"
+            f"Created by: {PROJECT_CREATOR}\n"
+            f"Source / support: {PROJECT_SOURCE_URL}"
+        )
+
+    def _copy_version_info(self):
+        QApplication.clipboard().setText(self._version_info_text())
+        self.statusBar().showMessage("CAS Curator version information copied to the clipboard.", 5000)
+
+    def _open_project_source(self):
+        if not QDesktopServices.openUrl(QUrl(PROJECT_SOURCE_URL)):
+            QMessageBox.warning(
+                self,
+                "Source code",
+                "CAS Curator could not open the source-code page in your default browser.",
+            )
+
+    def _show_about_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("About CAS Curator")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(480)
+        dialog.setMaximumWidth(620)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+
+        title = QLabel(f"{APP_NAME} {VERSION}")
+        title_font = title.font()
+        title_font.setPointSize(max(title_font.pointSize() + 4, 14))
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        subtitle = QLabel("Sims 3 CAS custom-content library, review and organisation tool")
+        subtitle.setWordWrap(True)
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+
+        info_card = QFrame()
+        info_card.setObjectName("GuideJumpCard")
+        info_layout = QVBoxLayout(info_card)
+        info_layout.setContentsMargins(16, 14, 16, 14)
+        info_layout.setSpacing(7)
+
+        version_label = QLabel(f"<b>Version:</b> {html.escape(VERSION)}")
+        build_label = QLabel(f"<b>Build date:</b> {html.escape(BUILD_DATE)}")
+        creator_label = QLabel(f"<b>Created by:</b> {html.escape(PROJECT_CREATOR)}")
+        source_label = QLabel(
+            f'<b>Source / support:</b> <a href="{html.escape(PROJECT_SOURCE_URL)}">'
+            f'{html.escape(PROJECT_SOURCE_URL)}</a>'
+        )
+        source_label.setOpenExternalLinks(True)
+        source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
+        source_label.setWordWrap(True)
+        for widget in (version_label, build_label, creator_label, source_label):
+            info_layout.addWidget(widget)
+        layout.addWidget(info_card)
+
+        button_row = QHBoxLayout()
+        button_row.setSpacing(8)
+        open_source = QPushButton("View Source Code")
+        open_source.setToolTip("Open the CAS Curator GitHub repository in your default browser.")
+        open_source.clicked.connect(self._open_project_source)
+        copy_info = QPushButton("Copy version info")
+        copy_info.setToolTip("Copy the version, build date, creator and source link to the clipboard.")
+
+        def copy_from_about():
+            self._copy_version_info()
+            copy_info.setText("Copied!")
+            QTimer.singleShot(1400, lambda: copy_info.setText("Copy version info"))
+
+        copy_info.clicked.connect(copy_from_about)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(dialog.accept)
+        button_row.addWidget(open_source)
+        button_row.addWidget(copy_info)
+        button_row.addStretch(1)
+        button_row.addWidget(close_btn)
+        layout.addLayout(button_row)
+
+        dialog.exec()
 
     def _set_app_page(self, page: str):
         allowed = {"library", "scan", "guide"}
@@ -9633,7 +11458,13 @@ class MainWindow(QMainWindow):
         self._copy_filename_text(rec.get("Package", ""), self.copy_filename_btn)
 
     def _show_table_context_menu(self, pos):
-        proxy_index = self.table.indexAt(pos)
+        self._show_library_table_context_menu(self.table, pos)
+
+    def _show_gallery_context_menu(self, pos):
+        self._show_library_table_context_menu(self.gallery, pos)
+
+    def _show_library_table_context_menu(self, view, pos):
+        proxy_index = view.indexAt(pos)
         if not proxy_index.isValid():
             return
         selection = self.table.selectionModel()
@@ -9645,11 +11476,7 @@ class MainWindow(QMainWindow):
         if not rec:
             return
         filename = rec.get("Package", "")
-        try:
-            excel_row = int(rec.get("_ExcelRow", "0") or 0)
-        except (TypeError, ValueError):
-            excel_row = 0
-        menu = QMenu(self.table)
+        menu = QMenu(view)
         file_location_name = self.model.effective_value(source_index.row(), "File Location").strip()
         open_location_action = None
         if file_location_name:
@@ -9657,9 +11484,13 @@ class MainWindow(QMainWindow):
         creator = self.model.effective_value(source_index.row(), "Creator").strip()
         search_web_action = menu.addAction("Search Web for Package")
         search_web_action.setEnabled(bool(str(filename or "").strip()))
-        search_creator_action = None
-        if creator:
-            search_creator_action = menu.addAction("Search Web for Creator")
+        attribution_action = menu.addAction("Find Creator / Converter Online…")
+        attribution_action.setToolTip("Open Google directly for this package to help identify its Creator and/or Converter.")
+        menu.addSeparator()
+        # Reuse the same QAction as Tools > Routing so its icon, enabled state,
+        # tooltip and experimental-feature gating always stay in sync.
+        routing_structure_action = self.routing_structure_action
+        menu.addAction(routing_structure_action)
         menu.addSeparator()
         selected_rows = self._selected_source_rows() or [source_index.row()]
         selected_count = len(selected_rows)
@@ -9675,15 +11506,18 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         copy_action = menu.addAction("Copy file name")
         menu.addSeparator()
-        delete_action = menu.addAction("Delete Record…")
-        delete_action.setEnabled(bool(self.mdb and excel_row > 1 and excel_row not in self.pending_deletions))
-        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        delete_action = menu.addAction(
+            "Delete Record…" if selected_count == 1 else f"Delete {selected_count} Selected Records…"
+        )
+        delete_action.setToolTip("Stage selected Library/MDB records for deletion. Physical .package files are never deleted.")
+        delete_action.setEnabled(self._has_deletable_source_rows(selected_rows))
+        chosen = menu.exec(view.viewport().mapToGlobal(pos))
         if open_location_action is not None and chosen == open_location_action:
             self._open_file_location_for_source_row(source_index.row())
         elif chosen == search_web_action:
             self._search_package_web(filename, creator)
-        elif search_creator_action is not None and chosen == search_creator_action:
-            self._search_creator_web(creator)
+        elif chosen == attribution_action:
+            self.find_attribution_online(selected_rows)
         elif chosen == set_creator_action:
             self.set_creator_for_selected(selected_rows)
         elif chosen == move_location_action:
@@ -9693,7 +11527,7 @@ class MainWindow(QMainWindow):
         elif chosen == copy_action:
             self._copy_filename_text(filename)
         elif chosen == delete_action:
-            self._stage_delete_record(rec)
+            self._stage_delete_records(selected_rows)
 
     def set_creator_for_selected(self, source_rows: Optional[List[int]] = None):
         """Stage one manual Creator value across the selected Library rows.
@@ -9835,6 +11669,29 @@ class MainWindow(QMainWindow):
                 h.update(chunk)
         return h.hexdigest().lower()
 
+    @staticmethod
+    def _managed_path_is_read_only(path: Path) -> bool:
+        """Return True when the file's writable bit/Windows Read-only attribute is not available."""
+        try:
+            return not bool(path.stat().st_mode & stat.S_IWRITE)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _managed_unlink_even_if_read_only(path: Path):
+        """Delete a managed temporary/destination copy, clearing Read-only first if Windows requires it."""
+        try:
+            path.unlink(missing_ok=True)
+            return
+        except OSError:
+            if not path.exists():
+                return
+        try:
+            path.chmod(path.stat().st_mode | stat.S_IWRITE)
+        except OSError:
+            pass
+        path.unlink(missing_ok=True)
+
     def _resolve_managed_package_source(self, source_row: int) -> tuple[Path, str]:
         """Resolve one real package file conservatively, preferring the assigned physical File Location."""
         rec = self.model.record(source_row)
@@ -9971,7 +11828,8 @@ class MainWindow(QMainWindow):
                     source.unlink(missing_ok=True)
                     problems.append(f"Hash verification failed while restoring: {source}")
                     continue
-                destination.unlink()
+                self._managed_unlink_even_if_read_only(destination)
+                self._remove_empty_created_dirs(list(item.get("created_dirs", []) or []))
             except Exception as exc:
                 problems.append(f"{item['filename']}: {exc}")
         return problems
@@ -10263,7 +12121,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self, "CC Magic Import",
                 "No CC Magic Import folder is configured.\n\n"
-                "Set it from Tools → Set CC Magic Import Folder….\n\n"
+                "Set it from Tools → Profiles & Locations → Set CC Magic Import Folder….\n\n"
                 "Choose the folder now?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
@@ -10289,7 +12147,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 self, "CC Magic Import",
                 "No CC Magic Import folder is configured yet.\n\n"
-                "Set it from Tools → Set CC Magic Import Folder….\n\n"
+                "Set it from Tools → Profiles & Locations → Set CC Magic Import Folder….\n\n"
                 "Choose the folder now?",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes,
             )
@@ -10402,6 +12260,339 @@ class MainWindow(QMainWindow):
             f"CC Magic Import: {len(copied):,} copied, {len(already_present):,} already present", 9000
         )
 
+
+
+    def _attribution_memory_key(self, field: str) -> str:
+        return "attribution_memory/creators_json" if field == "Creator" else "attribution_memory/converters_json"
+
+    @staticmethod
+    def _clean_attribution_memory_name(value: str) -> str:
+        name = re.sub(r"\s+", " ", str(value or "").strip())
+        if not name:
+            return ""
+        compact = "".join(ch for ch in name if ch.isalnum())
+        if len(compact) < 3:
+            return ""
+        if name.casefold() in {
+            "unknown", "unassigned", "none", "n/a", "na", "?", "various", "multiple",
+            "creator", "converter", "source", "site",
+        }:
+            return ""
+        return name
+
+    def _read_attribution_memory(self, field: str) -> List[str]:
+        raw = self.settings.value(self._attribution_memory_key(field), "[]")
+        if isinstance(raw, (list, tuple)):
+            values = list(raw)
+        else:
+            try:
+                parsed = json.loads(str(raw or "[]"))
+                values = parsed if isinstance(parsed, list) else []
+            except (TypeError, ValueError, json.JSONDecodeError):
+                values = []
+        unique: Dict[str, str] = {}
+        for value in values:
+            cleaned = self._clean_attribution_memory_name(value)
+            if cleaned:
+                unique.setdefault(cleaned.casefold(), cleaned)
+        return sorted(unique.values(), key=str.casefold)
+
+    def _write_attribution_memory(self, field: str, values: List[str]):
+        unique: Dict[str, str] = {}
+        for value in values:
+            cleaned = self._clean_attribution_memory_name(value)
+            if cleaned:
+                unique[cleaned.casefold()] = cleaned
+        ordered = sorted(unique.values(), key=str.casefold)
+        self.settings.setValue(self._attribution_memory_key(field), json.dumps(ordered, ensure_ascii=False))
+        self.settings.sync()
+
+    def _remember_attribution_names_from_records(self, records: Optional[List[Dict[str, str]]] = None) -> Dict[str, int]:
+        """Learn confirmed Creator/Converter values locally from saved MDB records.
+
+        Memory is global CAS Curator user data (QSettings), not an MDB field. Existing
+        saved attribution is treated as confirmed input. The helper never edits an MDB.
+        """
+        source = list(records if records is not None else (self.model.records if self.mdb else []))
+        added = {"Creator": 0, "Converter": 0}
+        for field in ("Creator", "Converter"):
+            existing = self._read_attribution_memory(field)
+            by_key = {name.casefold(): name for name in existing}
+            before = len(by_key)
+            for rec in source:
+                value = self._clean_attribution_memory_name(rec.get(field, ""))
+                if value:
+                    # Preserve the most recently confirmed spelling/capitalisation.
+                    by_key[value.casefold()] = value
+            if len(by_key) != before or any(by_key.get(name.casefold()) != name for name in existing):
+                self._write_attribution_memory(field, list(by_key.values()))
+            added[field] = max(0, len(by_key) - before)
+        return added
+
+    @staticmethod
+    def _remembered_name_match_reason(name: str, package_name: str) -> str:
+        """Return a conservative filename-match explanation, or an empty string."""
+        stem = re.sub(r"\.package$", "", Path(str(package_name or "")).name, flags=re.IGNORECASE)
+        if not stem:
+            return ""
+        name_phrase = re.sub(r"[\W_]+", " ", str(name or "").casefold(), flags=re.UNICODE).strip()
+        file_phrase = re.sub(r"[\W_]+", " ", stem.casefold(), flags=re.UNICODE).strip()
+        if not name_phrase or not file_phrase:
+            return ""
+        if f" {name_phrase} " in f" {file_phrase} ":
+            return "remembered name appears as a filename word/phrase"
+        name_compact = "".join(ch for ch in str(name or "").casefold() if ch.isalnum())
+        file_compact = "".join(ch for ch in stem.casefold() if ch.isalnum())
+        # Concatenated creator prefixes are common in CC filenames. Require a
+        # reasonably distinctive remembered name before using compact matching.
+        if len(name_compact) >= 5 and file_compact.startswith(name_compact):
+            return "remembered name appears at the start of the filename"
+        if len(name_compact) >= 6 and file_compact.endswith(name_compact):
+            return "remembered name appears at the end of the filename"
+        return ""
+
+    def _collect_remembered_attribution_suggestions(self) -> List[Dict[str, object]]:
+        if not self.mdb:
+            return []
+        memories = {
+            "Creator": self._read_attribution_memory("Creator"),
+            "Converter": self._read_attribution_memory("Converter"),
+        }
+        suggestions: List[Dict[str, object]] = []
+        for source_row, rec in enumerate(self.model.records):
+            try:
+                excel_row = int(rec.get("_ExcelRow", "0") or 0)
+            except (TypeError, ValueError):
+                excel_row = 0
+            if not excel_row or excel_row in self.pending_deletions:
+                continue
+            package = str(rec.get("Package", "") or "").strip()
+            if not package:
+                continue
+            for field in ("Creator", "Converter"):
+                if self.model.effective_value(source_row, field).strip():
+                    continue
+                candidates = []
+                for name in memories[field]:
+                    reason = self._remembered_name_match_reason(name, package)
+                    if not reason:
+                        continue
+                    phrase_strength = 2 if "word/phrase" in reason else 1
+                    compact_len = len("".join(ch for ch in name if ch.isalnum()))
+                    candidates.append((phrase_strength, compact_len, name, reason))
+                if not candidates:
+                    continue
+                # One suggestion per field/package. Longest/word-boundary matches
+                # beat shorter prefix candidates such as "Pixel" vs "PixelJack".
+                candidates.sort(key=lambda item: (item[0], item[1], item[2].casefold()), reverse=True)
+                _strength, _length, name, reason = candidates[0]
+                suggestions.append({
+                    "source_row": source_row,
+                    "excel_row": excel_row,
+                    "package": package,
+                    "field": field,
+                    "name": name,
+                    "reason": reason,
+                })
+        return suggestions
+
+    def _attribution_suggestion_signature(self, suggestion: Dict[str, object]) -> tuple:
+        mdb_key = str(self.mdb.path.resolve()).casefold() if self.mdb else ""
+        return (
+            mdb_key,
+            int(suggestion.get("excel_row", 0) or 0),
+            str(suggestion.get("field", "") or ""),
+            str(suggestion.get("name", "") or "").casefold(),
+        )
+
+    def _show_remembered_attribution_suggestions(self, suggestions: List[Dict[str, object]], *, automatic: bool = False):
+        if not suggestions:
+            if not automatic:
+                QMessageBox.information(
+                    self,
+                    "Remembered Attribution Suggestions",
+                    "No blank Creator/Converter fields currently match names CAS Curator remembers.",
+                )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Remembered Creator / Converter Suggestions")
+        dialog.resize(960, min(720, 240 + 34 * min(len(suggestions), 12)))
+        layout = QVBoxLayout(dialog)
+        info = QLabel(
+            "CAS Curator found names you previously confirmed in Creator/Converter fields. "
+            "Matches come only from package filenames; nothing is added automatically. "
+            "Review the checked rows before staging them."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        table = QTableWidget(len(suggestions), 5)
+        table.setHorizontalHeaderLabels(["Use", "Package", "Field", "Suggested name", "Why it matched"])
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        for row, suggestion in enumerate(suggestions):
+            use_item = QTableWidgetItem("")
+            use_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+            use_item.setCheckState(Qt.Checked)
+            table.setItem(row, 0, use_item)
+            pkg_item = QTableWidgetItem(str(suggestion["package"]))
+            pkg_item.setToolTip(str(suggestion["package"]))
+            table.setItem(row, 1, pkg_item)
+            table.setItem(row, 2, QTableWidgetItem(str(suggestion["field"])))
+            table.setItem(row, 3, QTableWidgetItem(str(suggestion["name"])))
+            table.setItem(row, 4, QTableWidgetItem(str(suggestion["reason"])))
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        layout.addWidget(table, 1)
+
+        controls = QHBoxLayout()
+        select_all = QPushButton("Select all")
+        clear_all = QPushButton("Clear all")
+        controls.addWidget(select_all)
+        controls.addWidget(clear_all)
+        controls.addStretch(1)
+        stage_btn = QPushButton("Stage Checked Suggestions")
+        not_now_btn = QPushButton("Not now")
+        controls.addWidget(stage_btn)
+        controls.addWidget(not_now_btn)
+        layout.addLayout(controls)
+
+        select_all.clicked.connect(lambda: [table.item(r, 0).setCheckState(Qt.Checked) for r in range(table.rowCount())])
+        clear_all.clicked.connect(lambda: [table.item(r, 0).setCheckState(Qt.Unchecked) for r in range(table.rowCount())])
+        stage_btn.clicked.connect(dialog.accept)
+        not_now_btn.clicked.connect(dialog.reject)
+
+        if dialog.exec() != QDialog.Accepted:
+            return
+        checked = [suggestions[r] for r in range(table.rowCount()) if table.item(r, 0).checkState() == Qt.Checked]
+        if not checked:
+            QMessageBox.information(dialog, "Remembered Attribution Suggestions", "No suggestions were selected.")
+            return
+        answer = QMessageBox.question(
+            self,
+            "Stage remembered attribution?",
+            f"Stage {len(checked):,} Creator/Converter suggestion(s)?\n\n"
+            "They will remain unsaved until you use Save Changes.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        changed_rows = set()
+        changed_count = 0
+        for suggestion in checked:
+            source_row = int(suggestion["source_row"])
+            field = str(suggestion["field"])
+            name = str(suggestion["name"])
+            if self.model.effective_value(source_row, field).strip():
+                continue
+            changed = self.model.stage_fill_value([source_row], field, name)
+            if changed:
+                changed_rows.update(changed)
+                changed_count += 1
+        for source_row in changed_rows:
+            self.model.notify_row_changed(source_row)
+        if self.current_source_row in changed_rows:
+            rec = self.model.record(self.current_source_row)
+            if rec:
+                self.show_record(rec)
+        self._populate_filters()
+        self._update_dirty_state()
+        self._update_selected_dirty_label()
+        self._apply_filters()
+        self.statusBar().showMessage(
+            f"Staged {changed_count:,} remembered Creator/Converter suggestion(s) — unsaved until Save Changes",
+            9000,
+        )
+
+    def review_remembered_attribution_suggestions(self):
+        """Manual command: always review all current local-memory matches."""
+        if not self.mdb:
+            QMessageBox.information(self, "Remembered Attribution Suggestions", "Open a Master Database first.")
+            return
+        self._remember_attribution_names_from_records(self.model.records)
+        self._show_remembered_attribution_suggestions(
+            self._collect_remembered_attribution_suggestions(),
+            automatic=False,
+        )
+
+    def _maybe_offer_remembered_attribution_suggestions(self):
+        if not self.mdb:
+            return
+        suggestions = self._collect_remembered_attribution_suggestions()
+        unseen = []
+        for suggestion in suggestions:
+            signature = self._attribution_suggestion_signature(suggestion)
+            if signature in self._attribution_memory_prompted_signatures:
+                continue
+            unseen.append(suggestion)
+            self._attribution_memory_prompted_signatures.add(signature)
+        if unseen:
+            self._show_remembered_attribution_suggestions(unseen, automatic=True)
+
+    def find_attribution_online(self, source_rows: Optional[List[int]] = None):
+        """Open Google directly to help identify a package's Creator / Converter."""
+        if not self.mdb:
+            QMessageBox.information(self, "Find Creator / Converter Online", "Open a Master Database first.")
+            return
+        rows = list(source_rows or self._selected_source_rows())
+        if not rows and self.current_source_row is not None:
+            rows = [self.current_source_row]
+
+        valid = []
+        seen = set()
+        for row in rows:
+            try:
+                source_row = int(row)
+            except (TypeError, ValueError):
+                continue
+            if source_row in seen or not (0 <= source_row < len(self.model.records)):
+                continue
+            rec = self.model.record(source_row)
+            if not rec or not str(rec.get("Package", "") or "").strip():
+                continue
+            excel_row = self.model._excel_row(rec)
+            if not excel_row or excel_row in self.pending_deletions:
+                continue
+            seen.add(source_row)
+            valid.append(source_row)
+
+        if not valid:
+            QMessageBox.information(self, "Find Creator / Converter Online", "Select a package row first.")
+            return
+
+        # If several rows are selected, search the active package rather than opening
+        # a burst of browser tabs. Right-clicking a row makes it the active package.
+        source_row = self.current_source_row if self.current_source_row in valid else valid[0]
+        rec = self.model.record(source_row)
+        raw_name = str(rec.get("Package", "") or "").strip()
+        base_name = Path(raw_name).name
+        search_name = re.sub(r"\.package$", "", base_name, flags=re.IGNORECASE)
+        search_name = re.sub(r"[\[\]{}()]", " ", search_name)
+        search_name = re.sub(r"[_]+", " ", search_name)
+        search_name = re.sub(r"\s+", " ", search_name).strip()
+        if not search_name:
+            search_name = base_name
+
+        # Keep the package/item name quoted so Google can focus on the exact CC,
+        # while adding creator/converter at the end to steer results toward attribution.
+        query = f'Sims 3 CC "{search_name}" creator converter'
+        url = QUrl(f"https://www.google.com/search?q={quote_plus(query)}")
+        if not QDesktopServices.openUrl(url):
+            QMessageBox.warning(
+                self,
+                "Find Creator / Converter Online",
+                "CAS Curator could not open Google in your default browser.",
+            )
+            return
+        self.statusBar().showMessage(f"Google search opened for Creator / Converter: {search_name}", 6000)
+
     def _search_package_web(self, filename: str, creator: str = ""):
         raw_name = str(filename or "").strip()
         if not raw_name:
@@ -10446,53 +12637,229 @@ class MainWindow(QMainWindow):
             return
         self.statusBar().showMessage(f"Searching the web for creator: {clean_creator}", 5000)
 
-    def _stage_delete_record(self, rec: Dict[str, str]):
-        """Confirm and stage removal of a library record; the actual package file is untouched."""
-        if not self.mdb or not rec:
+    def _has_deletable_source_rows(self, source_rows: List[int]) -> bool:
+        if not self.mdb:
+            return False
+        for source_row in source_rows:
+            rec = self.model.record(source_row)
+            if not rec:
+                continue
+            try:
+                excel_row = int(rec.get("_ExcelRow", "0") or 0)
+            except (TypeError, ValueError):
+                continue
+            if excel_row > 1 and excel_row not in self.pending_deletions:
+                return True
+        return False
+
+    def _clear_selected_table_field(self):
+        """Clear the active editable Table field across the selected rows."""
+        if not self.mdb:
             return
-        try:
-            excel_row = int(rec.get("_ExcelRow", "0") or 0)
-        except (TypeError, ValueError):
-            excel_row = 0
-        if excel_row <= 1:
-            QMessageBox.warning(self, "Delete Record", "This row cannot be deleted safely.")
+
+        current = self.table.currentIndex()
+        if not current.isValid():
+            self.statusBar().showMessage("Select one or more rows in an editable column first.", 5000)
             return
-        if excel_row in self.pending_deletions:
-            QMessageBox.information(self, "Delete Record", "This record is already staged for deletion.")
+
+        source_current = self.proxy.mapToSource(current)
+        if not source_current.isValid() or not (0 <= source_current.column() < len(self.model.columns)):
             return
-        package_name = str(rec.get("Package", "(unnamed package)") or "(unnamed package)")
-        unsaved = self.pending_changes.get(excel_row, {})
-        extra = (
-            "\n\nUnsaved edits for this record will be discarded if you continue."
-            if unsaved else ""
-        )
+        field = self.model.columns[source_current.column()]
+        label = _display_field_name(field)
+
+        if field not in EDITABLE_FIELDS:
+            QMessageBox.information(
+                self,
+                "Clear selected field",
+                f"{label} is read-only in the Table.\n\n"
+                "Choose an editable column, then press Delete. "
+                "Use Shift+Delete if you want to stage deletion of the selected Library record(s).",
+            )
+            return
+
+        selected_proxy_rows = sorted({idx.row() for idx in self.table.selectionModel().selectedRows()})
+        if not selected_proxy_rows:
+            selected_proxy_rows = [current.row()]
+
+        source_rows = []
+        populated = 0
+        skipped = 0
+        for proxy_row in selected_proxy_rows:
+            proxy_idx = self.proxy.index(proxy_row, current.column())
+            src_idx = self.proxy.mapToSource(proxy_idx)
+            if not src_idx.isValid():
+                continue
+            model_idx = self.model.index(src_idx.row(), source_current.column())
+            if not model_idx.isValid() or not (model_idx.flags() & Qt.ItemIsEditable):
+                skipped += 1
+                continue
+            source_rows.append(src_idx.row())
+            if str(self.model.effective_value(src_idx.row(), field) or "").strip():
+                populated += 1
+
+        if not source_rows:
+            QMessageBox.information(
+                self,
+                "Clear selected field",
+                f"None of the selected rows can edit {label}.",
+            )
+            return
+
+        if populated == 0:
+            self.statusBar().showMessage(f"{label} is already blank in the selected editable row(s).", 5000)
+            return
+
+        detail_lines = [
+            f"Clear {label} in {len(source_rows):,} selected row(s)?",
+            f"{populated:,} populated value(s) will be erased.",
+            "These changes remain staged until you use Save Changes.",
+        ]
+        if skipped:
+            detail_lines.append(f"{skipped:,} selected row(s) are not editable for this field and will be skipped.")
+
         answer = QMessageBox.question(
             self,
-            "Delete Record?",
-            f"Remove '{package_name}' from the CAS Curator library database?"
-            "\n\nThe record's library fields and Profile assignments will be cleared when you "
-            "click Save Changes. A full workbook backup is created before writing."
-            "\n\nThe actual .package file will not be deleted, moved or modified. "
-            "Scanner history on the Packages and CASP Master sheets will be preserved."
-            + extra + "\n\nStage this record for deletion?",
+            "Clear selected field",
+            "\n\n".join(detail_lines),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        changed_rows = self.model.stage_fill_value(source_rows, field, "")
+        if not changed_rows:
+            return
+
+        for source_row in changed_rows:
+            self.model.notify_row_changed(source_row)
+        if self.current_source_row in changed_rows:
+            rec = self.model.record(self.current_source_row)
+            if rec:
+                self.show_record(rec)
+
+        self._update_dirty_state()
+        self._update_selected_dirty_label()
+        self._apply_filters()
+        self.statusBar().showMessage(
+            f"Cleared {label} in {len(changed_rows):,} selected row(s) — unsaved until Save Changes",
+            8000,
+        )
+
+    def _stage_delete_selected_records(self):
+        rows = self._selected_source_rows()
+        if not rows and self.current_source_row is not None:
+            rows = [self.current_source_row]
+        if not rows:
+            self.statusBar().showMessage("Select one or more Library records first", 4000)
+            return
+        self._stage_delete_records(rows)
+
+    def _stage_delete_record(self, rec: Dict[str, str]):
+        """Backward-compatible single-record wrapper for the bulk staged-delete path."""
+        if not rec:
+            return
+        try:
+            target_excel_row = int(rec.get("_ExcelRow", "0") or 0)
+        except (TypeError, ValueError):
+            target_excel_row = 0
+        for source_row, candidate in enumerate(self.model.records):
+            try:
+                if int(candidate.get("_ExcelRow", "0") or 0) == target_excel_row:
+                    self._stage_delete_records([source_row])
+                    return
+            except (TypeError, ValueError):
+                continue
+        QMessageBox.warning(self, "Delete Record", "This row cannot be deleted safely.")
+
+    def _stage_delete_records(self, source_rows: List[int]):
+        """Confirm and stage one or many Library records; physical package files are untouched."""
+        if not self.mdb:
+            return
+        candidates = []
+        already_staged = 0
+        unsafe = 0
+        unsaved_count = 0
+        seen_excel_rows = set()
+        for source_row in dict.fromkeys(source_rows):
+            rec = self.model.record(source_row)
+            if not rec:
+                unsafe += 1
+                continue
+            try:
+                excel_row = int(rec.get("_ExcelRow", "0") or 0)
+            except (TypeError, ValueError):
+                excel_row = 0
+            if excel_row <= 1 or excel_row in seen_excel_rows:
+                unsafe += 1
+                continue
+            seen_excel_rows.add(excel_row)
+            if excel_row in self.pending_deletions:
+                already_staged += 1
+                continue
+            if self.pending_changes.get(excel_row):
+                unsaved_count += 1
+            candidates.append((source_row, excel_row, rec))
+
+        if not candidates:
+            if already_staged:
+                QMessageBox.information(self, "Delete Record", "All selected records are already staged for deletion.")
+            else:
+                QMessageBox.warning(self, "Delete Record", "The selected record(s) cannot be deleted safely.")
+            return
+
+        count = len(candidates)
+        if count == 1:
+            package_name = str(candidates[0][2].get("Package", "(unnamed package)") or "(unnamed package)")
+            opening = f"Remove '{package_name}' from the CAS Curator library database?"
+        else:
+            opening = f"Remove {count:,} selected records from the CAS Curator library database?"
+
+        notes = [
+            opening,
+            "The selected Library fields and Profile assignments will be cleared when you click Save Changes. A full workbook backup is created before writing.",
+            "The actual .package files will NOT be deleted, moved or modified. Scanner history on the Packages and CASP Master sheets will be preserved.",
+        ]
+        if unsaved_count:
+            notes.append(f"Unsaved edits on {unsaved_count:,} selected record(s) will be discarded if you continue.")
+        if already_staged:
+            notes.append(f"{already_staged:,} selected record(s) are already staged and will be left as-is.")
+        if unsafe:
+            notes.append(f"{unsafe:,} selected row(s) could not be safely staged and will be skipped.")
+        notes.append(f"Stage {count:,} record(s) for deletion?")
+        answer = QMessageBox.question(
+            self,
+            "Delete Records?" if count > 1 else "Delete Record?",
+            "\n\n".join(notes),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             self.statusBar().showMessage("Delete Record cancelled — nothing changed", 5000)
             return
-        self.pending_changes.pop(excel_row, None)
-        self.pending_deletions.add(excel_row)
+
+        staged_excel_rows = set()
+        for source_row, excel_row, rec in candidates:
+            self.pending_changes.pop(excel_row, None)
+            self.pending_deletions.add(excel_row)
+            staged_excel_rows.add(excel_row)
+
         self.model.notify_all_changed()
         if self.current_source_row is not None:
             selected_rec = self.model.record(self.current_source_row)
-            if selected_rec and int(selected_rec.get("_ExcelRow", "0") or 0) == excel_row:
-                self._set_editor_enabled(False)
+            if selected_rec:
+                try:
+                    current_excel_row = int(selected_rec.get("_ExcelRow", "0") or 0)
+                except (TypeError, ValueError):
+                    current_excel_row = 0
+                if current_excel_row in staged_excel_rows:
+                    self._set_editor_enabled(False)
         self._update_dirty_state()
         self._update_selected_dirty_label()
         self.statusBar().showMessage(
-            f"'{package_name}' is staged for deletion. Use Save Changes to confirm the workbook change, "
-            "or Revert All Unsaved Changes to cancel it.",
+            f"{count:,} record(s) staged for deletion. Use Save Changes to write the workbook change, "
+            "or Revert All Unsaved Changes to cancel it. Package files are untouched.",
             10000,
         )
 
@@ -10917,6 +13284,9 @@ class MainWindow(QMainWindow):
         self.profile_registry_saved = list(getattr(mdb, "profile_options", []) or [])
         self.profile_registry_current = list(self.profile_registry_saved)
         self.profile_registry_dirty = False
+        self.profile_layouts_saved = list(getattr(mdb, "profile_layouts", []) or [])
+        self.profile_layouts_current = list(self.profile_layouts_saved)
+        self.profile_layouts_dirty = False
         self.status_registry_dirty = False
         self.file_location_registry_saved = list(getattr(mdb, "file_locations", []) or [])
         self.file_location_registry_current = list(self.file_location_registry_saved)
@@ -10958,6 +13328,23 @@ class MainWindow(QMainWindow):
                 self.visible_columns = [c for c in DEFAULT_COLUMNS if c in ("#", "Thumbnail") or c in _available_public_columns_for_mdb(mdb)]
         else:
             self.visible_columns = [c for c in DEFAULT_COLUMNS if c in ("#", "Thumbnail") or c in _available_public_columns_for_mdb(mdb)]
+        # Introduce the new manual Converter column once for existing users whose
+        # saved visible-column list predates it. Afterwards normal column visibility
+        # settings remain fully user-controlled.
+        if "Converter" in available_columns:
+            converter_introduced = str(self.settings.value("converter_column_introduced", "") or "").strip().lower()
+            if converter_introduced not in {"1", "true", "yes", "on"} and "Converter" not in self.visible_columns:
+                insert_at = self.visible_columns.index("Creator") + 1 if "Creator" in self.visible_columns else len(self.visible_columns)
+                self.visible_columns.insert(insert_at, "Converter")
+                self.settings.setValue("converter_column_introduced", True)
+                self.settings.sync()
+        if (IS_DEV_BUILD or self.experimental_features) and PROFILE_LOCATION_FIELD in available_columns:
+            introduced = str(self.settings.value("planned_profile_location_column_introduced", "") or "").strip().lower()
+            if introduced not in {"1", "true", "yes", "on"} and PROFILE_LOCATION_FIELD not in self.visible_columns:
+                insert_at = self.visible_columns.index("File Location") + 1 if "File Location" in self.visible_columns else len(self.visible_columns)
+                self.visible_columns.insert(insert_at, PROFILE_LOCATION_FIELD)
+                self.settings.setValue("planned_profile_location_column_introduced", True)
+                self.settings.sync()
         self.model.set_columns(self.visible_columns)
         self.model.set_records(mdb.records)
         self._refresh_cc_magic_import_statuses(refresh_filters=False)
@@ -10969,6 +13356,7 @@ class MainWindow(QMainWindow):
         self._build_columns_menu()
         self._update_column_fold_buttons()
         self._populate_filters()
+        self._restore_active_profile_for_current_mdb()
         self._resize_columns()
         self._apply_filters()
         if IS_DEV_BUILD and hasattr(self, "random_sim_category_table"):
@@ -10977,6 +13365,10 @@ class MainWindow(QMainWindow):
         self.packages_label.setText(f"Packages: {len(mdb.records):,}")
         self.thumbs_label.setText(f"Thumbnails: {mdb.thumbnail_count:,}")
         self._update_dirty_state()
+        # Seed the local attribution vocabulary from values already confirmed in
+        # this MDB, then offer conservative filename matches for blank fields.
+        self._remember_attribution_names_from_records(mdb.records)
+        QTimer.singleShot(250, self._maybe_offer_remembered_attribution_suggestions)
         self.statusBar().showMessage(
             f"Loaded: {mdb.path.resolve()} | {len(mdb.records):,} library records | manual editing enabled"
         )
@@ -11030,15 +13422,86 @@ class MainWindow(QMainWindow):
         self._resize_columns()
         self._update_column_fold_buttons()
 
+    def _column_fold_restore_target(self):
+        """Return the top-most table whose header should host the hidden restore tab."""
+        frozen = getattr(self, "frozen_package_table", None)
+        if frozen is not None and frozen.isVisible():
+            return frozen
+        return getattr(self, "table", None)
+
+    def _position_column_fold_restore_btn(self):
+        """Float ▼ over the # header without reserving any layout height."""
+        btn = getattr(self, "column_fold_restore_btn", None)
+        if btn is None:
+            return
+        if self.view_mode != "table" or bool(self.column_shortcuts_visible):
+            btn.hide()
+            return
+        target = self._column_fold_restore_target()
+        if target is None or not target.isVisible():
+            btn.hide()
+            return
+        if btn.parent() is not target:
+            btn.setParent(target)
+
+        header = target.horizontalHeader()
+        logical = -1
+        if "#" in getattr(self, "visible_columns", []):
+            candidate = self.visible_columns.index("#")
+            if 0 <= candidate < self.proxy.columnCount() and not target.isColumnHidden(candidate):
+                logical = candidate
+
+        # If # is hidden or horizontally off-screen, use the first visible
+        # section so the restore affordance can never become unreachable.
+        def section_is_onscreen(section):
+            if section < 0 or target.isColumnHidden(section):
+                return False
+            x = header.sectionViewportPosition(section)
+            w = header.sectionSize(section)
+            return x + w > 0 and x < header.viewport().width()
+
+        if not section_is_onscreen(logical):
+            logical = -1
+            for section in range(self.proxy.columnCount()):
+                if section_is_onscreen(section):
+                    logical = section
+                    break
+        if logical < 0:
+            btn.hide()
+            return
+
+        x = header.sectionViewportPosition(logical)
+        x += max(0, (header.sectionSize(logical) - btn.width()) // 2)
+        pos = header.viewport().mapTo(target, QPoint(x, 1))
+        btn.move(pos.x(), pos.y())
+        btn.show()
+        btn.raise_()
+
+    def _set_column_shortcuts_visible(self, visible: bool, persist: bool = True):
+        self.column_shortcuts_visible = bool(visible)
+        if hasattr(self, "column_fold_bar"):
+            self.column_fold_bar.setVisible(self.view_mode == "table" and self.column_shortcuts_visible)
+        if hasattr(self, "column_fold_restore_btn"):
+            QTimer.singleShot(0, self._position_column_fold_restore_btn)
+        if hasattr(self, "column_shortcuts_action"):
+            self.column_shortcuts_action.blockSignals(True)
+            self.column_shortcuts_action.setChecked(self.column_shortcuts_visible)
+            self.column_shortcuts_action.blockSignals(False)
+        if persist:
+            self.settings.setValue("column_shortcuts_visible", self.column_shortcuts_visible)
+            self.settings.sync()
+
     def _build_columns_menu(self):
         self.columns_menu.clear()
         choose_action = QAction("Choose visible columns…", self)
         choose_action.triggered.connect(self._open_columns_dialog)
         self.columns_menu.addAction(choose_action)
         self.columns_menu.addSeparator()
-        reset_action = QAction("Reset to default visible columns", self)
-        reset_action.triggered.connect(self._reset_default_columns)
-        self.columns_menu.addAction(reset_action)
+        self.freeze_package_action = QAction("Freeze Package column", self, checkable=True)
+        self.freeze_package_action.setChecked(bool(self.freeze_package_column))
+        self.freeze_package_action.setToolTip("Keep the Package name visible while scrolling horizontally in Table view. The # column is kept beside it when visible.")
+        self.freeze_package_action.toggled.connect(self._set_freeze_package_column)
+        self.columns_menu.addAction(self.freeze_package_action)
 
     def _open_columns_dialog(self):
         if not self.mdb:
@@ -11070,11 +13533,15 @@ class MainWindow(QMainWindow):
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         all_btn = QPushButton("Select all")
+        none_btn = QPushButton("Deselect all")
         default_btn = QPushButton("Default")
         buttons.addButton(all_btn, QDialogButtonBox.ActionRole)
+        buttons.addButton(none_btn, QDialogButtonBox.ActionRole)
         buttons.addButton(default_btn, QDialogButtonBox.ActionRole)
         all_btn.clicked.connect(lambda: [cb.setChecked(True) for cb in checks.values()])
-        default_btn.clicked.connect(lambda: self._apply_default_checks(checks))
+        none_btn.clicked.connect(lambda: [cb.setChecked(False) for cb in checks.values()])
+        default_fields = {c for c in DEFAULT_COLUMNS if c in fields}
+        default_btn.clicked.connect(lambda: [cb.setChecked(field in default_fields) for field, cb in checks.items()])
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
         layout.addWidget(buttons)
@@ -11095,20 +13562,6 @@ class MainWindow(QMainWindow):
         """Persist column visibility independently of the active MDB."""
         self.settings.setValue("library_visible_columns", list(self.visible_columns))
         self.settings.sync()
-
-    def _apply_default_checks(self, checks: Dict[str, QCheckBox]):
-        default_set = set(DEFAULT_COLUMNS)
-        for field, cb in checks.items():
-            cb.setChecked(field in default_set)
-
-    def _reset_default_columns(self):
-        if not self.mdb:
-            return
-        self.visible_columns = [c for c in DEFAULT_COLUMNS if c in ("#", "Thumbnail") or c in _available_public_columns_for_mdb(self.mdb)]
-        self.model.set_columns(self.visible_columns)
-        self._persist_visible_columns()
-        self._resize_columns()
-        self._update_column_fold_buttons()
 
     def _toggle_column(self, field: str, checked: bool):
         if checked and field not in self.visible_columns:
@@ -11134,6 +13587,7 @@ class MainWindow(QMainWindow):
             base_width = COLUMN_WIDTHS.get(field, 145)
             header_width = metrics.horizontalAdvance(str(field)) + 46
             self.table.setColumnWidth(i, max(base_width, header_width))
+        self._sync_frozen_package_view()
 
     def _available_column_filter_fields(self) -> List[str]:
         """All user-facing data fields currently available in the active mode."""
@@ -11210,6 +13664,391 @@ class MainWindow(QMainWindow):
             self.extra_column_filters.pop(index)
             self._refresh_active_filter_chips()
             self._apply_filters()
+
+    def _mdb_ui_settings_prefix(self) -> str:
+        if not self.mdb:
+            return ""
+        try:
+            raw = str(self.mdb.path.resolve())
+        except OSError:
+            raw = str(self.mdb.path)
+        digest = hashlib.sha1(raw.casefold().encode("utf-8", "ignore")).hexdigest()[:20]
+        return f"mdb_ui/{digest}"
+
+    def _current_filter_state(self) -> Dict[str, object]:
+        """Serializable Library filter state. Search text is intentionally not saved."""
+        quick = {}
+        for field in ("Status", "CC Type", "Creator"):
+            box = self.filter_boxes.get(field)
+            if box is not None:
+                value = str(box.currentText() or "All")
+                if value and value != "All":
+                    quick[field] = value
+        return {
+            "quick": quick,
+            "extra": [dict(item) for item in self.extra_column_filters],
+        }
+
+    def _current_profile_rule_state(self) -> Dict[str, object]:
+        """Profile Rules save filters plus this Profile's preferred visible Table columns."""
+        state = dict(self._current_filter_state())
+        state["visible_columns"] = list(self.visible_columns)
+        return state
+
+    def _apply_profile_visible_columns(self, state: object):
+        if not self.mdb or not isinstance(state, dict):
+            return
+        saved = state.get("visible_columns")
+        if not isinstance(saved, (list, tuple)):
+            # Older Profile Rules did not store columns; leave the current columns alone.
+            return
+        available = ["#", "Thumbnail"] + _available_public_columns_for_mdb(self.mdb)
+        selected = []
+        seen = set()
+        for field in saved:
+            if not isinstance(field, str) or field not in available or field in seen:
+                continue
+            selected.append(field)
+            seen.add(field)
+        if not selected:
+            return
+        self.visible_columns = selected
+        self.model.set_columns(self.visible_columns)
+        self._persist_visible_columns()
+        self._resize_columns()
+        self._update_column_fold_buttons()
+        self._build_columns_menu()
+
+    def _apply_filter_state(self, state: object, *, clear_search: bool = False):
+        if not isinstance(state, dict):
+            return
+        if clear_search:
+            self.search_edit.clear()
+        quick = state.get("quick", {})
+        quick = quick if isinstance(quick, dict) else {}
+        for field in ("Status", "CC Type", "Creator"):
+            box = self.filter_boxes.get(field)
+            if box is None:
+                continue
+            wanted = str(quick.get(field, "All") or "All")
+            box.blockSignals(True)
+            if wanted == "All":
+                box.setCurrentText("All")
+            elif field == "CC Type":
+                match = next(
+                    (box.itemText(i) for i in range(box.count()) if _cc_type_key(box.itemText(i)) == _cc_type_key(wanted)),
+                    None,
+                )
+                box.setCurrentText(match or "All")
+            elif box.findText(wanted) >= 0:
+                box.setCurrentText(wanted)
+            else:
+                box.setCurrentText("All")
+            box.blockSignals(False)
+        extras = state.get("extra", [])
+        self.extra_column_filters = [dict(item) for item in extras if isinstance(item, dict)] if isinstance(extras, list) else []
+        self._sanitize_extra_column_filters()
+        self._refresh_active_filter_chips()
+        self._apply_filters()
+
+    def _global_filter_presets(self) -> Dict[str, Dict[str, object]]:
+        raw = str(self.settings.value("saved_filter_presets_json", "{}") or "{}")
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        result = {}
+        for name, state in data.items():
+            clean_name = str(name or "").strip()
+            if clean_name and isinstance(state, dict):
+                result[clean_name] = state
+        return result
+
+    def _write_global_filter_presets(self, presets: Dict[str, Dict[str, object]]):
+        self.settings.setValue("saved_filter_presets_json", json.dumps(presets, ensure_ascii=False, sort_keys=True))
+        self.settings.sync()
+
+    def _profile_filter_views(self) -> Dict[str, Dict[str, object]]:
+        prefix = self._mdb_ui_settings_prefix()
+        if not prefix:
+            return {}
+        raw = str(self.settings.value(f"{prefix}/profile_filter_views_json", "{}") or "{}")
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        result = {}
+        for name, state in data.items():
+            clean_name = str(name or "").strip()
+            if clean_name and isinstance(state, dict):
+                result[clean_name] = state
+        return result
+
+    def _write_profile_filter_views(self, views: Dict[str, Dict[str, object]]):
+        prefix = self._mdb_ui_settings_prefix()
+        if not prefix:
+            return
+        self.settings.setValue(f"{prefix}/profile_filter_views_json", json.dumps(views, ensure_ascii=False, sort_keys=True))
+        self.settings.sync()
+
+    def _profile_filter_state(self, profile: str) -> Optional[Dict[str, object]]:
+        wanted = str(profile or "").strip().casefold()
+        for name, state in self._profile_filter_views().items():
+            if name.casefold() == wanted:
+                return state
+        return None
+
+    def _save_filters_to_active_profile(self):
+        profile = self._profile_layout_context_profile()
+        if not profile:
+            QMessageBox.information(self, "Profile Rules", "Choose a Current Profile first.")
+            return
+        views = self._profile_filter_views()
+        # Preserve the canonical profile spelling in the registry.
+        for existing in list(views):
+            if existing.casefold() == profile.casefold() and existing != profile:
+                views.pop(existing, None)
+        views[profile] = self._current_profile_rule_state()
+        self._write_profile_filter_views(views)
+        self.statusBar().showMessage(
+            f"Saved filters and visible columns as Profile Rules for '{profile}'. Search text is not included.",
+            7000,
+        )
+
+    def _clear_filters_from_active_profile(self) -> bool:
+        profile = self._profile_layout_context_profile()
+        if not profile:
+            return False
+        views = self._profile_filter_views()
+        removed = False
+        for existing in list(views):
+            if existing.casefold() == profile.casefold():
+                views.pop(existing, None)
+                removed = True
+        if removed:
+            self._write_profile_filter_views(views)
+            self.statusBar().showMessage(f"Cleared Profile Rules for '{profile}'.", 6000)
+        return removed
+
+    def _clear_applied_profile_rule_filters(self):
+        """Clear only the Library filters that Profile Rules can save; keep Search and columns as-is."""
+        for field in ("Status", "CC Type", "Creator"):
+            box = self.filter_boxes.get(field)
+            if box is None:
+                continue
+            box.blockSignals(True)
+            box.setCurrentText("All")
+            box.blockSignals(False)
+        self.extra_column_filters.clear()
+        self._refresh_active_filter_chips()
+        self._apply_filters()
+
+    def _restore_active_profile_filters(self):
+        profile = self._profile_layout_context_profile()
+        state = self._profile_filter_state(profile) if profile else None
+        if state is None:
+            self.statusBar().showMessage(f"Profile '{profile}' has no Profile Rules." if profile else "No Current Profile selected.", 5000)
+            return
+        self._apply_filter_state(state)
+        self._apply_profile_visible_columns(state)
+        self.statusBar().showMessage(f"Applied Profile Rules for '{profile}' (filters + visible columns).", 6000)
+
+    def _save_current_filter_preset(self):
+        if not self.mdb:
+            QMessageBox.information(self, "Saved Quick Filters", "Open a Master Database first.")
+            return
+        name, ok = QInputDialog.getText(self, "Save Quick Filter Preset", "Preset name:")
+        if not ok:
+            return
+        name = str(name or "").strip()
+        if not name:
+            return
+        presets = self._global_filter_presets()
+        existing = next((n for n in presets if n.casefold() == name.casefold()), None)
+        if existing and existing != name:
+            name = existing
+        if existing:
+            answer = QMessageBox.question(
+                self, "Replace Quick Filter Preset", f"Replace saved filter preset '{name}'?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if answer != QMessageBox.Yes:
+                return
+        presets[name] = self._current_filter_state()
+        self._write_global_filter_presets(presets)
+        self.statusBar().showMessage(f"Saved filter preset '{name}'. Search text is not included.", 6000)
+
+    def _manage_filter_presets(self):
+        presets = self._global_filter_presets()
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Manage Saved Quick Filters")
+        dialog.resize(500, 390)
+        layout = QVBoxLayout(dialog)
+        info = QLabel("Saved Quick Filters are reusable across Profiles and MDBs. Search text is not included in presets.")
+        info.setWordWrap(True)
+        layout.addWidget(info)
+        table = QTableWidget(0, 1)
+        table.setHorizontalHeaderLabels(["Saved filter"])
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QTableWidget.SingleSelection)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(table, 1)
+        row = QHBoxLayout()
+        apply_btn = QPushButton("Apply")
+        rename_btn = QPushButton("Rename…")
+        delete_btn = QPushButton("Delete")
+        row.addWidget(apply_btn)
+        row.addWidget(rename_btn)
+        row.addWidget(delete_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        def refresh(select_name: str = ""):
+            current = self._global_filter_presets()
+            names = sorted(current, key=str.casefold)
+            table.setRowCount(len(names))
+            selected = -1
+            for r, name in enumerate(names):
+                table.setItem(r, 0, QTableWidgetItem(name))
+                if select_name and name.casefold() == select_name.casefold():
+                    selected = r
+            if selected >= 0:
+                table.selectRow(selected)
+            elif names:
+                table.selectRow(0)
+            enabled = bool(names)
+            apply_btn.setEnabled(enabled)
+            rename_btn.setEnabled(enabled)
+            delete_btn.setEnabled(enabled)
+
+        def selected_name() -> str:
+            item = table.item(table.currentRow(), 0) if table.currentRow() >= 0 else None
+            return item.text().strip() if item else ""
+
+        def apply_selected():
+            name = selected_name()
+            state = self._global_filter_presets().get(name)
+            if state:
+                self._apply_filter_state(state)
+                self.statusBar().showMessage(f"Applied filter preset '{name}'.", 5000)
+
+        def rename_selected():
+            old = selected_name()
+            if not old:
+                return
+            new, ok = QInputDialog.getText(dialog, "Rename Saved Filter", "New name:", QLineEdit.Normal, old)
+            if not ok:
+                return
+            new = str(new or "").strip()
+            if not new or new == old:
+                return
+            current = self._global_filter_presets()
+            if any(name.casefold() == new.casefold() and name.casefold() != old.casefold() for name in current):
+                QMessageBox.information(dialog, "Rename Saved Filter", f"'{new}' already exists.")
+                return
+            state = current.pop(old, None)
+            if state is not None:
+                current[new] = state
+                self._write_global_filter_presets(current)
+                refresh(new)
+
+        def delete_selected():
+            name = selected_name()
+            if not name:
+                return
+            answer = QMessageBox.question(dialog, "Delete Saved Filter", f"Delete saved filter '{name}'?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+            current = self._global_filter_presets()
+            current.pop(name, None)
+            self._write_global_filter_presets(current)
+            refresh()
+
+        apply_btn.clicked.connect(apply_selected)
+        rename_btn.clicked.connect(rename_selected)
+        delete_btn.clicked.connect(delete_selected)
+        refresh()
+        dialog.exec()
+
+    def _apply_suggested_filter(self, kind: str):
+        kind = str(kind or "")
+        if kind == "current_profile":
+            profile = self._profile_layout_context_profile()
+            if not profile:
+                return
+            new_filter = {"field": "CC Magic Profiles", "condition": "is", "value": profile}
+            if new_filter not in self.extra_column_filters:
+                self.extra_column_filters.append(new_filter)
+        elif kind == "to_review":
+            box = self.filter_boxes.get("Status")
+            if box is not None and box.findText("To Review") >= 0:
+                box.setCurrentText("To Review")
+        elif kind == "has_thumbnail":
+            new_filter = {"field": "Thumbnail", "condition": "is", "value": "Yes"}
+            if new_filter not in self.extra_column_filters:
+                self.extra_column_filters.append(new_filter)
+        elif kind == "missing_thumbnail":
+            new_filter = {"field": "Thumbnail", "condition": "is not", "value": "Yes"}
+            if new_filter not in self.extra_column_filters:
+                self.extra_column_filters.append(new_filter)
+        elif kind == "no_creator":
+            new_filter = {"field": "Creator", "condition": "is blank", "value": ""}
+            if new_filter not in self.extra_column_filters:
+                self.extra_column_filters.append(new_filter)
+        elif kind == "no_converter":
+            new_filter = {"field": "Converter", "condition": "is blank", "value": ""}
+            if new_filter not in self.extra_column_filters:
+                self.extra_column_filters.append(new_filter)
+        self._sanitize_extra_column_filters()
+        self._refresh_active_filter_chips()
+        self._apply_filters()
+
+    def _rebuild_add_filter_menu(self):
+        menu = self.add_filter_menu
+        menu.clear()
+        custom = menu.addAction("Add custom Quick Filter…")
+        custom.triggered.connect(self._add_column_filter)
+
+        suggested = menu.addMenu("Suggested")
+        profile = self._profile_layout_context_profile()
+        if profile:
+            action = suggested.addAction(f"Current Profile — {profile}")
+            action.triggered.connect(lambda checked=False: self._apply_suggested_filter("current_profile"))
+        action = suggested.addAction("To Review")
+        action.triggered.connect(lambda checked=False: self._apply_suggested_filter("to_review"))
+        action = suggested.addAction("Has thumbnail")
+        action.triggered.connect(lambda checked=False: self._apply_suggested_filter("has_thumbnail"))
+        action = suggested.addAction("Missing thumbnail")
+        action.triggered.connect(lambda checked=False: self._apply_suggested_filter("missing_thumbnail"))
+        action = suggested.addAction("Creator not assigned")
+        action.triggered.connect(lambda checked=False: self._apply_suggested_filter("no_creator"))
+        action = suggested.addAction("Converter not assigned")
+        action.triggered.connect(lambda checked=False: self._apply_suggested_filter("no_converter"))
+
+        presets = self._global_filter_presets()
+        saved_menu = menu.addMenu("Saved Quick Filters")
+        if presets:
+            for name in sorted(presets, key=str.casefold):
+                action = saved_menu.addAction(name)
+                action.triggered.connect(lambda checked=False, n=name: self._apply_filter_state(self._global_filter_presets().get(n, {})))
+        else:
+            empty = saved_menu.addAction("(none saved)")
+            empty.setEnabled(False)
+
+        menu.addSeparator()
+        save = menu.addAction("Save current Quick Filters…")
+        save.triggered.connect(self._save_current_filter_preset)
+        manage = menu.addAction("Manage saved Quick Filters…")
+        manage.triggered.connect(self._manage_filter_presets)
 
     def _add_column_filter(self):
         if not self.mdb:
@@ -11322,24 +14161,11 @@ class MainWindow(QMainWindow):
         self._sanitize_extra_column_filters()
         self._refresh_active_filter_chips()
 
-        if hasattr(self, "gallery_type_filter"):
-            current = self.gallery_type_filter.currentText()
-            self.gallery_type_filter.blockSignals(True)
-            self.gallery_type_filter.clear()
-            self.gallery_type_filter.addItem("All")
-            type_values = _unique_cc_type_values(self.mdb.records)
-            self.gallery_type_filter.addItems(type_values)
-            if current == "All":
-                self.gallery_type_filter.setCurrentText("All")
-            else:
-                wanted = _cc_type_key(current)
-                match = next((value for value in type_values if _cc_type_key(value) == wanted), None)
-                self.gallery_type_filter.setCurrentText(match or "All")
-            self.gallery_type_filter.blockSignals(False)
+
 
     def _apply_filters(self):
         if IS_PUBLIC_BUILD:
-            permanent_fields = {"Status", "CC Type", "Creator", "CC Magic Profiles"}
+            permanent_fields = {"Status", "CC Type", "Creator"}
             filters = {
                 field: box.currentText()
                 for field, box in self.filter_boxes.items()
@@ -11546,7 +14372,7 @@ class MainWindow(QMainWindow):
         self._fit_detail_title()
         QTimer.singleShot(0, self._fit_detail_title)
         self.status_badge.setText("Status: " + (effective.get("Status", "") or "—"))
-        self.cc_type_badge.setText("CC Type: " + (rec.get("CC Type", "") or "—"))
+        self.cc_type_badge.setText("CC Type: " + (_cc_type_label(rec.get("CC Type", "")) or "—"))
         self.polys_badge.setText("Highest Polys: " + (rec.get("Highest Polys", "") or "—"))
         # Random Sim usage is an independent DEV relationship label. It never
         # replaces Status, so "Used in Game" and "Random Sims: N" can coexist.
@@ -11651,7 +14477,7 @@ class MainWindow(QMainWindow):
             return []
         if field == "Status":
             return list(PUBLIC_STATUS_OPTIONS)
-        if field == "File Location":
+        if field in ("File Location", PROFILE_LOCATION_FIELD):
             return [name for name, _path in self.file_location_registry_current]
         if field == "CC Magic Profiles":
             return self._all_profile_names()
@@ -11677,13 +14503,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Fill down",
-                "The source cell is blank. Blank fill-down is blocked so populated values cannot be cleared accidentally.",
+                "The source cell is blank. To clear values instead, select the rows in the editable column and press Delete.",
             )
             return
 
-        # Resolve the complete displayed drag range before staging edits. This is
-        # essential when the edited field also participates in the active filter:
-        # rows may disappear from the proxy as soon as their value changes.
         mapped_source_rows: List[int] = []
         overwritten_nonblank = 0
         already_same = 0
@@ -11698,6 +14521,9 @@ class MainWindow(QMainWindow):
             excel_row = self.model._excel_row(rec)
             if excel_row in self.pending_deletions:
                 skipped_deletions += 1
+                continue
+            target_model_index = self.model.index(src_row, source_index.column())
+            if not target_model_index.isValid() or not (target_model_index.flags() & Qt.ItemIsEditable):
                 continue
             current = self.model.effective_value(src_row, field)
             mapped_source_rows.append(src_row)
@@ -11722,6 +14548,7 @@ class MainWindow(QMainWindow):
         if skipped_deletions:
             detail_lines.append(f"{skipped_deletions:,} row(s) staged for deletion will be skipped.")
         detail_lines.append("These edits remain staged until you use Save Changes.")
+
         if getattr(self, "confirm_fill_action", None) is None or self.confirm_fill_action.isChecked():
             answer = QMessageBox.question(
                 self,
@@ -11779,7 +14606,14 @@ class MainWindow(QMainWindow):
             self.file_location_edit.clear()
             self.file_location_edit.addItem("")
             self.file_location_edit.addItems([name for name, _path in self.file_location_registry_current])
+            if hasattr(self, "profile_location_edit"):
+                self.profile_location_edit.clear()
+                self.profile_location_edit.addItem("— no planned location —", "")
+                for name, _path in self.file_location_registry_current:
+                    self.profile_location_edit.addItem(name, name)
             self.file_location_manage_btn.setEnabled(True)
+            if hasattr(self, "manage_locations_global_btn"):
+                self.manage_locations_global_btn.setEnabled(True)
         finally:
             self._loading_editor = False
 
@@ -11880,7 +14714,8 @@ class MainWindow(QMainWindow):
         dialog.resize(900, 460)
         layout = QVBoxLayout(dialog)
         intro = QLabel(
-            "Each name points to the folder containing an original, unmerged package. Assigning a location never moves or copies a package. "
+            "Each name points to the folder containing an original, unmerged package. Add Folder uses the selected Windows folder's name automatically; "
+            "use Rename only if you want a different display name. Assigning a location never moves or copies a package. "
             "Missing folders are shown as unavailable; paths are never substituted automatically. "
             "Changes remain staged until Save Changes."
         )
@@ -11893,7 +14728,14 @@ class MainWindow(QMainWindow):
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         table.verticalHeader().setVisible(False)
-        table.horizontalHeader().setStretchLastSection(True)
+        table.verticalHeader().setDefaultSectionSize(48)
+        location_header = table.horizontalHeader()
+        location_header.setStretchLastSection(False)
+        location_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        location_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        location_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        location_header.setSectionResizeMode(3, QHeaderView.Fixed)
+        table.setColumnWidth(3, 92)
         layout.addWidget(table, 1)
 
         buttons_row = QHBoxLayout()
@@ -11929,13 +14771,22 @@ class MainWindow(QMainWindow):
                 table.setItem(row, 1, path_item)
                 table.setItem(row, 2, availability_item)
                 row_open_btn = QPushButton("Open")
+                row_open_btn.setFixedSize(64, 30)
                 row_open_btn.setEnabled(available)
                 row_open_btn.setToolTip("Open this exact saved folder in Windows File Explorer." if available else "This saved folder is currently unavailable.")
                 row_open_btn.clicked.connect(lambda checked=False, p=folder_path, n=name: self._open_saved_folder(p, n))
-                table.setCellWidget(row, 3, row_open_btn)
+
+                open_cell = QWidget()
+                open_cell_layout = QHBoxLayout(open_cell)
+                open_cell_layout.setContentsMargins(6, 6, 6, 6)
+                open_cell_layout.setAlignment(Qt.AlignCenter)
+                open_cell_layout.addWidget(row_open_btn)
+                table.setCellWidget(row, 3, open_cell)
                 if select_name and name.casefold() == select_name.casefold():
                     selected_row = row
             table.resizeColumnsToContents()
+            location_header.setSectionResizeMode(1, QHeaderView.Stretch)
+            table.setColumnWidth(3, 92)
             if selected_row >= 0:
                 table.selectRow(selected_row)
             update_buttons()
@@ -11978,16 +14829,19 @@ class MainWindow(QMainWindow):
                     QMessageBox.information(dialog, "File Location already exists", f"This folder is already saved as '{existing_name}'.")
                     refresh_table(existing_name)
                     return
-            name, ok = QInputDialog.getText(dialog, "Name File Location", "Friendly location name:")
-            if not ok:
-                return
-            name = name.strip()
-            if not name:
-                QMessageBox.information(dialog, "File Location", "Enter a non-empty location name.")
-                return
-            if any(old_name.casefold() == name.casefold() for old_name, _ in self.file_location_registry_current):
-                QMessageBox.warning(dialog, "File Location", f"A location named '{name}' already exists.")
-                return
+            # Use the real Windows folder name as the friendly location name so
+            # adding a managed location is a browse-only workflow. If another
+            # saved location already uses the same folder name, keep both by
+            # adding a small numeric suffix; the user can Rename it afterwards.
+            base_name = Path(folder_path).name.strip()
+            if not base_name:
+                base_name = Path(folder_path).drive.rstrip(":\\/") or "Location"
+            used_names = {old_name.casefold() for old_name, _ in self.file_location_registry_current}
+            name = base_name
+            suffix = 2
+            while name.casefold() in used_names:
+                name = f"{base_name} ({suffix})"
+                suffix += 1
             self.file_location_registry_current.append((name, folder_path))
             self.settings.setValue("last_file_location_dir", str(Path(folder_path).parent))
             set_registry_dirty()
@@ -12015,12 +14869,18 @@ class MainWindow(QMainWindow):
                 for name, path in self.file_location_registry_current
             ]
             changed = 0
+            layout_changed = 0
             if new_name != old_name:
                 changed = self._stage_file_location_rename(old_name, new_name)
+                layout_changed = self._rename_profile_layout_location(old_name, new_name)
             set_registry_dirty()
             refresh_table(new_name)
-            if changed:
-                self.statusBar().showMessage(f"Staged File Location rename across {changed:,} package assignment(s). Save Changes to keep it.", 9000)
+            if changed or layout_changed:
+                self.statusBar().showMessage(
+                    f"Staged File Location rename across {changed:,} current assignment(s) and "
+                    f"{layout_changed:,} Profile Layout target(s). Save Changes to keep it.",
+                    9000,
+                )
 
         def change_folder_path():
             selected = selected_location()
@@ -12064,10 +14924,20 @@ class MainWindow(QMainWindow):
                     continue
                 if self.model.effective_value(source_row, "File Location").strip().casefold() == name.casefold():
                     usage += 1
-            if usage:
+            layout_usage = sum(
+                1 for _profile, _hash, _package, location_name in self.profile_layouts_current
+                if location_name.casefold() == name.casefold()
+            )
+            if usage or layout_usage:
+                details = []
+                if usage:
+                    details.append(f"{usage:,} current package assignment(s)")
+                if layout_usage:
+                    details.append(f"{layout_usage:,} Experimental Profile Layout target(s)")
                 QMessageBox.warning(
                     dialog, "File Location is in use",
-                    f"'{name}' is assigned to {usage:,} package(s). Reassign those packages first, then remove the location."
+                    f"'{name}' is used by " + " and ".join(details) + ". "
+                    "Reassign those uses first, then remove the location."
                 )
                 return
             answer = QMessageBox.question(
@@ -12102,7 +14972,9 @@ class MainWindow(QMainWindow):
         for widget in (
             getattr(self, "status_edit", None),
             getattr(self, "creator_edit", None),
+            getattr(self, "converter_edit", None),
             getattr(self, "file_location_edit", None),
+            getattr(self, "profile_location_edit", None),
             getattr(self, "cc_magic_profiles_edit", None),
             getattr(self, "merge_profiles_edit", None),
             getattr(self, "merge_profiles_set_btn", None),
@@ -12111,6 +14983,7 @@ class MainWindow(QMainWindow):
             getattr(self, "preview_image_add_btn", None),
             getattr(self, "preview_image_clear_btn", None),
             getattr(self, "cc_magic_profile_quick", None),
+            getattr(self, "cc_magic_profile_remove_quick", None),
             getattr(self, "cc_profile_add_btn", None),
             getattr(self, "cc_profile_remove_btn", None),
             getattr(self, "cc_profile_manage_btn", None),
@@ -12125,7 +14998,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "save_btn"):
             self.save_btn.setEnabled(
                 bool(self.pending_changes) or bool(self.pending_deletions)
-                or self.profile_registry_dirty or self.status_registry_dirty or self.file_location_registry_dirty
+                or self.profile_registry_dirty or self.profile_layouts_dirty
+                or self.status_registry_dirty or self.file_location_registry_dirty
                 or self.merge_profile_registry_dirty
             )
         if hasattr(self, "revert_selected_btn"):
@@ -12133,6 +15007,2142 @@ class MainWindow(QMainWindow):
             self.revert_selected_btn.setEnabled(
                 (enabled and row_num in self.pending_changes) or row_num in self.pending_deletions
             )
+
+    @staticmethod
+    def _profile_layout_identity(rec: Dict[str, str]) -> tuple[str, str]:
+        """Stable Profile Layout identity: prefer package hash, keep filename for display/fallback."""
+        package_hash = str((rec or {}).get("Package Hash", "") or "").strip().lower()
+        package_name = Path(str((rec or {}).get("Package", "") or "").strip()).name
+        return package_hash, package_name
+
+    @staticmethod
+    def _profile_layout_entry_matches(
+        entry: tuple[str, str, str, str], profile: str, package_hash: str, package_name: str
+    ) -> bool:
+        entry_profile, entry_hash, entry_package, _location = entry
+        if str(entry_profile or "").strip().casefold() != str(profile or "").strip().casefold():
+            return False
+        entry_hash = str(entry_hash or "").strip().lower()
+        package_hash = str(package_hash or "").strip().lower()
+        if package_hash and entry_hash:
+            return package_hash == entry_hash
+        if package_hash or entry_hash:
+            return False
+        return Path(str(entry_package or "")).name.casefold() == Path(str(package_name or "")).name.casefold()
+
+    def _profile_layout_target(
+        self,
+        profile: str,
+        rec: Dict[str, str],
+        layouts: Optional[List[tuple[str, str, str, str]]] = None,
+    ) -> str:
+        profile = str(profile or "").strip()
+        if not profile or not rec:
+            return ""
+        package_hash, package_name = self._profile_layout_identity(rec)
+        for entry in (self.profile_layouts_current if layouts is None else layouts):
+            if self._profile_layout_entry_matches(entry, profile, package_hash, package_name):
+                return str(entry[3] or "").strip()
+        return ""
+
+    def _profile_layout_context_profile(self) -> str:
+        """Return the Current Profile selected from Profiles…."""
+        profile = str(getattr(self, "active_profile_name", "") or "").strip()
+        if not profile:
+            return ""
+        match = next((p for p in self._all_profile_names() if p.casefold() == profile.casefold()), None)
+        return match or ""
+
+    def _set_profile_layout_target(
+        self, profile: str, rec: Dict[str, str], target_location: str
+    ) -> bool:
+        """Stage one desired Profile Location. This never moves a package file."""
+        profile = str(profile or "").strip()
+        target_location = str(target_location or "").strip()
+        if not profile or not rec:
+            return False
+        package_hash, package_name = self._profile_layout_identity(rec)
+        if not package_hash and not package_name:
+            return False
+
+        old_target = self._profile_layout_target(profile, rec)
+        if old_target == target_location:
+            return False
+
+        new_entries = [
+            entry for entry in self.profile_layouts_current
+            if not self._profile_layout_entry_matches(entry, profile, package_hash, package_name)
+        ]
+        if target_location:
+            new_entries.append((profile, package_hash, package_name, target_location))
+        new_entries.sort(
+            key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
+        )
+        self.profile_layouts_current = new_entries
+        self.profile_layouts_dirty = self.profile_layouts_current != self.profile_layouts_saved
+        self._update_dirty_state()
+        self._update_selected_dirty_label()
+        return True
+
+    def _profile_layout_is_dirty_for_record(self, profile: str, rec: Dict[str, str]) -> bool:
+        return self._profile_layout_target(profile, rec, self.profile_layouts_current) != self._profile_layout_target(
+            profile, rec, self.profile_layouts_saved
+        )
+
+    def _table_profile_location_conditions(self, source_row: int) -> tuple[bool, str, Dict[str, str]]:
+        """Return whether the Table Planned Location cell may be edited."""
+        if not self.mdb or not (0 <= source_row < len(self.model.records)):
+            return False, "", {}
+        if not (IS_DEV_BUILD or self.experimental_features):
+            return False, "", self.model.record(source_row)
+        profile = self._profile_layout_context_profile()
+        rec = self.model.record(source_row)
+        if not profile or not rec:
+            return False, profile, rec
+        excel_row = self.model._excel_row(rec)
+        if not excel_row or excel_row in self.pending_deletions:
+            return False, profile, rec
+        # A Current Profile is enough to edit Planned Location. Setting a non-blank
+        # plan automatically adds that Profile to Profile Membership, so users do
+        # not need a separate Add-to step first.
+        return True, profile, rec
+
+    def _table_virtual_value(self, source_row: int, field: str) -> str:
+        if field != PROFILE_LOCATION_FIELD:
+            return ""
+        profile = self._profile_layout_context_profile()
+        rec = self.model.record(source_row)
+        return self._profile_layout_target(profile, rec) if profile and rec else ""
+
+    def _table_virtual_editable(self, source_row: int, field: str) -> bool:
+        if field != PROFILE_LOCATION_FIELD:
+            return False
+        allowed, _profile, _rec = self._table_profile_location_conditions(source_row)
+        return allowed
+
+    def _table_virtual_set_value(self, source_row: int, field: str, value: str) -> bool:
+        if field != PROFILE_LOCATION_FIELD:
+            return False
+        allowed, profile, rec = self._table_profile_location_conditions(source_row)
+        if not allowed:
+            return False
+        target = str(value or "").strip()
+        valid_locations = {name.casefold(): name for name, path in self.file_location_registry_current if name and path}
+        if target:
+            canonical = valid_locations.get(target.casefold())
+            if not canonical:
+                return False
+            target = canonical
+            # A saved plan implies membership in that Profile.
+            self._stage_profile_on_rows(profile, [source_row], True)
+        changed = self._set_profile_layout_target(profile, rec, target)
+        if changed and self.current_source_row == source_row:
+            self._load_profile_location_editor(rec)
+        return changed
+
+    def _table_virtual_tooltip(self, source_row: int, field: str) -> str:
+        if field != PROFILE_LOCATION_FIELD:
+            return ""
+        value = self._table_virtual_value(source_row, field) or "(no planned location)"
+        allowed, profile, _rec = self._table_profile_location_conditions(source_row)
+        if allowed:
+            return (
+                f"{value}\n\nDouble-click to choose the Planned Location for '{profile}'. "
+                "Save Changes stores the plan only; no file moves until Apply Profile Locations."
+            )
+        if not (IS_DEV_BUILD or self.experimental_features):
+            return "Enable Experimental features to use Planned Location."
+        if not profile:
+            return "Choose a Current Profile at the top of Library first."
+        return (
+            f"Choose a Planned Location for '{profile}'. Setting a non-blank plan automatically adds "
+            "this package to that Profile's Membership. Save Changes stores the plan only."
+        )
+
+    def _table_virtual_dirty(self, source_row: int) -> bool:
+        profile = self._profile_layout_context_profile()
+        rec = self.model.record(source_row)
+        return bool(profile and rec and self._profile_layout_is_dirty_for_record(profile, rec))
+
+    def _refresh_profile_layout_editor_visibility(self):
+        tools = getattr(self, "profile_location_tools", None)
+        label = getattr(self, "profile_location_label", None)
+        if tools is None:
+            return
+        profile = self._profile_layout_context_profile()
+        visible = bool((IS_DEV_BUILD or self.experimental_features) and self.mdb and profile)
+        try:
+            self.edit_form.setRowVisible(tools, visible)
+        except (AttributeError, RuntimeError):
+            if label is not None:
+                label.setVisible(visible)
+            tools.setVisible(visible)
+        if not visible:
+            return
+        if self.current_source_row is not None:
+            rec = self.model.record(self.current_source_row)
+            if rec:
+                self._load_profile_location_editor(rec)
+
+    def _load_profile_location_editor(self, rec: Dict[str, str]):
+        combo = getattr(self, "profile_location_edit", None)
+        if combo is None:
+            return
+        profile = self._profile_layout_context_profile()
+        self._loading_editor = True
+        try:
+            combo.clear()
+            combo.addItem("— no planned location —", "")
+            for name, _path in self.file_location_registry_current:
+                combo.addItem(name, name)
+            target = self._profile_layout_target(profile, rec) if profile else ""
+            index = combo.findData(target)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+            enabled = bool(profile and (IS_DEV_BUILD or self.experimental_features))
+            combo.setEnabled(enabled)
+            if hasattr(self, "profile_location_help"):
+                if not profile:
+                    help_text = "Choose a Current Profile at the top of Library to edit its planned location."
+                else:
+                    help_text = (
+                        f"Planned location for Profile '{profile}'. Choosing a location automatically adds this package "
+                        "to that Profile's Membership if needed. Save Changes stores the plan only; "
+                        "Apply Profile Locations performs the physical move."
+                    )
+                self.profile_location_help.setText(help_text)
+        finally:
+            self._loading_editor = False
+
+    def _profile_layout_context_changed(self, *_):
+        self._refresh_profile_layout_editor_visibility()
+        if self.current_source_row is not None:
+            rec = self.model.record(self.current_source_row)
+            if rec:
+                self._load_profile_location_editor(rec)
+        self._update_selected_dirty_label()
+
+    def _profile_location_editor_changed(self, *_):
+        if self._loading_editor or not self.mdb or self.current_source_row is None:
+            return
+        profile = self._profile_layout_context_profile()
+        if not profile or not (IS_DEV_BUILD or self.experimental_features):
+            return
+        rec = self.model.record(self.current_source_row)
+        if not rec:
+            return
+        target = str(self.profile_location_edit.currentData() or "").strip()
+        if target:
+            self._stage_profile_on_rows(profile, [self.current_source_row], True)
+        if self._set_profile_layout_target(profile, rec, target):
+            self.statusBar().showMessage(
+                f"Staged Planned Location for '{profile}' — Save Changes stores the plan; no file moved.",
+                8000,
+            )
+
+    def _prune_profile_layouts_to_effective_memberships(self) -> bool:
+        """Remove orphan layout entries when records/profiles/memberships are deleted."""
+        valid: List[tuple[str, str, str, str]] = []
+        changed = False
+        for entry in self.profile_layouts_current:
+            profile, package_hash, package_name, location_name = entry
+            matched = False
+            for source_row, rec in enumerate(self.model.records):
+                try:
+                    excel_row = int(rec.get("_ExcelRow", "0") or 0)
+                except (TypeError, ValueError):
+                    excel_row = 0
+                if excel_row in self.pending_deletions:
+                    continue
+                rec_hash, rec_name = self._profile_layout_identity(rec)
+                if not self._profile_layout_entry_matches(
+                    entry, profile, rec_hash, rec_name
+                ):
+                    continue
+                memberships = {
+                    p.casefold()
+                    for p in _split_cc_magic_profiles(
+                        self.model.effective_value(source_row, "CC Magic Profiles")
+                    )
+                }
+                if profile.casefold() in memberships:
+                    matched = True
+                break
+            if matched:
+                valid.append((profile, package_hash, package_name, location_name))
+            else:
+                changed = True
+        if changed:
+            valid.sort(
+                key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
+            )
+            self.profile_layouts_current = valid
+            self.profile_layouts_dirty = self.profile_layouts_current != self.profile_layouts_saved
+        return changed
+
+    def _rename_or_remove_profile_layouts(self, old_profile: str, new_profile: Optional[str]) -> int:
+        old_key = str(old_profile or "").strip().casefold()
+        if not old_key:
+            return 0
+        new_name = str(new_profile or "").strip()
+        changed = 0
+        rebuilt: List[tuple[str, str, str, str]] = []
+        seen = set()
+        for profile, package_hash, package_name, location_name in self.profile_layouts_current:
+            if profile.casefold() == old_key:
+                changed += 1
+                if not new_name:
+                    continue
+                profile = new_name
+            identity = ("h:" + package_hash.lower()) if package_hash else ("p:" + package_name.casefold())
+            key = (profile.casefold(), identity)
+            if key in seen:
+                continue
+            seen.add(key)
+            rebuilt.append((profile, package_hash, package_name, location_name))
+        rebuilt.sort(
+            key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
+        )
+        if rebuilt != self.profile_layouts_current:
+            self.profile_layouts_current = rebuilt
+            self.profile_layouts_dirty = self.profile_layouts_current != self.profile_layouts_saved
+            self._update_dirty_state()
+        return changed
+
+    def _rename_profile_layout_location(self, old_name: str, new_name: str) -> int:
+        old_key = str(old_name or "").strip().casefold()
+        changed = 0
+        rebuilt = []
+        for profile, package_hash, package_name, location_name in self.profile_layouts_current:
+            if location_name.casefold() == old_key:
+                location_name = new_name
+                changed += 1
+            rebuilt.append((profile, package_hash, package_name, location_name))
+        if changed:
+            rebuilt.sort(
+                key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
+            )
+            self.profile_layouts_current = rebuilt
+            self.profile_layouts_dirty = self.profile_layouts_current != self.profile_layouts_saved
+            self._update_dirty_state()
+        return changed
+
+    def _profile_layout_members(self, profile: str) -> List[int]:
+        wanted = str(profile or "").strip().casefold()
+        rows: List[int] = []
+        if not wanted:
+            return rows
+        for source_row, rec in enumerate(self.model.records):
+            try:
+                excel_row = int(rec.get("_ExcelRow", "0") or 0)
+            except (TypeError, ValueError):
+                excel_row = 0
+            if not excel_row or excel_row in self.pending_deletions:
+                continue
+            memberships = {
+                p.casefold()
+                for p in _split_cc_magic_profiles(self.model.effective_value(source_row, "CC Magic Profiles"))
+            }
+            if wanted in memberships:
+                rows.append(source_row)
+        return rows
+
+    def _routing_structure_presets(self) -> Dict[str, Dict[str, object]]:
+        raw = str(self.settings.value("routing_structure_presets_json", "{}") or "{}")
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        result = {}
+        for name, payload in data.items():
+            if not isinstance(payload, dict):
+                continue
+            clean = str(name or "").strip()
+            levels = payload.get("levels", [])
+            if clean and isinstance(levels, list):
+                result[clean] = {
+                    "levels": [str(v) for v in levels if str(v).strip()],
+                    "missing": str(payload.get("missing", "unassigned") or "unassigned"),
+                    "outfit_multi": str(payload.get("outfit_multi", "priority") or "priority"),
+                }
+        return result
+
+    def _write_routing_structure_presets(self, presets: Dict[str, Dict[str, object]]):
+        self.settings.setValue(
+            "routing_structure_presets_json",
+            json.dumps(presets, ensure_ascii=False, sort_keys=True),
+        )
+        self.settings.sync()
+
+    def _routing_structure_fields(self) -> List[str]:
+        """Folder-suitable fields derived from the same user-facing pool as Quick Filters."""
+        blocked = {
+            "#", "Thumbnail", "Package", "Image", "File Location", PROFILE_LOCATION_FIELD,
+            "Original Source Path", "Package Hash", "Last Scanned", "Notes", "CASP Instance IDs",
+            "Duplicate Files",
+        }
+        fields = []
+        for field in self._available_column_filter_fields():
+            if field in blocked:
+                continue
+            if field not in fields:
+                fields.append(field)
+        preferred = [
+            "Creator", "Converter", "CC Type", "Subtype", "Status", "Health Status", "Outfit Category",
+            "Age", "Gender", "EA Resource Status", "Skin Type", "Package Format",
+            "CC Magic Profiles", "Merge Profiles", "Risk Score", "HQ Warning", "Poly Warning",
+        ]
+        order = {name: i for i, name in enumerate(preferred)}
+        fields.sort(key=lambda f: (order.get(f, 999), _display_field_name(f).casefold()))
+        return fields
+
+    ROUTING_SEGMENT_MAX = 64
+    ROUTING_PATH_MAX = 240
+
+    @classmethod
+    def _routing_structure_clean_segment(cls, value: str) -> str:
+        original = str(value or "")
+        value = original.replace("\r", " ").replace("\n", " + ").replace(";", " + ")
+        value = re.sub(r"[<>:\"/\\|?*\x00-\x1f]+", "-", value)
+        value = re.sub(r"\s+", " ", value).strip(" .")
+        # A punctuation-only result such as '-' is technically legal on Windows,
+        # but it is not a useful folder identity and collides far too easily.
+        if value in {"", ".", ".."} or not any(ch.isalnum() for ch in value):
+            return ""
+        reserved = {"CON", "PRN", "AUX", "NUL"} | {f"COM{i}" for i in range(1, 10)} | {f"LPT{i}" for i in range(1, 10)}
+        if value.split(".", 1)[0].upper() in reserved:
+            value = "_" + value
+        value = value.rstrip(" .")
+        if len(value) > cls.ROUTING_SEGMENT_MAX:
+            digest = hashlib.sha256(original.encode("utf-8", errors="replace")).hexdigest()[:8]
+            suffix = f"_{digest}"
+            keep = max(1, cls.ROUTING_SEGMENT_MAX - len(suffix))
+            value = value[:keep].rstrip(" .-") + suffix
+        return value
+
+    @staticmethod
+    def _routing_structure_split_outfit_categories(value: str) -> List[str]:
+        parts = [part.strip() for part in re.split(r"\s*(?:\+|;|,)\s*", str(value or "")) if part.strip()]
+        seen = set()
+        result = []
+        for part in parts:
+            key = part.casefold()
+            if key not in seen:
+                seen.add(key)
+                result.append(part)
+        return result
+
+    def _routing_structure_outfit_value(self, raw: str, rule: str) -> tuple[str, Optional[str]]:
+        values = self._routing_structure_split_outfit_categories(raw)
+        if len(values) <= 1:
+            return (values[0] if values else ""), None
+        rule = str(rule or "priority")
+        if rule == "combined":
+            return " + ".join(values), None
+        if rule == "block_multi":
+            return "", "Outfit Category has multiple values: " + ", ".join(values)
+        priority = ["Everyday", "Formal", "Sleepwear", "Swimwear", "Athletic", "Career", "Outerwear"]
+        by_key = {value.casefold(): value for value in values}
+        for wanted in priority:
+            if wanted.casefold() in by_key:
+                return by_key[wanted.casefold()], None
+        return values[0], None
+
+    def _routing_structure_field_role(self, token: str) -> str:
+        token = str(token or "")
+        if token.startswith("CUSTOM::"):
+            return "custom"
+        if token in {"CC Magic Profiles", "Merge Profiles"}:
+            return "main"
+        if token in {"Subtype", "Outfit Category"}:
+            return "sub"
+        if token in {
+            "Creator", "Converter", "CC Type", "Status", "Health Status", "Age", "Gender",
+            "EA Resource Status", "Skin Type", "Package Format",
+        }:
+            return "either"
+        return "unavailable"
+
+    def _routing_structure_field_allowed(self, token: str, position: int, preceding: List[str]) -> tuple[bool, str]:
+        role = self._routing_structure_field_role(token)
+        label = token.split("::", 1)[1] if token.startswith("CUSTOM::") else _display_field_name(token)
+        if role == "unavailable":
+            return False, f"{label} is not a supported physical folder level in the visual builder."
+        if role == "main" and position != 0:
+            return False, f"{label} can only be the first/main folder level."
+        if role == "sub" and position == 0:
+            return False, f"{label} is a subfolder-only level."
+        if token in {"Subtype", "Outfit Category"} and "CC Type" not in preceding:
+            return False, f"{label} requires CC Type earlier in the structure."
+        return True, ""
+
+    def _routing_structure_validate_levels(self, levels: List[str]) -> List[str]:
+        errors = []
+        preceding: List[str] = []
+        for index, token in enumerate(levels):
+            ok, reason = self._routing_structure_field_allowed(token, index, preceding)
+            if not ok:
+                errors.append(reason)
+            preceding.append(token)
+        return errors
+
+    @staticmethod
+    def _routing_structure_is_readonly(path: Path) -> bool:
+        try:
+            attrs = getattr(path.stat(), "st_file_attributes", 0)
+            readonly_flag = getattr(stat, "FILE_ATTRIBUTE_READONLY", 0)
+            if readonly_flag and attrs & readonly_flag:
+                return True
+        except OSError:
+            return False
+        return False
+
+    @staticmethod
+    def _routing_structure_probe_writable_folder(folder: Path) -> tuple[bool, str]:
+        probe_root = Path(folder)
+        while not probe_root.exists() and probe_root != probe_root.parent:
+            probe_root = probe_root.parent
+        if not probe_root.is_dir():
+            return False, f"No writable parent folder exists for '{folder}'."
+        probe = probe_root / f".cas_curator_write_test_{os.getpid()}_{hashlib.sha1(str(folder).encode('utf-8', errors='replace')).hexdigest()[:8]}.tmp"
+        try:
+            with probe.open("xb") as handle:
+                handle.write(b"CAS Curator write test")
+            probe.unlink()
+            return True, ""
+        except Exception as exc:
+            try:
+                probe.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return False, f"Folder is not writable: {probe_root} ({exc})"
+
+    def _routing_structure_levels_for_record(
+        self, source_row: int, levels: List[str], missing_rule: str, outfit_rule: str = "priority"
+    ) -> tuple[List[str], List[str], Optional[str]]:
+        """Resolve one record into safe folder segments.
+
+        Routing fields include scanner-derived values as well as manually editable
+        metadata.  A malformed/legacy scanner cell must never abort the whole
+        Preview callback (which previously looked like an empty Preview with a
+        disabled Route button).  Normalize every value to text here and return a
+        visible per-package block reason if one field cannot be read.
+        """
+        segments: List[str] = []
+        identities: List[str] = []
+        for token in levels:
+            token = str(token or "")
+            if token.startswith("CUSTOM::"):
+                raw_text = str(token.split("::", 1)[1] or "")
+                label = raw_text or "Custom folder"
+            else:
+                label = _display_field_name(token)
+                try:
+                    # Editable metadata must include staged/unsaved edits. Scanner-derived
+                    # fields are read directly from the stored MDB record: they are
+                    # read-only and this is the same source shown by Table / All Fields.
+                    # Keeping the two paths separate prevents the visual builder from
+                    # treating scanner fields as failed/virtual editable values.
+                    if token in EDITABLE_FIELDS or token == PROFILE_LOCATION_FIELD:
+                        raw_value = self.model.effective_value(source_row, token)
+                    else:
+                        record = self.model.record(source_row) or {}
+                        raw_value = record.get(token, "")
+                except Exception as exc:
+                    return [], [], f"{label} could not be read for this package ({exc})"
+                raw_text = str(raw_value or "")
+                if token == "CC Type":
+                    # User-facing route folders use friendly labels while the MDB
+                    # continues to store the scanner's raw value unchanged.
+                    raw_text = _cc_type_label(raw_text)
+                if token in {"CC Magic Profiles", "Merge Profiles"}:
+                    try:
+                        raw_text = " + ".join(_split_cc_magic_profiles(raw_text))
+                    except Exception as exc:
+                        return [], [], f"{label} could not be interpreted for this package ({exc})"
+                if token == "Outfit Category":
+                    try:
+                        raw_text, outfit_error = self._routing_structure_outfit_value(raw_text, outfit_rule)
+                    except Exception as exc:
+                        return [], [], f"{label} could not be interpreted for this package ({exc})"
+                    if outfit_error:
+                        return [], [], outfit_error
+            identity = str(raw_text or "")
+            try:
+                clean = self._routing_structure_clean_segment(raw_text)
+            except Exception as exc:
+                return [], [], f"{label} could not be converted into a safe folder name ({exc})"
+            if clean:
+                segments.append(clean)
+                identities.append(identity)
+                continue
+            if missing_rule == "skip":
+                continue
+            if missing_rule == "block":
+                return [], [], f"No usable {label} value is available for this package."
+            segments.append("Unassigned")
+            identities.append("__UNASSIGNED__")
+        return segments, identities, None
+
+    def _routing_structure_rows(self, scope: str) -> List[int]:
+        scope = str(scope or "all")
+        if scope == "selected":
+            rows = []
+            selection = self.table.selectionModel()
+            for proxy_index in (selection.selectedRows() if selection else []):
+                source = self.proxy.mapToSource(proxy_index)
+                if source.isValid():
+                    rows.append(source.row())
+            return sorted(set(rows))
+        if scope == "shown":
+            rows = []
+            for proxy_row in range(self.proxy.rowCount()):
+                source = self.proxy.mapToSource(self.proxy.index(proxy_row, 0))
+                if source.isValid():
+                    rows.append(source.row())
+            return sorted(set(rows))
+        return list(range(len(self.model.records)))
+
+    def _routing_structure_preview_plans(
+        self, rows: List[int], target_name: str, levels: List[str], missing_rule: str,
+        outfit_rule: str = "priority", resolve_sources: bool = False
+    ) -> tuple[List[dict], List[str]]:
+        target_path_text = self._file_location_path_for_name(target_name)
+        target_root = Path(target_path_text) if target_path_text else Path()
+        errors: List[str] = []
+        plans: List[dict] = []
+        if not target_path_text or not target_root.is_dir():
+            return [], [f"Destination File Location '{target_name}' is unavailable ({target_path_text or 'no saved path'})."]
+
+        structure_errors = self._routing_structure_validate_levels(levels)
+        if structure_errors:
+            return [], structure_errors
+
+        candidates: List[dict] = []
+        for source_row in rows:
+            rec = self.model.record(source_row)
+            filename = Path(str((rec or {}).get("Package", "") or "")).name
+            if not filename or not filename.lower().endswith(".package"):
+                continue
+            try:
+                segments, identities, missing_error = self._routing_structure_levels_for_record(
+                    source_row, levels, missing_rule, outfit_rule
+                )
+            except Exception as exc:
+                # Last-resort guard: never let one unusual scanner-derived value
+                # erase the whole Preview.  Keep the row visible and explain it.
+                field_text = " → ".join(_display_field_name(t) for t in levels) or "routing structure"
+                missing_error = f"Could not evaluate {field_text} for this package ({exc})"
+                segments, identities = [], []
+            if missing_error:
+                errors.append(f"{filename}: {missing_error}")
+                try:
+                    excel_row = int((rec or {}).get("_ExcelRow", "0") or 0)
+                except (TypeError, ValueError):
+                    excel_row = 0
+                try:
+                    current_name = str(self.model.effective_value(source_row, "File Location") or "").strip()
+                except Exception:
+                    current_name = ""
+                plans.append({
+                    "source_row": source_row,
+                    "excel_row": excel_row,
+                    "filename": filename,
+                    "source": None,
+                    "hash": "",
+                    "target_name": target_name,
+                    "target_root": target_root.resolve(),
+                    "destination": None,
+                    "segments": [],
+                    "same_path": False,
+                    "status": "BLOCKED",
+                    "blocked_reason": missing_error,
+                    "current_name": current_name,
+                    "created_dirs": [],
+                })
+                continue
+            candidates.append({
+                "source_row": source_row,
+                "rec": rec or {},
+                "filename": filename,
+                "segments": list(segments),
+                "identities": list(identities),
+            })
+
+        # Windows paths are case-insensitive, and several distinct metadata values
+        # can sanitise to the same legal folder name. Disambiguate every member
+        # of a collision group with a deterministic identity suffix so no value is
+        # silently merged with another.
+        max_depth = max((len(item["segments"]) for item in candidates), default=0)
+        for level_index in range(max_depth):
+            groups: Dict[tuple, List[dict]] = {}
+            for item in candidates:
+                if level_index >= len(item["segments"]):
+                    continue
+                parent_key = tuple(part.casefold() for part in item["segments"][:level_index])
+                key = (parent_key, item["segments"][level_index].casefold())
+                groups.setdefault(key, []).append(item)
+            for members in groups.values():
+                identities = {
+                    str(member["identities"][level_index] if level_index < len(member["identities"]) else "")
+                    for member in members
+                }
+                if len(identities) <= 1:
+                    continue
+                for member in members:
+                    identity = str(member["identities"][level_index] if level_index < len(member["identities"]) else "")
+                    token = levels[level_index] if level_index < len(levels) else ""
+                    digest = hashlib.sha256(f"{token}\0{identity}".encode("utf-8", errors="replace")).hexdigest()[:6]
+                    base = member["segments"][level_index]
+                    suffix = f"_{digest}"
+                    keep = max(1, self.ROUTING_SEGMENT_MAX - len(suffix))
+                    member["segments"][level_index] = base[:keep].rstrip(" .-") + suffix
+
+        destination_keys = set()
+        for item in candidates:
+            source_row = item["source_row"]
+            rec = item["rec"]
+            filename = item["filename"]
+            segments = item["segments"]
+            destination = (target_root.joinpath(*segments, filename)).resolve()
+            destination_text = str(destination)
+
+            def append_plan(status: str, *, source_path=None, source_hash: str = "", same_path: bool = False, blocked_reason: str = ""):
+                plans.append({
+                    "source_row": source_row,
+                    "excel_row": int(rec.get("_ExcelRow", "0") or 0),
+                    "filename": filename,
+                    "source": source_path,
+                    "hash": source_hash,
+                    "target_name": target_name,
+                    "target_root": target_root.resolve(),
+                    "destination": destination,
+                    "segments": segments,
+                    "same_path": same_path,
+                    "status": status,
+                    "blocked_reason": blocked_reason,
+                    "current_name": self.model.effective_value(source_row, "File Location").strip(),
+                    "created_dirs": [],
+                })
+
+            if len(destination_text) > self.ROUTING_PATH_MAX:
+                reason = f"destination path is too long ({len(destination_text)} characters; safety limit {self.ROUTING_PATH_MAX})."
+                errors.append(f"{filename}: {reason}")
+                append_plan("BLOCKED", blocked_reason=reason)
+                continue
+            key = os.path.normcase(destination_text).casefold()
+            if key in destination_keys:
+                reason = f"two records would use the same destination '{destination}'."
+                errors.append(f"{filename}: {reason}")
+                append_plan("BLOCKED", blocked_reason=reason)
+                continue
+            destination_keys.add(key)
+
+            source_path = None
+            source_hash = ""
+            same_path = False
+            status = "READY"
+            if resolve_sources:
+                try:
+                    source_path, source_hash = self._resolve_managed_package_source(source_row)
+                    source_path = source_path.resolve()
+                    same_path = os.path.normcase(str(source_path)).casefold() == key
+                except Exception as exc:
+                    reason = str(exc)
+                    errors.append(f"{filename}: {reason}")
+                    append_plan("BLOCKED", blocked_reason=reason)
+                    continue
+
+                if not same_path:
+                    if self._routing_structure_is_readonly(source_path) or not os.access(source_path, os.W_OK):
+                        reason = f"source file is read-only or not writable: '{source_path}'."
+                        errors.append(f"{filename}: {reason}")
+                        append_plan("BLOCKED", source_path=source_path, source_hash=source_hash, blocked_reason=reason)
+                        continue
+                    writable, reason_detail = self._routing_structure_probe_writable_folder(source_path.parent)
+                    if not writable:
+                        reason = f"source folder does not allow the file to be removed. {reason_detail}"
+                        errors.append(f"{filename}: {reason}")
+                        append_plan("BLOCKED", source_path=source_path, source_hash=source_hash, blocked_reason=reason)
+                        continue
+                    writable, reason_detail = self._routing_structure_probe_writable_folder(destination.parent)
+                    if not writable:
+                        reason = f"destination is not writable. {reason_detail}"
+                        errors.append(f"{filename}: {reason}")
+                        append_plan("BLOCKED", source_path=source_path, source_hash=source_hash, blocked_reason=reason)
+                        continue
+
+                if destination.exists() and not same_path:
+                    try:
+                        dest_hash = self._managed_file_sha256(destination)
+                        kind = "an exact duplicate" if dest_hash == source_hash else "a different file"
+                    except Exception:
+                        kind = "an existing file"
+                    reason = f"destination '{destination}' already contains {kind}; nothing will be overwritten."
+                    errors.append(f"{filename}: {reason}")
+                    append_plan("BLOCKED", source_path=source_path, source_hash=source_hash, blocked_reason=reason)
+                    continue
+                status = "ALREADY AT DESTINATION" if same_path else "READY"
+            elif destination.exists():
+                status = "DESTINATION EXISTS — APPLY RECHECKS"
+
+            append_plan(status, source_path=source_path, source_hash=source_hash, same_path=same_path)
+
+        if resolve_sources and self.mdb is not None:
+            mdb_path = Path(self.mdb.path)
+            if self._routing_structure_is_readonly(mdb_path) or not os.access(mdb_path, os.W_OK):
+                errors.append(f"Master Database is read-only or not writable: '{mdb_path}'.")
+            else:
+                writable, reason = self._routing_structure_probe_writable_folder(mdb_path.parent)
+                if not writable:
+                    errors.append(f"Master Database folder is not writable. {reason}")
+
+        return plans, errors
+
+    def _apply_routing_structure(
+        self,
+        rows: List[int],
+        target_name: str,
+        levels: List[str],
+        missing_rule: str,
+        save_profile: bool,
+        profile_name: str,
+        outfit_rule: str = "priority",
+    ) -> bool:
+        if not self.mdb:
+            return False
+        if not levels:
+            QMessageBox.information(self, "Routing Structure", "Add at least one folder level first.")
+            return False
+        if not rows:
+            QMessageBox.information(self, "Routing Structure", "The selected scope contains no package rows.")
+            return False
+        if self.scan_process is not None and self.scan_process.state() != QProcess.NotRunning:
+            QMessageBox.warning(self, "Routing Structure", "Wait for the current Scan/Routing operation to finish first.")
+            return False
+        if not self._confirm_pending_changes():
+            return False
+
+        profile_name = str(profile_name or "").strip()
+        if save_profile and not self._valid_profile_name(profile_name):
+            QMessageBox.information(self, "Routing Structure", "Enter one valid Profile name (no semicolons or line breaks).")
+            return False
+
+        plans, errors = self._routing_structure_preview_plans(
+            rows, target_name, levels, missing_rule, outfit_rule, resolve_sources=True
+        )
+        if errors:
+            shown = "\n\n".join(f"• {line}" for line in errors[:14])
+            if len(errors) > 14:
+                shown += f"\n\n…and {len(errors) - 14} more problem(s)."
+            QMessageBox.warning(
+                self, "Routing Structure preflight blocked",
+                "Nothing was moved because the full routing batch did not pass safety preflight:\n\n" + shown,
+            )
+            return False
+        if not plans:
+            QMessageBox.information(self, "Routing Structure", "No supported .package rows were available to route.")
+            return False
+
+        moving = [p for p in plans if not p["same_path"]]
+        aligned = [p for p in plans if p["same_path"]]
+        metadata_needs_update = any(p["current_name"] != target_name for p in plans)
+        if not moving and not save_profile and not metadata_needs_update:
+            QMessageBox.information(
+                self, "Routing Structure",
+                "No files moved — all selected packages are already at their destination.",
+            )
+            return True
+        structure_text = " → ".join(
+            (token.split("::", 1)[1] if token.startswith("CUSTOM::") else _display_field_name(token))
+            for token in levels
+        )
+        preview = [
+            "Apply this Routing Structure?", "",
+            f"Structure: {structure_text}",
+            f"Destination location: {target_name}",
+            f"Packages mapped: {len(plans):,}",
+            f"Files to move: {len(moving):,}",
+            f"Already at destination: {len(aligned):,}",
+        ]
+        if save_profile:
+            preview.append(f"Save result as Profile: {profile_name}")
+        preview.append("")
+        for item in plans[:14]:
+            if item["same_path"]:
+                preview.append(f"• {item['filename']} — already at destination")
+            else:
+                preview.append(f"• {item['source']}\n  → {item['destination']}")
+        if len(plans) > 14:
+            preview.append(f"…and {len(plans) - 14} more package(s).")
+        preview += [
+            "",
+            "CAS Curator copies first, verifies SHA-256, then deletes the original. Existing destination files are never overwritten.",
+            "If any move or MDB save fails, completed moves are rolled back where possible.",
+        ]
+        answer = QMessageBox.question(
+            self, "Preview Routing Structure moves", "\n".join(preview),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return False
+
+        # Prepare final MDB metadata before the first move, but do not mutate app state yet.
+        changes: Dict[int, Dict[str, str]] = {}
+        new_profile_registry = list(self.profile_registry_current)
+        new_profile_layouts = list(self.profile_layouts_current)
+        if save_profile and profile_name.casefold() not in {p.casefold() for p in new_profile_registry}:
+            new_profile_registry.append(profile_name)
+            new_profile_registry.sort(key=str.casefold)
+
+        for item in plans:
+            rec = self.model.record(item["source_row"])
+            row_changes = changes.setdefault(item["excel_row"], {})
+            if item["current_name"] != target_name:
+                row_changes["File Location"] = target_name
+            if save_profile:
+                memberships = _split_cc_magic_profiles(str((rec or {}).get("CC Magic Profiles", "") or ""))
+                if profile_name.casefold() not in {p.casefold() for p in memberships}:
+                    memberships.append(profile_name)
+                    row_changes["CC Magic Profiles"] = _normalise_cc_magic_profiles("; ".join(memberships))
+                package_hash, package_name = self._profile_layout_identity(rec or {})
+                new_profile_layouts = [
+                    e for e in new_profile_layouts
+                    if not self._profile_layout_entry_matches(e, profile_name, package_hash, package_name)
+                ]
+                new_profile_layouts.append((profile_name, package_hash, package_name, target_name))
+        changes = {row: fields for row, fields in changes.items() if fields}
+        if save_profile:
+            new_profile_layouts.sort(key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold()))
+
+        moved: List[dict] = []
+        result = None
+        wait_cursor_active = False
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        wait_cursor_active = True
+        try:
+            for item in moving:
+                source = item["source"]
+                destination = item["destination"]
+                try:
+                    missing_dirs = []
+                    probe = destination.parent
+                    while probe != item["target_root"].parent and not probe.exists():
+                        missing_dirs.append(probe)
+                        if probe == item["target_root"]:
+                            break
+                        probe = probe.parent
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    item["created_dirs"] = list(reversed(missing_dirs))
+                    shutil.copy2(source, destination)
+                    if self._managed_file_sha256(destination) != item["hash"]:
+                        destination.unlink(missing_ok=True)
+                        self._remove_empty_created_dirs(item["created_dirs"])
+                        raise ValueError("copied file failed SHA-256 verification")
+                    try:
+                        source.unlink()
+                    except Exception:
+                        destination.unlink(missing_ok=True)
+                        self._remove_empty_created_dirs(item["created_dirs"])
+                        raise
+                    moved.append(item)
+                except Exception as exc:
+                    rollback_problems = self._rollback_managed_moves(moved)
+                    detail = f"Routing Structure move failed at '{item['filename']}': {exc}\n\nEarlier moves were rolled back."
+                    if rollback_problems:
+                        detail += "\n\nRollback needs attention:\n" + "\n".join(f"• {p}" for p in rollback_problems)
+                    raise RuntimeError(detail) from exc
+
+            if changes or save_profile:
+                try:
+                    result = MDBWorkbook().save_manual_changes(
+                        self.mdb,
+                        changes,
+                        profile_options=new_profile_registry if save_profile else None,
+                        profile_layouts=new_profile_layouts if save_profile else None,
+                    )
+                except Exception as exc:
+                    rollback_problems = self._rollback_managed_moves(moved)
+                    detail = (
+                        f"Files were routed, but the MDB update failed: {exc}\n\n"
+                        "CAS Curator attempted to restore the original package locations."
+                    )
+                    if rollback_problems:
+                        detail += "\n\nRollback needs attention:\n" + "\n".join(f"• {p}" for p in rollback_problems)
+                    raise RuntimeError(detail) from exc
+        except Exception as exc:
+            # Do not leave the Windows busy cursor active while a modal error
+            # dialog waits for the user; that makes the app look frozen.
+            if wait_cursor_active:
+                QApplication.restoreOverrideCursor()
+                wait_cursor_active = False
+            QApplication.processEvents()
+            QMessageBox.critical(self, "Routing Structure failed", str(exc))
+            return False
+        finally:
+            if wait_cursor_active:
+                QApplication.restoreOverrideCursor()
+
+        # Update in-memory state only after the workbook save succeeded.
+        for item in plans:
+            rec = self.model.record(item["source_row"])
+            if not rec:
+                continue
+            if item["current_name"] != target_name:
+                rec["File Location"] = target_name
+            if save_profile:
+                memberships = _split_cc_magic_profiles(str(rec.get("CC Magic Profiles", "") or ""))
+                if profile_name.casefold() not in {p.casefold() for p in memberships}:
+                    memberships.append(profile_name)
+                    rec["CC Magic Profiles"] = _normalise_cc_magic_profiles("; ".join(memberships))
+            self.model.notify_row_changed(item["source_row"])
+
+        if save_profile:
+            self.profile_registry_current = list(new_profile_registry)
+            self.profile_registry_saved = list(new_profile_registry)
+            self.profile_registry_dirty = False
+            self.profile_layouts_current = list(new_profile_layouts)
+            self.profile_layouts_saved = list(new_profile_layouts)
+            self.profile_layouts_dirty = False
+
+        # Save a readable recovery/audit manifest next to the MDB.
+        try:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            manifest = self.mdb.path.with_name(f"CAS_Curator_Structure_Routing_{stamp}.json")
+            payload = {
+                "schema": "CASCuratorRoutingStructure/v1",
+                "created": datetime.now().isoformat(timespec="seconds"),
+                "mdb": str(self.mdb.path),
+                "destination_location": target_name,
+                "destination_root": self._file_location_path_for_name(target_name),
+                "structure": levels,
+                "missing_rule": missing_rule,
+                "outfit_category_multi_value_rule": outfit_rule,
+                "saved_profile": profile_name if save_profile else "",
+                "records": [
+                    {
+                        "package": item["filename"],
+                        "source": str(item["source"]),
+                        "destination": str(item["destination"]),
+                        "sha256": item["hash"],
+                        "status": "already_structured" if item["same_path"] else "moved",
+                    }
+                    for item in plans
+                ],
+            }
+            manifest.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception:
+            manifest = None
+
+        self._refresh_cc_magic_profile_choices()
+        self._populate_filters()
+        self._apply_filters()
+        if self.current_source_row is not None:
+            rec = self.model.record(self.current_source_row)
+            if rec:
+                self.show_record(rec)
+
+        summary = [
+            f"Structure: {structure_text}",
+            f"Moved: {len(moved):,}",
+            f"Already at destination: {len(aligned):,}",
+            f"Destination: {target_name}",
+        ]
+        if save_profile:
+            summary.append(f"Saved as Profile: {profile_name}")
+        if result is not None:
+            summary.append(f"MDB backup: {result.backup_path.name}")
+        if manifest is not None:
+            summary.append(f"Routing manifest: {manifest.name}")
+        QMessageBox.information(self, "Routing Structure applied", "\n".join(summary))
+        self.statusBar().showMessage(
+            f"Routing Structure: {len(moved):,} moved, {len(aligned):,} already structured",
+            10000,
+        )
+        return True
+
+    def _open_routing_structure_builder(self):
+        if not self.mdb:
+            QMessageBox.information(self, "Routing Structure Builder", "Open a Master Database first.")
+            return
+        if not (IS_DEV_BUILD or self.experimental_features):
+            QMessageBox.information(self, "Routing Structure Builder", "Enable Experimental features first.")
+            return
+        locations = [(n, p) for n, p in self.file_location_registry_current if str(n).strip() and str(p).strip()]
+        if not locations:
+            QMessageBox.information(
+                self, "Routing Structure Builder",
+                "Add at least one managed File Location first with Tools > Profiles & Locations > Manage File Locations…",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Experimental Routing Structure Builder")
+        screen = dialog.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        target_w = 1050
+        target_h = 680
+        if available is not None:
+            target_w = min(target_w, max(760, available.width() - 80))
+            target_h = min(target_h, max(520, available.height() - 100))
+        dialog.resize(target_w, target_h)
+
+        outer_layout = QVBoxLayout(dialog)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+
+        dialog_scroll = QScrollArea(dialog)
+        dialog_scroll.setWidgetResizable(True)
+        dialog_scroll.setFrameShape(QFrame.NoFrame)
+        dialog_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        dialog_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        content = QWidget(dialog_scroll)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+        dialog_scroll.setWidget(content)
+        outer_layout.addWidget(dialog_scroll, 1)
+
+        intro = QLabel(
+            "Build the folder hierarchy visually. The first item becomes the main folder level; each following item becomes a subfolder. "
+            "Example: Creator → CC Type → Subtype. Preview first; Route with Structure performs verified physical moves."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        top_form = QFormLayout()
+        destination_box = QComboBox()
+        for name, folder in sorted(locations, key=lambda item: item[0].casefold()):
+            destination_box.addItem(name, name)
+            destination_box.setItemData(destination_box.count() - 1, folder, Qt.ToolTipRole)
+        scope_box = QComboBox()
+        # Safest and fastest working default: act only on the packages the user
+        # deliberately selected. The old "Currently shown" scope was too easy
+        # to confuse with an explicit selection and is intentionally removed.
+        scope_box.addItem("Selected packages", "selected")
+        scope_box.addItem("All packages in MDB", "all")
+        missing_box = QComboBox()
+        missing_box.addItem("Use Unassigned folder", "unassigned")
+        missing_box.addItem("Skip that folder level", "skip")
+        missing_box.addItem("Block package if a level is blank", "block")
+        outfit_box = QComboBox()
+        outfit_box.addItem("Priority match", "priority")
+        outfit_box.addItem("Combine all categories", "combined")
+        outfit_box.addItem("Block package for review", "block_multi")
+        outfit_box.setToolTip(
+            "Outfit Category is naturally multi-value. Priority match uses: "
+            "Everyday → Formal → Sleepwear → Swimwear → Athletic → Career → Outerwear."
+        )
+        top_form.addRow("Destination location:", destination_box)
+        top_form.addRow("Scope:", scope_box)
+        top_form.addRow("If a value is blank:", missing_box)
+        top_form.addRow("If Outfit Category has multiple values:", outfit_box)
+        layout.addLayout(top_form)
+
+        presets_row = QHBoxLayout()
+        presets_row.addWidget(QLabel("Saved structure:"))
+        preset_box = QComboBox()
+        preset_box.addItem("— none —", "")
+        presets_row.addWidget(preset_box, 1)
+        save_preset_btn = QPushButton("Save Structure")
+        save_preset_btn.setObjectName("RoutingSaveStructureButton")
+        save_preset_btn.setToolTip("Save this folder structure for reuse")
+        # Give this frequently-used action a clear physical press response even
+        # under flat themes. Successful saves also flash a brief confirmation.
+        save_preset_btn.setStyleSheet(
+            "QPushButton#RoutingSaveStructureButton:pressed { "
+            "border: 2px inset #777777; padding: 6px 10px 4px 12px; }"
+        )
+        delete_preset_btn = QPushButton("Delete Saved")
+        presets_row.addWidget(save_preset_btn)
+        presets_row.addWidget(delete_preset_btn)
+        layout.addLayout(presets_row)
+
+        builder = QSplitter(Qt.Horizontal)
+        left = QFrame()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 6, 0)
+        available_header = QHBoxLayout()
+        available_header.setContentsMargins(0, 0, 0, 0)
+        available_header.addWidget(QLabel("Available folder levels"))
+        available_header.addStretch(1)
+        colour_key_btn = QPushButton("Key")
+        colour_key_btn.setFixedWidth(54)
+        colour_key_btn.setToolTip("Show what the folder-level colours mean")
+        available_header.addWidget(colour_key_btn)
+        left_layout.addLayout(available_header)
+        available = QListWidget()
+        available.setSelectionMode(QAbstractItemView.SingleSelection)
+        available.setDragEnabled(True)
+        available.setAcceptDrops(True)
+        available.setDragDropMode(QAbstractItemView.DragDrop)
+        available.setDefaultDropAction(Qt.MoveAction)
+        left_layout.addWidget(available, 1)
+        add_custom_btn = QPushButton("+ Custom fixed folder…")
+        left_layout.addWidget(add_custom_btn)
+
+        right = QFrame()
+        right_layout = QVBoxLayout(right)
+        right_layout.setContentsMargins(6, 0, 0, 0)
+        right_layout.addWidget(QLabel("Folder structure — drag to reorder  1 → 2 → 3 → 4…"))
+        structure = QListWidget()
+        structure.setSelectionMode(QAbstractItemView.SingleSelection)
+        structure.setDragEnabled(True)
+        structure.setAcceptDrops(True)
+        structure.setDragDropMode(QAbstractItemView.DragDrop)
+        structure.setDefaultDropAction(Qt.MoveAction)
+        right_layout.addWidget(structure, 1)
+        controls = QHBoxLayout()
+        add_btn = QPushButton("Add →")
+        remove_btn = QPushButton("← Remove")
+        up_btn = QPushButton("Move Up")
+        down_btn = QPushButton("Move Down")
+        controls.addWidget(add_btn)
+        controls.addWidget(remove_btn)
+        controls.addStretch(1)
+        controls.addWidget(up_btn)
+        controls.addWidget(down_btn)
+        right_layout.addLayout(controls)
+
+        # A normal Qt :pressed state can disappear too quickly to perceive on
+        # mouse release, especially before a confirmation/input dialog opens.
+        # Hold the real QPushButton down-state briefly, then run the action.
+        # This is visual feedback only; routing behaviour is unchanged.
+        def run_with_button_feedback(button: QPushButton, action, delay_ms: int = 140):
+            if not button.isEnabled():
+                return
+            button.setDown(True)
+            button.repaint()
+
+            def finish_press():
+                button.setDown(False)
+                button.repaint()
+                action()
+
+            QTimer.singleShot(delay_ms, finish_press)
+        builder.addWidget(left)
+        builder.addWidget(right)
+        builder.setSizes([420, 520])
+        layout.addWidget(builder, 1)
+
+        preview_label = QLabel("Preview")
+        layout.addWidget(preview_label)
+        preview_table = QTableWidget(0, 4)
+        preview_table.setHorizontalHeaderLabels(["Package", "Current Location", "Destination", "Status"])
+        preview_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        preview_table.setSelectionBehavior(QTableWidget.SelectRows)
+        preview_table.verticalHeader().setVisible(False)
+        ph = preview_table.horizontalHeader()
+        # Keep Destination readable without requiring a hover.  Fixed starting
+        # widths prevent long package/current-location text from consuming the
+        # whole table; every column remains user-resizable and per-pixel
+        # horizontal scrolling is available when the dialog is narrower.
+        ph.setSectionResizeMode(QHeaderView.Interactive)
+        ph.setMinimumSectionSize(90)
+        ph.resizeSection(0, 235)
+        ph.resizeSection(1, 185)
+        ph.resizeSection(2, 500)
+        ph.resizeSection(3, 145)
+        preview_table.setWordWrap(False)
+        preview_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        preview_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        preview_table.setMinimumHeight(190)
+        layout.addWidget(preview_table, 1)
+        preview_problem_label = QLabel("")
+        preview_problem_label.setWordWrap(True)
+        preview_problem_label.setObjectName("RoutingPreviewProblems")
+        preview_problem_label.setVisible(False)
+        layout.addWidget(preview_problem_label)
+
+        profile_group = QGroupBox("Optional: save the routed result as a Profile")
+        profile_layout = QHBoxLayout(profile_group)
+        save_profile_check = QCheckBox("Save result as Profile")
+        profile_name_edit = QLineEdit()
+        profile_name_edit.setPlaceholderText("Profile name")
+        profile_name_edit.setEnabled(False)
+        profile_layout.addWidget(save_profile_check)
+        profile_layout.addWidget(profile_name_edit, 1)
+        profile_help = QLabel("The Profile records membership + destination root; the routed Creator/Type/etc subfolders stay physically underneath that root.")
+        profile_help.setWordWrap(True)
+        profile_layout.addWidget(profile_help, 2)
+        layout.addWidget(profile_group)
+        save_profile_check.toggled.connect(profile_name_edit.setEnabled)
+
+        bottom = QHBoxLayout()
+        preview_btn = QPushButton("Refresh Preview")
+        route_btn = QPushButton("Route with Structure…")
+        close_btn = QPushButton("Close")
+        bottom.addWidget(preview_btn)
+        bottom.addWidget(route_btn)
+        bottom.addStretch(1)
+        bottom.addWidget(close_btn)
+        layout.addLayout(bottom)
+
+        field_labels = {field: _display_field_name(field) for field in self._routing_structure_fields()}
+
+        role_colours = {
+            # Deliberately stronger than the first pastel pass so the routing
+            # roles read as a real visual system rather than faint row shading.
+            "main": QColor("#FFD966"),      # yellow: main-folder-only
+            "sub": QColor("#B6E3A8"),       # green: subfolder-only
+            "either": QColor("#B7D3FF"),    # blue: main or subfolder
+            "custom": QColor("#D9B8FF"),    # purple: validated custom
+            "unavailable": QColor("#A9B9C8"),
+        }
+
+        def show_colour_key():
+            key_dialog = QDialog(dialog)
+            key_dialog.setWindowTitle("Folder level colour key")
+            key_dialog.setModal(False)
+            key_dialog.setAttribute(Qt.WA_DeleteOnClose, True)
+            key_layout = QVBoxLayout(key_dialog)
+            key_layout.setContentsMargins(14, 14, 14, 14)
+            key_layout.setSpacing(8)
+            title = QLabel("Folder level colour key")
+            title_font = title.font()
+            title_font.setBold(True)
+            title.setFont(title_font)
+            key_layout.addWidget(title)
+            legend_rows = [
+                ("main", "Main folder only"),
+                ("sub", "Subfolder only"),
+                ("either", "Main folder or subfolder"),
+                ("custom", "Validated custom fixed folder"),
+                ("unavailable", "Unavailable / impossible here"),
+            ]
+            for role, text in legend_rows:
+                row = QHBoxLayout()
+                swatch = QLabel("")
+                swatch.setFixedSize(32, 20)
+                c = role_colours[role].name()
+                swatch.setStyleSheet(f"background-color: {c}; border: 1px solid #777777; border-radius: 3px;")
+                row.addWidget(swatch)
+                row.addWidget(QLabel(text), 1)
+                key_layout.addLayout(row)
+            note = QLabel("Grey can also mean a normally valid level is unavailable in the current position.")
+            note.setWordWrap(True)
+            key_layout.addWidget(note)
+            close_key_btn = QPushButton("Close")
+            close_key_btn.clicked.connect(key_dialog.close)
+            key_layout.addWidget(close_key_btn, 0, Qt.AlignHCenter)
+            key_dialog.setMinimumWidth(360)
+            key_dialog.show()
+
+        colour_key_btn.clicked.connect(show_colour_key)
+
+        def make_item(token: str, position: Optional[int] = None, preceding: Optional[List[str]] = None) -> QListWidgetItem:
+            if token.startswith("CUSTOM::"):
+                label = token.split("::", 1)[1]
+            else:
+                label = field_labels.get(token, _display_field_name(token))
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, token)
+            role = self._routing_structure_field_role(token)
+            item.setBackground(role_colours.get(role, role_colours["unavailable"]))
+            if role != "unavailable":
+                item.setForeground(QColor("#222222"))
+            else:
+                item.setForeground(QColor("#000000"))
+            item.setToolTip({
+                "main": "Main-folder-only",
+                "sub": "Subfolder-only",
+                "either": "Can be used as a main folder or subfolder",
+                "custom": "Validated custom fixed folder",
+                "unavailable": "Not available as a physical routing folder",
+            }.get(role, ""))
+            item.setFlags(item.flags() | Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled)
+            if position is not None:
+                ok, reason = self._routing_structure_field_allowed(token, position, list(preceding or []))
+                if not ok:
+                    item.setBackground(role_colours["unavailable"])
+                    item.setForeground(QColor("#000000"))
+                    item.setToolTip(reason)
+                    item.setFlags(item.flags() & ~Qt.ItemIsEnabled & ~Qt.ItemIsSelectable & ~Qt.ItemIsDragEnabled)
+            return item
+
+        def tokens_in_structure() -> List[str]:
+            return [str(structure.item(i).data(Qt.UserRole) or "") for i in range(structure.count())]
+
+        def renumber(*_args):
+            preceding: List[str] = []
+            for i in range(structure.count()):
+                item = structure.item(i)
+                token = str(item.data(Qt.UserRole) or "")
+                label = token.split("::", 1)[1] if token.startswith("CUSTOM::") else field_labels.get(token, _display_field_name(token))
+                item.setText(f"{i + 1}.  {label}")
+                role = self._routing_structure_field_role(token)
+                ok, reason = self._routing_structure_field_allowed(token, i, preceding)
+                if ok:
+                    item.setBackground(role_colours.get(role, role_colours["unavailable"]))
+                    item.setForeground(QColor("#222222"))
+                    item.setToolTip({
+                        "main": "Main-folder-only",
+                        "sub": "Subfolder-only",
+                        "either": "Can be used as a main folder or subfolder",
+                        "custom": "Validated custom fixed folder",
+                    }.get(role, ""))
+                else:
+                    item.setBackground(role_colours["unavailable"])
+                    item.setForeground(QColor("#000000"))
+                    item.setToolTip(reason)
+                preceding.append(token)
+            QTimer.singleShot(0, rebuild_available)
+            QTimer.singleShot(0, refresh_preview)
+
+        def rebuild_available():
+            current = tokens_in_structure()
+            used = {t for t in current if t and not t.startswith("CUSTOM::")}
+            available.clear()
+            position = len(current)
+            for field in self._routing_structure_fields():
+                if field not in used:
+                    available.addItem(make_item(field, position, current))
+
+        def add_selected():
+            item = available.currentItem()
+            if item is None:
+                return
+            row = available.row(item)
+            item = available.takeItem(row)
+            structure.addItem(item)
+            renumber()
+            rebuild_available()
+
+        def remove_selected():
+            item = structure.currentItem()
+            if item is None:
+                return
+            row = structure.row(item)
+            structure.takeItem(row)
+            renumber()
+            rebuild_available()
+
+        def move_selected(delta: int):
+            row = structure.currentRow()
+            dest = row + delta
+            if row < 0 or dest < 0 or dest >= structure.count():
+                return
+            item = structure.takeItem(row)
+            structure.insertItem(dest, item)
+            structure.setCurrentRow(dest)
+            renumber()
+
+        def add_custom():
+            value, ok = QInputDialog.getText(dialog, "Custom fixed folder", "Folder name to insert as a fixed level:")
+            value = self._routing_structure_clean_segment(value)
+            if ok and value:
+                structure.addItem(make_item("CUSTOM::" + value, structure.count(), tokens_in_structure()))
+                renumber()
+
+        def current_rows() -> List[int]:
+            return self._routing_structure_rows(str(scope_box.currentData() or "all"))
+
+        def refresh_preview(*_args):
+            target_name = str(destination_box.currentData() or "")
+            levels = tokens_in_structure()
+            rows = current_rows()
+            structure_errors = self._routing_structure_validate_levels(levels) if levels else []
+            resolve_preview = bool(levels and rows and len(rows) <= 50 and not structure_errors)
+            try:
+                plans, errors = self._routing_structure_preview_plans(
+                    rows, target_name, levels, str(missing_box.currentData() or "unassigned"),
+                    str(outfit_box.currentData() or "priority"), resolve_sources=resolve_preview
+                ) if levels and not structure_errors else ([], list(structure_errors))
+            except Exception as exc:
+                # Qt signal exceptions can otherwise leave a blank Preview and a
+                # disabled button with no explanation.  Convert any unexpected
+                # planner failure into visible BLOCKED rows instead.
+                reason = f"Preview could not evaluate this structure: {exc}"
+                errors = [reason]
+                plans = []
+                for source_row in rows[:150]:
+                    rec = self.model.record(source_row) or {}
+                    filename = Path(str(rec.get("Package", "") or "")).name or "(unknown package)"
+                    plans.append({
+                        "source_row": source_row,
+                        "filename": filename,
+                        "target_name": target_name,
+                        "destination": None,
+                        "segments": [],
+                        "status": "BLOCKED",
+                        "blocked_reason": reason,
+                    })
+
+            # A non-empty selection + structure must never fail silently.  This
+            # fallback also covers legacy/non-package rows that the planner could
+            # not map, while keeping Route safely disabled.
+            if levels and rows and not plans and not errors:
+                field_text = " → ".join(
+                    token.split("::", 1)[1] if token.startswith("CUSTOM::") else _display_field_name(token)
+                    for token in levels
+                )
+                reason = f"No selected package could produce a usable destination for {field_text}."
+                errors = [reason]
+                for source_row in rows[:150]:
+                    rec = self.model.record(source_row) or {}
+                    filename = Path(str(rec.get("Package", "") or "")).name or "(unknown package)"
+                    plans.append({
+                        "source_row": source_row,
+                        "filename": filename,
+                        "target_name": target_name,
+                        "destination": None,
+                        "segments": [],
+                        "status": "BLOCKED",
+                        "blocked_reason": reason,
+                    })
+
+            preview_table.setRowCount(0)
+            for plan in plans[:150]:
+                r = preview_table.rowCount()
+                preview_table.insertRow(r)
+                preview_table.setItem(r, 0, QTableWidgetItem(str(plan.get("filename") or "(unknown package)")))
+                try:
+                    current_location = str(self.model.effective_value(plan["source_row"], "File Location") or "")
+                except Exception:
+                    current_location = ""
+                preview_table.setItem(r, 1, QTableWidgetItem(current_location or "—"))
+                destination_obj = plan.get("destination")
+                if destination_obj is None:
+                    blocked_reason = str(plan.get("blocked_reason") or "").strip()
+                    relative_destination = (
+                        "BLOCKED — " + blocked_reason
+                        if blocked_reason
+                        else "BLOCKED — destination could not be built"
+                    )
+                    full_destination = ""
+                else:
+                    relative_destination = "\\".join(
+                        [str(plan.get("target_name") or target_name)]
+                        + [str(part) for part in plan.get("segments", []) if str(part)]
+                        + [str(plan.get("filename") or "")]
+                    )
+                    full_destination = str(destination_obj)
+                dest_item = QTableWidgetItem(relative_destination)
+                dest_item.setToolTip(full_destination)
+                dest_item.setData(Qt.UserRole, full_destination)
+                preview_table.setItem(r, 2, dest_item)
+                status_item = QTableWidgetItem(str(plan.get("status") or "BLOCKED"))
+                blocked_reason = str(plan.get("blocked_reason") or "")
+                if blocked_reason:
+                    status_item.setToolTip(blocked_reason)
+                preview_table.setItem(r, 3, status_item)
+
+            if errors:
+                preview_label.setText(f"Preview — {len(plans):,} mapped, {len(errors):,} blocked")
+                preview_label.setToolTip("\n".join(errors[:12]))
+                shown_errors = errors[:4]
+                text = "Blocked: " + " | ".join(shown_errors)
+                if len(errors) > 4:
+                    text += f" | …and {len(errors) - 4} more"
+                preview_problem_label.setText(text)
+                preview_problem_label.setVisible(True)
+            else:
+                suffix = f" (showing first 150)" if len(plans) > 150 else ""
+                preview_label.setText(f"Preview — {len(plans):,} package(s){suffix}")
+                preview_label.setToolTip("")
+                preview_problem_label.clear()
+                preview_problem_label.setVisible(False)
+            route_btn.setEnabled(bool(levels and rows and plans and not errors))
+
+        def refresh_presets(select_name: str = ""):
+            presets = self._routing_structure_presets()
+            preset_box.blockSignals(True)
+            preset_box.clear()
+            preset_box.addItem("— none —", "")
+            selected = 0
+            for name in sorted(presets, key=str.casefold):
+                preset_box.addItem(name, name)
+                if name == select_name:
+                    selected = preset_box.count() - 1
+            preset_box.setCurrentIndex(selected)
+            preset_box.blockSignals(False)
+
+        def load_preset(*_args):
+            name = str(preset_box.currentData() or "")
+            if not name:
+                return
+            payload = self._routing_structure_presets().get(name, {})
+            levels = [str(v) for v in payload.get("levels", []) if str(v).strip()]
+            structure.clear()
+            for token in levels:
+                structure.addItem(make_item(token))
+            missing = str(payload.get("missing", "unassigned") or "unassigned")
+            idx = missing_box.findData(missing)
+            missing_box.setCurrentIndex(idx if idx >= 0 else 0)
+            outfit_rule = str(payload.get("outfit_multi", "priority") or "priority")
+            outfit_idx = outfit_box.findData(outfit_rule)
+            outfit_box.setCurrentIndex(outfit_idx if outfit_idx >= 0 else 0)
+            renumber()
+            rebuild_available()
+
+        def save_preset():
+            levels = tokens_in_structure()
+            if not levels:
+                QMessageBox.information(dialog, "Save Structure", "Add at least one folder level first.")
+                return
+            structure_errors = self._routing_structure_validate_levels(levels)
+            if structure_errors:
+                QMessageBox.information(dialog, "Save Structure", "This structure is not valid yet:\n\n" + "\n".join(f"• {e}" for e in structure_errors))
+                return
+            name = " → ".join(
+                token.split("::", 1)[1] if token.startswith("CUSTOM::") else field_labels.get(token, _display_field_name(token))
+                for token in levels
+            )
+            presets = self._routing_structure_presets()
+            presets[name] = {
+                "levels": levels,
+                "missing": str(missing_box.currentData() or "unassigned"),
+                "outfit_multi": str(outfit_box.currentData() or "priority"),
+            }
+            self._write_routing_structure_presets(presets)
+            refresh_presets(name)
+            save_preset_btn.setText("Saved ✓")
+            QTimer.singleShot(850, lambda: save_preset_btn.setText("Save Structure"))
+
+        def delete_preset():
+            name = str(preset_box.currentData() or "")
+            if not name:
+                return
+            answer = QMessageBox.question(dialog, "Delete saved structure?", f"Delete '{name}'?", QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if answer != QMessageBox.Yes:
+                return
+            presets = self._routing_structure_presets()
+            presets.pop(name, None)
+            self._write_routing_structure_presets(presets)
+            refresh_presets()
+
+        def route_now():
+            levels = tokens_in_structure()
+            rows = current_rows()
+            if self._apply_routing_structure(
+                rows,
+                str(destination_box.currentData() or ""),
+                levels,
+                str(missing_box.currentData() or "unassigned"),
+                bool(save_profile_check.isChecked()),
+                profile_name_edit.text(),
+                str(outfit_box.currentData() or "priority"),
+            ):
+                refresh_preview()
+
+        add_btn.clicked.connect(lambda _checked=False: run_with_button_feedback(add_btn, add_selected))
+        remove_btn.clicked.connect(lambda _checked=False: run_with_button_feedback(remove_btn, remove_selected))
+        up_btn.clicked.connect(lambda _checked=False: run_with_button_feedback(up_btn, lambda: move_selected(-1)))
+        down_btn.clicked.connect(lambda _checked=False: run_with_button_feedback(down_btn, lambda: move_selected(1)))
+        add_custom_btn.clicked.connect(lambda _checked=False: run_with_button_feedback(add_custom_btn, add_custom))
+        available.itemDoubleClicked.connect(lambda *_: add_selected())
+        structure.itemDoubleClicked.connect(lambda *_: remove_selected())
+        preview_btn.clicked.connect(refresh_preview)
+        route_btn.clicked.connect(route_now)
+        close_btn.clicked.connect(dialog.accept)
+        destination_box.currentIndexChanged.connect(refresh_preview)
+        scope_box.currentIndexChanged.connect(refresh_preview)
+        missing_box.currentIndexChanged.connect(refresh_preview)
+        outfit_box.currentIndexChanged.connect(refresh_preview)
+        preset_box.currentIndexChanged.connect(load_preset)
+        save_preset_btn.clicked.connect(save_preset)
+        delete_preset_btn.clicked.connect(lambda _checked=False: run_with_button_feedback(delete_preset_btn, delete_preset))
+        structure.model().rowsMoved.connect(renumber)
+        structure.model().rowsInserted.connect(renumber)
+        structure.model().rowsRemoved.connect(lambda *_: QTimer.singleShot(0, rebuild_available))
+
+        rebuild_available()
+        refresh_presets()
+        route_btn.setEnabled(False)
+        refresh_preview()
+        dialog.exec()
+
+    def _manage_profile_layouts(self):
+        if not self.mdb:
+            QMessageBox.information(self, "Experimental Profile Layouts", "Open a Master Database first.")
+            return
+        if not (IS_DEV_BUILD or self.experimental_features):
+            QMessageBox.information(
+                self,
+                "Experimental Profile Layouts",
+                "Enable Experimental features in Options first.",
+            )
+            return
+        profiles = self._all_profile_names()
+        if not profiles:
+            QMessageBox.information(
+                self,
+                "Experimental Profile Layouts",
+                "Create at least one normal Profile first.",
+            )
+            return
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Experimental Profile Layouts")
+        dialog.resize(900, 620)
+        layout = QVBoxLayout(dialog)
+
+        intro = QLabel(
+            "<b>Experimental — profile-specific managed folder layouts</b><br>"
+            "Route packages into managed File Locations first and confirm Current File Location is correct. "
+            "Current Location is the physical truth now. Planned Location is where that Profile wants the package. "
+            "Read each row as <b>Current Location → Planned Location</b>. Choosing, filtering or editing a Profile never moves package files. "
+            "<b>Apply Profile Locations…</b> is the only batch-move action."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        profile_row = QHBoxLayout()
+        profile_row.addWidget(QLabel("Profile:"))
+        profile_box = QComboBox()
+        profile_box.addItems(profiles)
+        context_profile = self._profile_layout_context_profile()
+        if context_profile and profile_box.findText(context_profile) >= 0:
+            profile_box.setCurrentText(context_profile)
+        profile_row.addWidget(profile_box, 1)
+        layout.addLayout(profile_row)
+
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["Package", "Current Location", "→", "Planned Location"])
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.Fixed)
+        header.resizeSection(2, 34)
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        layout.addWidget(table, 1)
+
+        status = QLabel("")
+        status.setWordWrap(True)
+        layout.addWidget(status)
+
+        action_row = QHBoxLayout()
+        set_btn = QPushButton("Set Selected Planned Location…")
+        clear_btn = QPushButton("Clear Selected Plan")
+        apply_btn = QPushButton("Apply Profile Locations…")
+        action_row.addWidget(set_btn)
+        action_row.addWidget(clear_btn)
+        action_row.addStretch(1)
+        action_row.addWidget(apply_btn)
+        layout.addLayout(action_row)
+
+        close_buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        close_buttons.rejected.connect(dialog.reject)
+        layout.addWidget(close_buttons)
+
+        def selected_source_rows() -> List[int]:
+            rows = []
+            seen = set()
+            for index in table.selectionModel().selectedRows():
+                item = table.item(index.row(), 0)
+                if item is None:
+                    continue
+                source_row = item.data(Qt.UserRole)
+                try:
+                    source_row = int(source_row)
+                except (TypeError, ValueError):
+                    continue
+                if source_row not in seen:
+                    seen.add(source_row)
+                    rows.append(source_row)
+            return rows
+
+        def refresh():
+            profile = profile_box.currentText().strip()
+            members = self._profile_layout_members(profile)
+            table.setRowCount(0)
+            planned = 0
+            for source_row in members:
+                rec = self.model.record(source_row)
+                if not rec:
+                    continue
+                row = table.rowCount()
+                table.insertRow(row)
+                package_item = QTableWidgetItem(Path(str(rec.get("Package", "") or "")).name)
+                package_item.setData(Qt.UserRole, source_row)
+                current_location = self.model.effective_value(source_row, "File Location").strip()
+                target_location = self._profile_layout_target(profile, rec)
+                if target_location:
+                    planned += 1
+                table.setItem(row, 0, package_item)
+                table.setItem(row, 1, QTableWidgetItem(current_location or "—"))
+
+                arrow_item = QTableWidgetItem("→")
+                arrow_item.setTextAlignment(Qt.AlignCenter)
+                arrow_item.setToolTip("Current Location → Planned Location")
+                table.setItem(row, 2, arrow_item)
+
+                planned_text = target_location or "— unchanged —"
+                planned_item = QTableWidgetItem(planned_text)
+                if target_location:
+                    planned_item.setToolTip(f"{current_location or '—'} → {target_location}")
+                else:
+                    planned_item.setToolTip("No move planned for this Profile.")
+                table.setItem(row, 3, planned_item)
+            status.setText(
+                f"{len(members):,} package(s) currently belong to '{profile}'. "
+                f"{planned:,} have a saved/staged Planned Location. "
+                + (
+                    "<b>Unsaved layout changes:</b> use the main Save Changes button before applying."
+                    if self.profile_layouts_dirty else
+                    "The stored layout is saved."
+                )
+            )
+            set_btn.setEnabled(bool(members and self.file_location_registry_current))
+            clear_btn.setEnabled(bool(members))
+            apply_btn.setEnabled(bool(members))
+
+        def set_selected():
+            rows = selected_source_rows()
+            if not rows:
+                QMessageBox.information(dialog, "Planned Location", "Select one or more package rows first.")
+                return
+            names = [
+                name for name, path in sorted(self.file_location_registry_current, key=lambda item: item[0].casefold())
+                if str(name).strip() and str(path).strip()
+            ]
+            if not names:
+                QMessageBox.information(
+                    dialog, "Planned Location",
+                    "No managed File Locations exist yet. Add them with Manage Locations… in Edit."
+                )
+                return
+            target, ok = QInputDialog.getItem(
+                dialog, "Planned Location", "Planned Location for selected package(s):", names, 0, False
+            )
+            if not ok or not str(target).strip():
+                return
+            profile = profile_box.currentText().strip()
+            changed = 0
+            for source_row in rows:
+                rec = self.model.record(source_row)
+                if rec and self._set_profile_layout_target(profile, rec, str(target).strip()):
+                    changed += 1
+            refresh()
+            self.statusBar().showMessage(
+                f"Staged {changed:,} Planned Location change(s) for '{profile}' — Save Changes stores the plan.",
+                8000,
+            )
+
+        def clear_selected():
+            rows = selected_source_rows()
+            if not rows:
+                QMessageBox.information(dialog, "Planned Location", "Select one or more package rows first.")
+                return
+            profile = profile_box.currentText().strip()
+            changed = 0
+            for source_row in rows:
+                rec = self.model.record(source_row)
+                if rec and self._set_profile_layout_target(profile, rec, ""):
+                    changed += 1
+            refresh()
+            self.statusBar().showMessage(
+                f"Cleared {changed:,} Planned Location change(s) for '{profile}' — Save Changes stores the change.",
+                8000,
+            )
+
+        def apply_profile():
+            profile = profile_box.currentText().strip()
+            if self.profile_layouts_dirty or self.pending_changes or self.pending_deletions or self.profile_registry_dirty or self.status_registry_dirty or self.file_location_registry_dirty or self.merge_profile_registry_dirty:
+                answer = QMessageBox.question(
+                    dialog,
+                    "Save before applying?",
+                    "Profile Layouts and/or other Library changes are still unsaved.\n\n"
+                    "Apply Profile Locations uses the saved MDB state. Save Changes now?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer != QMessageBox.Yes or not self.save_changes():
+                    return
+            if self._apply_profile_locations(profile):
+                refresh()
+
+        profile_box.currentTextChanged.connect(lambda *_: refresh())
+        set_btn.clicked.connect(set_selected)
+        clear_btn.clicked.connect(clear_selected)
+        apply_btn.clicked.connect(apply_profile)
+        refresh()
+        dialog.exec()
+
+    @staticmethod
+    def _path_relative_to_root(path: Path, root: Path) -> Optional[Path]:
+        try:
+            return path.resolve().relative_to(root.resolve())
+        except (OSError, ValueError):
+            return None
+
+    @staticmethod
+    def _remove_empty_created_dirs(dirs: List[Path]):
+        for folder in reversed(dirs):
+            try:
+                folder.rmdir()
+            except OSError:
+                pass
+
+    def _apply_profile_locations(self, profile: str) -> bool:
+        """Preview and apply one saved Profile Layout as verified physical batch moves."""
+        profile = str(profile or "").strip()
+        if not self.mdb or not profile:
+            return False
+        if self.scan_process is not None and self.scan_process.state() != QProcess.NotRunning:
+            QMessageBox.warning(
+                self, "Apply Profile Locations",
+                "Wait for the current Scan/Routing operation to finish before moving package files."
+            )
+            return False
+        if self.profile_layouts_dirty:
+            QMessageBox.information(
+                self, "Apply Profile Locations",
+                "Save Changes first so the Profile Layout plan is stored before it is applied."
+            )
+            return False
+
+        member_rows = self._profile_layout_members(profile)
+        planned_rows = []
+        for source_row in member_rows:
+            rec = self.model.record(source_row)
+            target_name = self._profile_layout_target(profile, rec or {})
+            if target_name:
+                planned_rows.append((source_row, target_name))
+        if not planned_rows:
+            QMessageBox.information(
+                self, "Apply Profile Locations",
+                f"Profile '{profile}' has no saved Planned Locations to apply."
+            )
+            return False
+
+        plans = []
+        errors = []
+        target_keys = set()
+        for source_row, target_name in planned_rows:
+            rec = self.model.record(source_row)
+            filename = Path(str((rec or {}).get("Package", "") or "")).name or "(unnamed package)"
+            target_path_text = self._file_location_path_for_name(target_name)
+            target_root = Path(target_path_text) if target_path_text else Path()
+            if not target_path_text or not target_root.is_dir():
+                errors.append(
+                    f"{filename}: target File Location '{target_name}' is unavailable ({target_path_text or 'no path saved'})."
+                )
+                continue
+            try:
+                source_path, source_hash = self._resolve_managed_package_source(source_row)
+                excel_row = int((rec or {}).get("_ExcelRow", "0") or 0)
+                if excel_row <= 1:
+                    raise ValueError("The Library row has no safe MDB worksheet identity.")
+            except Exception as exc:
+                errors.append(f"{filename}: {exc}")
+                continue
+
+            current_name = self.model.effective_value(source_row, "File Location").strip()
+            current_root_text = self._file_location_path_for_name(current_name)
+            current_root = Path(current_root_text) if current_root_text else None
+
+            # A package already anywhere below the desired managed root is physically
+            # in the right location. We only need to align the MDB File Location name.
+            within_target = self._path_relative_to_root(source_path, target_root)
+            if within_target is not None:
+                destination = source_path.resolve()
+                relative = within_target
+                same_path = True
+            else:
+                relative = (
+                    self._path_relative_to_root(source_path, current_root)
+                    if current_root is not None and current_root_text and current_root.is_dir()
+                    else None
+                )
+                if relative is None or str(relative) in {"", "."}:
+                    relative = Path(filename)
+                destination = (target_root / relative).resolve()
+                same_path = os.path.normcase(str(source_path.resolve())).casefold() == os.path.normcase(str(destination)).casefold()
+
+            dest_key = os.path.normcase(str(destination)).casefold()
+            if dest_key in target_keys and not same_path:
+                errors.append(f"{filename}: two Profile Layout entries would use the same destination '{destination}'.")
+                continue
+            target_keys.add(dest_key)
+
+            if destination.exists() and not same_path:
+                try:
+                    dest_hash = self._managed_file_sha256(destination)
+                    kind = "an exact duplicate" if dest_hash == source_hash else "a different file"
+                except Exception:
+                    kind = "an existing file"
+                errors.append(f"{filename}: destination '{destination}' already contains {kind}; nothing will be overwritten.")
+                continue
+
+            if not same_path and self._managed_path_is_read_only(source_path):
+                errors.append(
+                    f"{filename}: source package is Read-only. Clear the Read-only attribute before Apply Profile Locations so CAS Curator can move it safely."
+                )
+                continue
+
+            plans.append({
+                "source_row": source_row,
+                "excel_row": excel_row,
+                "filename": filename,
+                "source": source_path.resolve(),
+                "hash": source_hash,
+                "target_name": target_name,
+                "target_root": target_root.resolve(),
+                "relative": relative,
+                "destination": destination,
+                "same_path": same_path,
+                "current_name": current_name,
+                "created_dirs": [],
+            })
+
+        if errors:
+            shown = "\n\n".join(f"• {line}" for line in errors[:12])
+            if len(errors) > 12:
+                shown += f"\n\n…and {len(errors) - 12} more problem(s)."
+            QMessageBox.warning(
+                self, "Profile Layout preflight blocked",
+                "Nothing was moved because the full Profile Layout was not conflict-free:\n\n" + shown
+            )
+            return False
+
+        moving = [item for item in plans if not item["same_path"]]
+        aligned = [item for item in plans if item["same_path"]]
+        preview = [
+            f"Apply Profile Locations for '{profile}'?",
+            "",
+            f"Profile members: {len(member_rows):,}",
+            f"Mapped locations: {len(plans):,}",
+            f"Files to move: {len(moving):,}",
+            f"Already physically inside the desired location: {len(aligned):,}",
+            "",
+        ]
+        for item in plans[:15]:
+            if item["same_path"]:
+                preview.append(
+                    f"• {item['filename']} — already under '{item['target_name']}'"
+                    + ("; File Location name will be aligned" if item["current_name"] != item["target_name"] else "")
+                )
+            else:
+                preview.append(
+                    f"• {item['source']}\n  → {item['destination']}  [{item['target_name']}]"
+                )
+        if len(plans) > 15:
+            preview.append(f"…and {len(plans) - 15} more mapped package(s).")
+        preview += [
+            "",
+            "Folder structure below the current managed root is preserved where possible.",
+            "CAS Curator copies first, verifies SHA-256, deletes the original only after verification, "
+            "then updates Current File Location in the MDB. Existing files are never overwritten.",
+            "",
+            "Choosing/filtering Profiles alone never performs these moves.",
+        ]
+        answer = QMessageBox.question(
+            self, "Preview Profile Layout moves", "\n".join(preview),
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No
+        )
+        if answer != QMessageBox.Yes:
+            return False
+
+        moved: List[dict] = []
+        result = None
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            for item in moving:
+                source = item["source"]
+                destination = item["destination"]
+                try:
+                    missing_dirs = []
+                    probe = destination.parent
+                    while probe != item["target_root"].parent and not probe.exists():
+                        missing_dirs.append(probe)
+                        if probe == item["target_root"]:
+                            break
+                        probe = probe.parent
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    item["created_dirs"] = list(reversed(missing_dirs))
+                    shutil.copy2(source, destination)
+                    if self._managed_file_sha256(destination) != item["hash"]:
+                        self._managed_unlink_even_if_read_only(destination)
+                        self._remove_empty_created_dirs(item["created_dirs"])
+                        raise ValueError("copied file failed SHA-256 verification")
+                    try:
+                        source.unlink()
+                    except Exception as source_exc:
+                        cleanup_error = None
+                        try:
+                            self._managed_unlink_even_if_read_only(destination)
+                        except Exception as cleanup_exc:
+                            cleanup_error = cleanup_exc
+                        self._remove_empty_created_dirs(item["created_dirs"])
+                        if cleanup_error is not None:
+                            raise RuntimeError(
+                                f"{source_exc}; cleanup of the incomplete destination copy also failed: {cleanup_error}"
+                            ) from source_exc
+                        raise
+                    moved.append(item)
+                except Exception as exc:
+                    current_cleanup_problem = None
+                    if source.exists() and destination.exists():
+                        try:
+                            if self._managed_file_sha256(destination) == item["hash"]:
+                                self._managed_unlink_even_if_read_only(destination)
+                                self._remove_empty_created_dirs(item["created_dirs"])
+                        except Exception as cleanup_exc:
+                            current_cleanup_problem = f"{item['filename']}: could not remove incomplete destination copy: {cleanup_exc}"
+                    rollback_problems = self._rollback_managed_moves(moved)
+                    detail = f"Profile Layout move failed at '{item['filename']}': {exc}\n\nEarlier files were rolled back."
+                    if current_cleanup_problem:
+                        rollback_problems.insert(0, current_cleanup_problem)
+                    if rollback_problems:
+                        detail += "\n\nRollback needs attention:\n" + "\n".join(f"• {p}" for p in rollback_problems)
+                    raise RuntimeError(detail) from exc
+
+            changes = {
+                item["excel_row"]: {"File Location": item["target_name"]}
+                for item in plans if item["current_name"] != item["target_name"]
+            }
+            if changes:
+                try:
+                    result = MDBWorkbook().save_manual_changes(self.mdb, changes)
+                except Exception as exc:
+                    rollback_problems = self._rollback_managed_moves(moved)
+                    detail = (
+                        f"The package files were moved, but the MDB File Location update failed: {exc}\n\n"
+                        "CAS Curator attempted to restore the original package locations."
+                    )
+                    if rollback_problems:
+                        detail += "\n\nRollback needs attention:\n" + "\n".join(f"• {p}" for p in rollback_problems)
+                    raise RuntimeError(detail) from exc
+        except Exception as exc:
+            QMessageBox.critical(self, "Apply Profile Locations failed", str(exc))
+            return False
+        finally:
+            QApplication.restoreOverrideCursor()
+
+        for item in plans:
+            rec = self.model.record(item["source_row"])
+            if rec:
+                rec["File Location"] = item["target_name"]
+                self.model.notify_row_changed(item["source_row"])
+
+        self._populate_filters()
+        self._apply_filters()
+        if self.current_source_row is not None:
+            rec = self.model.record(self.current_source_row)
+            if rec:
+                self.show_record(rec)
+
+        summary = [
+            f"Profile: {profile}",
+            f"Moved: {len(moved):,}",
+            f"Already in desired managed location: {len(aligned):,}",
+            "",
+            "Current File Location now matches the applied Planned Location for every mapped package.",
+        ]
+        if result is not None:
+            summary.append(f"MDB backup: {result.backup_path.name}")
+        QMessageBox.information(self, "Profile Locations applied", "\n".join(summary))
+        self.statusBar().showMessage(
+            f"Profile Layout '{profile}': {len(moved):,} moved, {len(aligned):,} already in place",
+            10000,
+        )
+        return True
 
     def _all_profile_names(self) -> List[str]:
         """Return the profile registry plus any assigned legacy profile names."""
@@ -12151,16 +17161,163 @@ class MainWindow(QMainWindow):
 
     def _refresh_cc_magic_profile_choices(self):
         combo = getattr(self, "cc_magic_profile_quick", None)
+        current_value = ""
+        if self.current_source_row is not None:
+            current_value = self.model.effective_value(self.current_source_row, "CC Magic Profiles")
+        assigned = {p.casefold() for p in _split_cc_magic_profiles(current_value)}
+
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("Choose Profile…", "")
+            if self.mdb:
+                for profile in self._all_profile_names():
+                    if profile.casefold() not in assigned:
+                        combo.addItem(profile, profile)
+            combo.setCurrentIndex(0)
+            combo.setEnabled(bool(self.mdb and self.current_source_row is not None and combo.count() > 1))
+            combo.blockSignals(False)
+
+        # Remove choices show only Profiles already assigned to the focused package.
+        self._refresh_profile_remove_choices(current_value)
+
+    def _refresh_profile_remove_choices(self, profile_value: str):
+        combo = getattr(self, "cc_magic_profile_remove_quick", None)
         if combo is None:
             return
         combo.blockSignals(True)
         combo.clear()
-        combo.addItem("Choose Profile…", "")
+        combo.addItem("Choose assigned Profile…", "")
+        for profile in _split_cc_magic_profiles(profile_value):
+            combo.addItem(profile, profile)
+        combo.setCurrentIndex(0)
+        combo.setEnabled(bool(self.mdb and self.current_source_row is not None and combo.count() > 1))
+        combo.blockSignals(False)
+
+    def _active_profile_settings_key(self) -> str:
+        prefix = self._mdb_ui_settings_prefix()
+        return f"{prefix}/active_profile" if prefix else ""
+
+    def _current_profile_combo_changed(self, _index: int):
+        combo = getattr(self, "current_profile_combo", None)
+        if combo is None:
+            return
+        requested = str(combo.currentData() or "").strip()
+        self._adapt_current_profile_combo_width()
+        if requested.casefold() == str(getattr(self, "active_profile_name", "") or "").strip().casefold():
+            return
+        self._set_active_profile(requested, restore_filters=True)
+
+    def _adapt_current_profile_combo_width(self):
+        # Intentionally fixed-width: the header does not have enough horizontal
+        # room for profile-name-driven expansion without overlapping actions.
+        combo = getattr(self, "current_profile_combo", None)
+        if combo is not None:
+            combo.setFixedWidth(160)
+
+    def _update_current_profile_indicator(self):
+        combo = getattr(self, "current_profile_combo", None)
+        if combo is None:
+            return
+        current = str(getattr(self, "active_profile_name", "") or "").strip()
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("None", "")
+        selected_index = 0
         if self.mdb:
             for profile in self._all_profile_names():
                 combo.addItem(profile, profile)
-        combo.setCurrentIndex(0)
+                if profile.casefold() == current.casefold():
+                    selected_index = combo.count() - 1
+        combo.setCurrentIndex(selected_index)
         combo.blockSignals(False)
+        self._adapt_current_profile_combo_width()
+        combo.setToolTip(
+            f"Current Profile: {current}. Changing the Current Profile does not move package files."
+            if current else
+            "No Current Profile selected. Choosing a Current Profile changes context only and never moves package files."
+        )
+
+    def _set_active_profile(self, profile: str, *, restore_filters: bool = True):
+        requested = str(profile or "").strip()
+        match = next((p for p in self._all_profile_names() if p.casefold() == requested.casefold()), None) if requested else None
+        previous_profile = str(getattr(self, "active_profile_name", "") or "").strip()
+        next_profile = match or ""
+
+        # Library filters are Profile-view state. On every actual Profile
+        # change, clear the previous filter view first so permanent filters
+        # (Status / CC Type / Creator) and extra column filters (for example
+        # Converter / Notes) cannot leak into the next Profile or None.
+        # Search text and visible-column layout are intentionally separate.
+        if previous_profile.casefold() != next_profile.casefold():
+            self._clear_applied_profile_rule_filters()
+
+        self.active_profile_name = next_profile
+        key = self._active_profile_settings_key()
+        if key:
+            self.settings.setValue(key, self.active_profile_name)
+            self.settings.sync()
+        self._rebuild_profiles_menu()
+        self._update_current_profile_indicator()
+        self._refresh_profile_layout_editor_visibility()
+        self.model.notify_all_changed()
+        if self.current_source_row is not None:
+            rec = self.model.record(self.current_source_row)
+            if rec:
+                self._load_profile_location_editor(rec)
+        if restore_filters and self.active_profile_name:
+            state = self._profile_filter_state(self.active_profile_name)
+            if state is not None:
+                self._apply_filter_state(state)
+                self._apply_profile_visible_columns(state)
+        self.statusBar().showMessage(
+            f"Current Profile: {self.active_profile_name}. Switching Profiles does not move files."
+            if self.active_profile_name else
+            "No Current Profile selected. Changing Current Profile never moves files.",
+            7000,
+        )
+
+    def _restore_active_profile_for_current_mdb(self):
+        if not self.mdb:
+            self.active_profile_name = ""
+            return
+        key = self._active_profile_settings_key()
+        saved = str(self.settings.value(key, "") or "").strip() if key else ""
+        match = next((p for p in self._all_profile_names() if p.casefold() == saved.casefold()), None) if saved else None
+        self.active_profile_name = match or ""
+        self._rebuild_profiles_menu()
+        self._update_current_profile_indicator()
+        self.model.notify_all_changed()
+        if self.active_profile_name:
+            state = self._profile_filter_state(self.active_profile_name)
+            if state is not None:
+                self._apply_filter_state(state)
+                self._apply_profile_visible_columns(state)
+        self._refresh_profile_layout_editor_visibility()
+
+    def _rename_or_remove_profile_filter_view(self, old_profile: str, new_profile: Optional[str]):
+        old_key = str(old_profile or "").strip().casefold()
+        if not old_key:
+            return
+        new_name = str(new_profile or "").strip()
+        views = self._profile_filter_views()
+        old_name = next((name for name in views if name.casefold() == old_key), None)
+        state = views.pop(old_name, None) if old_name else None
+        if state is not None and new_name:
+            existing = next((name for name in views if name.casefold() == new_name.casefold()), None)
+            if existing is None:
+                views[new_name] = state
+        self._write_profile_filter_views(views)
+        if str(self.active_profile_name or "").casefold() == old_key:
+            self.active_profile_name = new_name
+            key = self._active_profile_settings_key()
+            if key:
+                self.settings.setValue(key, self.active_profile_name)
+                self.settings.sync()
+
+    def _rebuild_profiles_menu(self):
+        """Compatibility refresh hook retained for profile rename/delete paths."""
+        self._update_current_profile_indicator()
 
     def _valid_profile_name(self, name: str) -> bool:
         return bool(name and ";" not in name and "\n" not in name and "\r" not in name)
@@ -12206,10 +17363,10 @@ class MainWindow(QMainWindow):
         existing = next((p for p in self._all_profile_names() if p.casefold() == name.casefold()), None)
         if existing:
             QMessageBox.information(self, "New Profile", f"'{existing}' already exists.")
-            if hasattr(self, "cc_magic_profile_quick"):
-                self.cc_magic_profile_quick.setCurrentText(existing)
+            self._set_active_profile(existing)
             return
         self._ensure_profile_in_registry(name)
+        self._set_active_profile(name, restore_filters=False)
         if hasattr(self, "cc_magic_profile_quick"):
             self.cc_magic_profile_quick.setCurrentText(name)
         self.statusBar().showMessage(
@@ -12236,6 +17393,56 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(f"This package already has Profile '{profile}'.", 5000)
+
+    def _cc_profile_remove_quick_selected(self, index: int):
+        """Remove one existing Profile membership from the current package."""
+        if index <= 0 or self.current_source_row is None:
+            return
+        combo = getattr(self, "cc_magic_profile_remove_quick", None)
+        if combo is None:
+            return
+        profile = str(combo.itemData(index) or combo.itemText(index) or "").strip()
+        combo.setCurrentIndex(0)
+        if not profile:
+            return
+
+        planned = ""
+        rec = self.model.record(self.current_source_row)
+        if rec:
+            planned = self._profile_layout_target(profile, rec)
+
+        detail = (
+            f"Remove Profile '{profile}' from this package?\n\n"
+            "This only stages the membership change until Save Changes."
+        )
+        if planned:
+            detail += (
+                f"\n\nThis package also has Planned Location '{planned}' for '{profile}'. "
+                "Saving the membership removal will also remove that Profile-specific plan."
+            )
+
+        answer = QMessageBox.question(
+            self,
+            "Remove Profile membership",
+            detail,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        changed = self._stage_profile_on_rows(profile, [self.current_source_row], False)
+        if changed:
+            self._refresh_cc_magic_profile_choices()
+            self.statusBar().showMessage(
+                f"Removed '{profile}' from this package — unsaved until Save Changes",
+                7000,
+            )
+        else:
+            self.statusBar().showMessage(
+                f"This package is not assigned to Profile '{profile}'.",
+                5000,
+            )
 
     def _cc_profile_tool_name(self) -> str:
         combo = getattr(self, "cc_magic_profile_quick", None)
@@ -12321,13 +17528,19 @@ class MainWindow(QMainWindow):
             self.cc_magic_profile_quick.setCurrentIndex(0)
 
     def _cc_profile_remove_from_current(self):
+        """Compatibility hook: use the staged Remove from control in the Edit tab."""
+        if self.current_source_row is None:
+            return
         profile = self._cc_profile_tool_name()
         if not profile:
-            QMessageBox.information(self, "Profile", "Choose the profile to remove first.")
+            QMessageBox.information(self, "Profile", "Choose the Profile to remove first.")
             return
-        profiles = [p for p in _split_cc_magic_profiles(self.cc_magic_profiles_edit.toPlainText()) if p.casefold() != profile.casefold()]
-        self.cc_magic_profiles_edit.setPlainText("\n".join(profiles))
-        self.cc_magic_profile_quick.setCurrentText(profile)
+        changed = self._stage_profile_on_rows(profile, [self.current_source_row], False)
+        if changed:
+            self.statusBar().showMessage(
+                f"Removed '{profile}' from this package — unsaved until Save Changes",
+                7000,
+            )
 
     def _cc_profile_apply_to_selected(self, add: bool):
         if not self.mdb:
@@ -12437,6 +17650,8 @@ class MainWindow(QMainWindow):
         registry.sort(key=str.casefold)
         self.profile_registry_current = registry
         self.profile_registry_dirty = self.profile_registry_current != self.profile_registry_saved
+        self._rename_or_remove_profile_layouts(old_profile, new_clean if new_clean else None)
+        self._rename_or_remove_profile_filter_view(old_profile, new_clean if new_clean else None)
 
         changed_rows: List[int] = []
         for source_row, rec in enumerate(self.model.records):
@@ -12478,6 +17693,7 @@ class MainWindow(QMainWindow):
             self.model.notify_row_changed(source_row)
         self._refresh_cc_magic_profile_choices()
         self._populate_filters()
+        self._rebuild_profiles_menu()
         if self.current_source_row is not None:
             rec = self.model.record(self.current_source_row)
             if rec:
@@ -12489,23 +17705,39 @@ class MainWindow(QMainWindow):
 
     def _manage_cc_magic_profiles(self):
         if not self.mdb:
+            QMessageBox.information(self, "Profiles", "Open a Master Database first.")
             return
 
         dialog = QDialog(self)
         dialog.setWindowTitle("Manage Profiles")
-        dialog.resize(580, 450)
+        dialog.resize(700, 520)
+        self._style_custom_dialog(dialog)
         layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(14, 14, 14, 14)
+        layout.setSpacing(10)
+
+        current_row = QHBoxLayout()
+        current_label = QLabel("")
+        current_font = current_label.font()
+        current_font.setBold(True)
+        current_label.setFont(current_font)
+        clear_current_btn = QPushButton("Clear Current")
+        clear_current_btn.setMinimumWidth(120)
+        current_row.addWidget(current_label, 1)
+        current_row.addWidget(clear_current_btn)
+        layout.addLayout(current_row)
 
         help_label = QLabel(
             "Profiles are optional groups for playthroughs, themes, saves, testing setups, or other organisational purposes. "
-            "They are independent of File Location. Empty profiles are allowed. Create/rename/delete changes are staged first; "
-            "nothing is written until Save Changes in the main window."
+            "The Current Profile is the Profile context used for Profile Rules and Experimental Planned Locations. "
+            "Changing the Current Profile never moves package files. "
+            "Create/rename/delete changes are staged first; use Save Changes in the main window to write MDB changes."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
 
-        table = QTableWidget(0, 2)
-        table.setHorizontalHeaderLabels(["Profile", "Packages"])
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["Profile", "Packages", "Current"])
         table.setEditTriggers(QTableWidget.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectRows)
         table.setSelectionMode(QTableWidget.SingleSelection)
@@ -12513,55 +17745,115 @@ class MainWindow(QMainWindow):
         table.horizontalHeader().setStretchLastSection(False)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         layout.addWidget(table, 1)
 
         status = QLabel("")
         status.setWordWrap(True)
         layout.addWidget(status)
 
+        # Keep action rows visually balanced: every button in a row expands
+        # equally instead of one long label pushing the others out of alignment.
         action_row = QHBoxLayout()
+        action_row.setSpacing(8)
+        use_btn = QPushButton("Use Selected")
         create_btn = QPushButton("New Profile…")
-        rename_btn = QPushButton("Rename selected…")
-        delete_btn = QPushButton("Delete selected…")
-        action_row.addWidget(create_btn)
-        action_row.addWidget(rename_btn)
-        action_row.addWidget(delete_btn)
-        action_row.addStretch(1)
+        rename_btn = QPushButton("Rename Selected…")
+        delete_btn = QPushButton("Delete Selected…")
+        for button in (use_btn, create_btn, rename_btn, delete_btn):
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            action_row.addWidget(button)
         layout.addLayout(action_row)
+
+        rules_box = QGroupBox("Profile Rules")
+        rules_layout = QVBoxLayout(rules_box)
+        rules_layout.setContentsMargins(10, 9, 10, 10)
+        rules_layout.setSpacing(7)
+        rules_help = QLabel(
+            "Profile Rules save this Profile's Library filters and visible Table columns. "
+            "Switching to the Profile can restore that preferred Library view; "
+            "Profile Rules do not change membership and never move package files."
+        )
+        rules_help.setWordWrap(True)
+        rules_layout.addWidget(rules_help)
+
+        rules_row = QHBoxLayout()
+        rules_row.setSpacing(8)
+        save_filters_btn = QPushButton("Save Current View")
+        restore_filters_btn = QPushButton("Apply Rules")
+        clear_filters_btn = QPushButton("Clear Rules")
+        for button in (save_filters_btn, restore_filters_btn, clear_filters_btn):
+            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            rules_row.addWidget(button)
+        rules_layout.addLayout(rules_row)
+        layout.addWidget(rules_box)
 
         close_box = QDialogButtonBox(QDialogButtonBox.Close)
         close_box.rejected.connect(dialog.reject)
         layout.addWidget(close_box)
 
+        def selected_profile() -> str:
+            row = table.currentRow()
+            item = table.item(row, 0) if row >= 0 else None
+            return item.text().strip() if item else ""
+
         def refresh_table(select_name: str = ""):
             rows = self._cc_magic_profile_usage()
             table.setRowCount(len(rows))
-            wanted = select_name.casefold()
+            wanted = str(select_name or "").casefold()
+            active_key = str(self.active_profile_name or "").casefold()
             select_row = -1
             for row, (profile, count) in enumerate(rows):
                 name_item = QTableWidgetItem(profile)
                 count_item = QTableWidgetItem(f"{count:,}")
                 count_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                current_item = QTableWidgetItem("✓" if profile.casefold() == active_key else "")
+                current_item.setTextAlignment(Qt.AlignCenter)
                 table.setItem(row, 0, name_item)
                 table.setItem(row, 1, count_item)
+                table.setItem(row, 2, current_item)
                 if wanted and profile.casefold() == wanted:
+                    select_row = row
+                elif not wanted and profile.casefold() == active_key:
                     select_row = row
             if select_row >= 0:
                 table.selectRow(select_row)
             elif rows:
                 table.selectRow(0)
+
+            current_name = self.active_profile_name or "None"
+            current_label.setText(f"Current Profile: {current_name}")
+            clear_current_btn.setEnabled(bool(self.active_profile_name))
+            use_btn.setEnabled(bool(rows))
             rename_btn.setEnabled(bool(rows))
             delete_btn.setEnabled(bool(rows))
+            has_current = bool(self.active_profile_name)
+            has_saved_view = has_current and self._profile_filter_state(self.active_profile_name) is not None
+            save_filters_btn.setEnabled(has_current)
+            restore_filters_btn.setEnabled(bool(has_saved_view))
+            clear_filters_btn.setEnabled(bool(has_saved_view))
             registry_note = "registry changed" if self.profile_registry_dirty else "registry saved"
             status.setText(
                 f"{len(rows):,} profile(s), including empty profiles. "
-                f"Unsaved package fields: {sum(len(v) for v in self.pending_changes.values()):,}; {registry_note}."
+                f"Unsaved package fields: {sum(len(v) for v in self.pending_changes.values()):,}; {registry_note}. "
+                "Changing Current Profile does not move files."
+            )
+            self._update_current_profile_indicator()
+
+        def use_selected():
+            profile = selected_profile()
+            if not profile:
+                return
+            self._set_active_profile(profile, restore_filters=True)
+            refresh_table(profile)
+            status.setText(
+                f"Current Profile is now '{profile}'. Package files were not moved."
             )
 
-        def selected_profile() -> str:
-            row = table.currentRow()
-            item = table.item(row, 0) if row >= 0 else None
-            return item.text().strip() if item else ""
+        def clear_current():
+            self._set_active_profile("", restore_filters=False)
+            refresh_table()
+            status.setText("Current Profile cleared. Package files were not moved.")
 
         def create_profile_here():
             name, ok = QInputDialog.getText(dialog, "New Profile", "Profile name:")
@@ -12578,6 +17870,7 @@ class MainWindow(QMainWindow):
                 return
             self._ensure_profile_in_registry(name)
             refresh_table(name)
+            status.setText(f"Created '{name}' as an unsaved Profile. Use Selected if you want it to become the Current Profile.")
 
         def rename_selected():
             old_name = selected_profile()
@@ -12632,13 +17925,40 @@ class MainWindow(QMainWindow):
                 return
             changed = self._stage_cc_magic_profile_global_change(old_name, None)
             refresh_table()
-            status.setText(f"Staged profile deletion from {changed:,} package(s). Save Changes when ready.")
+            status.setText(f"Staged Profile deletion from {changed:,} package(s). Save Changes when ready.")
 
+        def save_current_filters():
+            self._save_filters_to_active_profile()
+            refresh_table(self.active_profile_name)
+
+        def restore_saved_filters():
+            self._restore_active_profile_filters()
+            refresh_table(self.active_profile_name)
+
+        def clear_saved_filters():
+            profile = self.active_profile_name
+            if self._clear_filters_from_active_profile():
+                self._clear_applied_profile_rule_filters()
+                refresh_table(profile)
+                status.setText(
+                    f"Cleared Profile Rules for '{profile}'. Saved Library filter rules were removed and the currently applied rule filters were cleared; search text was left unchanged."
+                )
+            else:
+                refresh_table(profile)
+                status.setText(f"Profile '{profile}' has no saved Profile Rules." if profile else "No Current Profile selected.")
+
+        use_btn.clicked.connect(use_selected)
+        clear_current_btn.clicked.connect(clear_current)
         create_btn.clicked.connect(create_profile_here)
         rename_btn.clicked.connect(rename_selected)
         delete_btn.clicked.connect(delete_selected)
-        refresh_table()
+        save_filters_btn.clicked.connect(save_current_filters)
+        restore_filters_btn.clicked.connect(restore_saved_filters)
+        clear_filters_btn.clicked.connect(clear_saved_filters)
+
+        refresh_table(self.active_profile_name)
         dialog.exec()
+        self._update_current_profile_indicator()
 
     def _all_merge_profile_names(self) -> List[str]:
         """Return the managed Merge Profile registry plus any assigned legacy names."""
@@ -12996,11 +18316,13 @@ class MainWindow(QMainWindow):
         try:
             self._ensure_combo_value(self.status_edit, pending.get("Status", rec.get("Status", "")))
             self.creator_edit.setText(pending.get("Creator", rec.get("Creator", "")))
+            self.converter_edit.setText(pending.get("Converter", rec.get("Converter", "")))
             self._ensure_combo_value(self.file_location_edit, pending.get("File Location", rec.get("File Location", "")))
             profile_value = pending.get("CC Magic Profiles", rec.get("CC Magic Profiles", ""))
             self.cc_magic_profiles_edit.setPlainText(
                 _normalise_cc_magic_profiles(profile_value).replace("; ", "\n")
             )
+            self._refresh_cc_magic_profile_choices()
             merge_profile_value = pending.get("Merge Profiles", rec.get("Merge Profiles", ""))
             self.merge_profiles_edit.setPlainText(
                 _normalise_cc_magic_profiles(merge_profile_value).replace("; ", "\n")
@@ -13011,6 +18333,9 @@ class MainWindow(QMainWindow):
             self._loading_editor = False
         self._set_editor_enabled(row_num not in self.pending_deletions)
         self._set_merge_profiles_row_visible(pending.get("Status", rec.get("Status", "")))
+        self._refresh_profile_layout_editor_visibility()
+        if (IS_DEV_BUILD or self.experimental_features) and self._profile_layout_context_profile():
+            self._load_profile_location_editor(rec)
         self._update_selected_dirty_label()
 
     def _editor_changed(self, *_):
@@ -13025,6 +18350,7 @@ class MainWindow(QMainWindow):
         values = {
             "Status": self.status_edit.currentText(),
             "Creator": self.creator_edit.text().strip(),
+            "Converter": self.converter_edit.text().strip(),
             "File Location": self.file_location_edit.currentText(),
             "Notes": self.notes_edit.toPlainText(),
         }
@@ -13101,24 +18427,30 @@ class MainWindow(QMainWindow):
             return
         row_num = self._current_excel_row()
         fields = list(self.pending_changes.get(row_num or -1, {}).keys())
+        profile = self._profile_layout_context_profile()
+        rec = self.model.record(self.current_source_row) if self.current_source_row is not None else {}
+        profile_layout_dirty = bool(profile and rec and self._profile_layout_is_dirty_for_record(profile, rec))
+        display_fields = list(fields)
+        if profile_layout_dirty:
+            display_fields.append("Profile Location")
         if row_num in self.pending_deletions:
             self.edit_dirty_label.setText("Record staged for deletion — use Revert this to cancel")
-        elif fields:
-            self.edit_dirty_label.setText("Unsaved for this package: " + ", ".join(fields))
+        elif display_fields:
+            self.edit_dirty_label.setText("Unsaved for this package: " + ", ".join(display_fields))
         else:
             self.edit_dirty_label.setText("No unsaved changes for this package")
         if hasattr(self, "revert_selected_btn"):
-            self.revert_selected_btn.setEnabled(bool(fields) or row_num in self.pending_deletions)
+            self.revert_selected_btn.setEnabled(bool(display_fields) or row_num in self.pending_deletions)
 
     def _update_dirty_state(self):
         field_count = sum(len(v) for v in self.pending_changes.values())
         dirty = (
             field_count > 0 or bool(self.pending_deletions) or self.profile_registry_dirty
-            or self.status_registry_dirty or self.file_location_registry_dirty
+            or self.profile_layouts_dirty or self.status_registry_dirty or self.file_location_registry_dirty
             or self.merge_profile_registry_dirty
         )
         registry_extra = (
-            int(self.profile_registry_dirty) + int(self.status_registry_dirty)
+            int(self.profile_registry_dirty) + int(self.profile_layouts_dirty) + int(self.status_registry_dirty)
             + int(self.file_location_registry_dirty) + int(self.merge_profile_registry_dirty)
         )
         if hasattr(self, "unsaved_label"):
@@ -13139,12 +18471,17 @@ class MainWindow(QMainWindow):
         row_num = self._current_excel_row()
         if not row_num:
             return
-        had_change = row_num in self.pending_changes or row_num in self.pending_deletions
+        rec = self.model.record(self.current_source_row) if self.current_source_row is not None else {}
+        profile = self._profile_layout_context_profile()
+        layout_change = bool(profile and rec and self._profile_layout_is_dirty_for_record(profile, rec))
+        had_change = row_num in self.pending_changes or row_num in self.pending_deletions or layout_change
         if not had_change:
             return
         self.pending_changes.pop(row_num, None)
         self.pending_deletions.discard(row_num)
-        rec = self.model.record(self.current_source_row) if self.current_source_row is not None else {}
+        if layout_change:
+            saved_target = self._profile_layout_target(profile, rec, self.profile_layouts_saved)
+            self._set_profile_layout_target(profile, rec, saved_target)
         if rec:
             self.show_record(rec)
         if self.current_source_row is not None:
@@ -13154,13 +18491,13 @@ class MainWindow(QMainWindow):
 
     def revert_all_changes(self):
         if (not self.pending_changes and not self.pending_deletions and not self.profile_registry_dirty
-                and not self.status_registry_dirty and not self.file_location_registry_dirty
-                and not self.merge_profile_registry_dirty):
+                and not self.profile_layouts_dirty and not self.status_registry_dirty
+                and not self.file_location_registry_dirty and not self.merge_profile_registry_dirty):
             return
         answer = QMessageBox.question(
             self,
             "Revert unsaved changes",
-            "Discard all unsaved Library/Profile/Merge Profile/Status/File Location changes, including staged record deletions?",
+            "Discard all unsaved Library/Profile/Profile Layout/Merge Profile/Status/File Location changes, including staged record deletions?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -13170,6 +18507,8 @@ class MainWindow(QMainWindow):
         self.pending_deletions.clear()
         self.profile_registry_current = list(self.profile_registry_saved)
         self.profile_registry_dirty = False
+        self.profile_layouts_current = list(self.profile_layouts_saved)
+        self.profile_layouts_dirty = False
         self.status_registry_dirty = False
         self.file_location_registry_current = list(self.file_location_registry_saved)
         self.file_location_registry_dirty = False
@@ -13309,6 +18648,7 @@ class MainWindow(QMainWindow):
             not self.pending_changes
             and not self.pending_deletions
             and not self.profile_registry_dirty
+            and not self.profile_layouts_dirty
             and not self.status_registry_dirty
             and not self.file_location_registry_dirty
             and not self.merge_profile_registry_dirty
@@ -13316,6 +18656,9 @@ class MainWindow(QMainWindow):
             return True
 
         target_path = str(self.mdb.path.resolve())
+        # Profile Layout entries are valid only while the package remains a member
+        # of that Profile. Prune removed memberships/records before persisting.
+        self._prune_profile_layouts_to_effective_memberships()
         # No repetitive Save confirmation in PUBLIC RC4. The writer still creates
         # the same full MDB backup before every successful save. Delete Record has
         # its own explicit staging confirmation before it reaches this point.
@@ -13330,7 +18673,8 @@ class MainWindow(QMainWindow):
         profile_registry_was_dirty = profile_registry_needs_save
         merge_profile_registry_was_dirty = merge_profile_registry_needs_save
         file_location_registry_was_dirty = self.file_location_registry_dirty
-        self.statusBar().showMessage("Saving Library/Profile changes and creating MDB backup…")
+        profile_layouts_were_dirty = self.profile_layouts_dirty
+        self.statusBar().showMessage("Saving Library/Profile/Profile Layout changes and creating MDB backup…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             result = MDBWorkbook().save_manual_changes(
@@ -13341,6 +18685,7 @@ class MainWindow(QMainWindow):
                 delete_rows=self.pending_deletions,
                 file_locations=self.file_location_registry_current if file_location_registry_was_dirty else None,
                 merge_profile_options=self.merge_profile_registry_current if merge_profile_registry_needs_save else None,
+                profile_layouts=self.profile_layouts_current if profile_layouts_were_dirty else None,
             )
         except WorkbookChangedError as exc:
             QMessageBox.warning(self, "Master Database changed", str(exc))
@@ -13389,6 +18734,8 @@ class MainWindow(QMainWindow):
         self.pending_deletions.clear()
         self.profile_registry_saved = list(self.profile_registry_current)
         self.profile_registry_dirty = False
+        self.profile_layouts_saved = list(self.profile_layouts_current)
+        self.profile_layouts_dirty = False
         self.status_registry_dirty = False
         self.file_location_registry_saved = list(self.file_location_registry_current)
         self.file_location_registry_dirty = False
@@ -13405,7 +18752,16 @@ class MainWindow(QMainWindow):
             if rec:
                 self.show_record(rec)
 
+        # Learn only from values that have now been successfully written to the
+        # MDB. If a newly remembered name matches other blank package filenames,
+        # offer those suggestions after Save completes; never fill them silently.
+        learned = self._remember_attribution_names_from_records(self.model.records)
+        if learned.get("Creator", 0) or learned.get("Converter", 0):
+            QTimer.singleShot(250, self._maybe_offer_remembered_attribution_suggestions)
+
         registry_note = " Profile registry saved." if profile_registry_was_dirty else ""
+        if profile_layouts_were_dirty:
+            registry_note += " Experimental Profile Layouts saved."
         if status_registry_was_dirty:
             registry_note += " Status options updated."
         if file_location_registry_was_dirty:
@@ -13422,12 +18778,12 @@ class MainWindow(QMainWindow):
 
     def _confirm_pending_changes(self) -> bool:
         if (not self.pending_changes and not self.pending_deletions and not self.profile_registry_dirty
-                and not self.status_registry_dirty and not self.file_location_registry_dirty
-                and not self.merge_profile_registry_dirty):
+                and not self.profile_layouts_dirty and not self.status_registry_dirty
+                and not self.file_location_registry_dirty and not self.merge_profile_registry_dirty):
             return True
         box = QMessageBox(self)
         box.setWindowTitle("Unsaved changes")
-        box.setText("You have unsaved Library/Profile/Merge Profile/Status/File Location changes, including any staged record deletions.")
+        box.setText("You have unsaved Library/Profile/Profile Layout/Merge Profile/Status/File Location changes, including any staged record deletions.")
         box.setInformativeText("Save them before continuing?")
         box.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         box.setDefaultButton(QMessageBox.Save)
@@ -13439,6 +18795,8 @@ class MainWindow(QMainWindow):
             self.pending_deletions.clear()
             self.profile_registry_current = list(self.profile_registry_saved)
             self.profile_registry_dirty = False
+            self.profile_layouts_current = list(self.profile_layouts_saved)
+            self.profile_layouts_dirty = False
             self.status_registry_dirty = False
             self.file_location_registry_current = list(self.file_location_registry_saved)
             self.file_location_registry_dirty = False
