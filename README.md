@@ -4,38 +4,58 @@ CAS Curator is a specialist **The Sims 3 CAS catalogue, review and organisation 
 
 It works with a CC Master Database (MDB) and the validated CAS scanner to help inspect, classify, review and organise Sims 3 CAS custom content.
 
+## Download
+
+The recommended download is the **CAS Curator v1.0.1 installer** from the [v1.0.1 release](https://github.com/Taemaly/CAS-Curator/releases/tag/v1.0.1).
+
+Release packages:
+
+- **`CAS_Curator_v1.0.1_Installer.zip`** — recommended Windows installer. Lets you choose the install location, creates shortcuts, includes an uninstaller, and can launch CAS Curator when setup finishes.
+- **`CAS_Curator_v1.0.1_APP.zip`** — portable compiled application for users who prefer to extract and run the app without installing it.
+- **`CAS_Curator_v1.0.1_SOURCE.zip`** — complete v1.0.1 source package for reference and source-based use.
+- **`CAS_Curator_v1.0.1_THIRD_PARTY_SOURCE.zip`** — corresponding third-party source/licence bundle.
+
 ## What's new in v1.0.1
 
-This update keeps the validated scanner/routing core unchanged while improving:
+v1.0.1 keeps the **frozen scanner core unchanged** while substantially expanding the organisation and review workflow around it.
 
-- Library organisation and filtering
-- Creator metadata and search tools
-- File Location management and safer routing
-- CC Magic Import deployment copies
-- ZIP and Sims3Pack intake
-- Age/Gender display from CASP observations
-- Advanced and Experimental metadata views
-- Table column visibility and editing tools
-- Library layout and panel resizing
-- Themed dialogs and long-path wrapping
-- Dark-theme readability
-- Expanded Scanner Log readability
-- Guide and Manual fields help
+Highlights include:
 
-See `CHANGELOG_v1.0.1.txt` for the full list of changes since v1.0.
+- Profile Rules that remember each Profile's filter view and visible Table columns
+- safer Profile Membership and Experimental Profile Layout workflows with explicit Planned Locations
+- read-only and conflict preflight for Apply Profile Locations, plus stronger rollback cleanup
+- the Experimental Routing Structure Builder with reusable folder structures, preview, sanitising and transactional routing
+- managed File Locations and safer routing/recovery location updates
+- universal **+ Add Quick Filter…** support alongside Status / CC Type / Creator
+- Creator and Converter metadata plus improved package web-search shortcuts
+- persistent column visibility, Select all / Deselect all / Default controls, collapsible column shortcuts and smoother horizontal Table navigation
+- a hideable Details panel and compact Gallery quick-filter toolbar
+- CC Magic Import deployment-copy workflow with live status
+- ZIP preview/extract and conservative Sims3Pack scan intake
+- Age/Gender plus opt-in Advanced and Experimental metadata views
+- resizable Scanner Log, clearer Tools organisation, improved dialogs and updated Guide
+- **About CAS Curator…**, Copy version info, source/support shortcuts and final application icon polish
+
+See [`CHANGELOG_v1.0.1.txt`](CHANGELOG_v1.0.1.txt) for the full user-facing list of changes since v1.0.
 
 ## Safety
 
+- The frozen scanner core used by this release is unchanged.
 - Run Scan does not move source files.
 - Run Routing is an explicit action and can move source files.
-- Experimental metadata is for review only and does not automatically control Routing.
+- Routing duplicate handling was corrected so a package is not treated as a duplicate of its own freshly scanned MDB record.
+- Risk Score is a review value and does not decide routing folders.
+- Experimental scanner-derived metadata is for review only and never automatically controls Routing.
+- Experimental Profile Layouts are separate from scanner metadata. Saving a Planned Location stores only a plan; package files move only through the explicit previewed Apply Profile Locations action.
 - CC Magic Import uses deployment copies and does not replace the organised master package.
-- ZIP extraction is explicit, keeps the original ZIP, rejects unsafe paths, and does not overwrite existing files.
+- ZIP extraction is explicit, keeps the original ZIP, rejects unsafe paths and does not overwrite existing files.
 - RAR and 7Z preview/extraction are intentionally not supported.
 
 ## Running from source
 
-1. Extract the whole CAS Curator folder to a normal writable folder.
+For the complete source package:
+
+1. Extract the whole CAS Curator v1.0.1 source folder to a normal writable folder.
 2. Run `run_CAS_Curator.bat`.
 3. CAS Curator uses a private `.venv` in its own folder.
 4. A supported 64-bit Python 3.10–3.14 installation is required.
@@ -47,10 +67,12 @@ Your existing Sims scanner Python installation can remain unchanged.
 
 Keep backups of important MDBs and custom content. CAS Curator includes safety checks, previews and MDB backups, but any tool that can move files should still be used with normal backup precautions.
 
-## License
+## Source and license
+
+The source is published for visibility and reference, but **CAS Curator is proprietary software, not open-source software**.
 
 Copyright © 2026 Taemaly. All Rights Reserved.
 
-CAS Curator and its source code are proprietary. Copying, modification, redistribution, reuse, or creation of derivative works is not permitted without prior written permission.
+Copying, modification, redistribution, reuse, mirroring, or creation of derivative works is not permitted without prior written permission.
 
-See the `LICENSE` file for full terms.
+See the [`LICENSE`](LICENSE) file for the full terms.
