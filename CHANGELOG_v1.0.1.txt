@@ -1,76 +1,115 @@
-﻿CAS CURATOR v1.0.1 — CHANGES SINCE v1.0
+CAS CURATOR v1.0.1 — CHANGES SINCE v1.0
 ==========================================
 
+Library, profiles and organisation
+----------------------------------
+- Added managed File Locations so packages can be linked to named folders, opened in Explorer and moved between managed locations with verification and rollback safeguards.
+- Added a dedicated Manage Profiles… window with Current Profile selection, package counts, create/rename/delete controls, Profile Rules and Profile Layout controls.
+- Profile Membership now supports multiple Profiles safely. Adding a Profile from the Table no longer replaces existing memberships.
+- Added direct Add to / Remove from Profile controls in the Edit panel, with safeguards for Profile-specific Planned Locations.
+- Added Profile Rules. Each Profile can remember its Library filter view and visible Table columns; switching Current Profile applies that Profile's saved view.
+- Clear Rules now visibly clears the applied Profile Rule view and confirms the action in Manage Profiles.
+- Profile switching now clears the previous profile-view filters before applying the destination Profile's own saved rules.
+- Planned Location is Profile-specific. Setting a non-blank Planned Location automatically adds the Current Profile to Profile Membership when needed; clearing the plan does not remove membership.
+- Current File Location remains the physical truth and is read-only in the Table.
+- Added Experimental Profile Layouts for previewing and explicitly applying Profile-specific Planned Locations.
+- Apply Profile Locations now preflights read-only source packages, destination conflicts and other blocking conditions before moving files.
+- Strengthened Profile Layout rollback/cleanup so incomplete destination copies are removed safely, including read-only copies created during a failed operation.
 
-Library and organisation
+Routing Structure Builder
+-------------------------
+- Added the Experimental Routing Structure Builder for building reusable folder structures from MDB fields such as Creator, CC Type, Subtype, Age, Gender and other supported fields.
+- Added custom fixed folder levels, drag/reorder controls and reusable saved structures.
+- Preview now shows exact relative destinations with readable path display and full-path tooltips.
+- Routing defaults to Selected packages and is available from both Tools and the package right-click menu.
+- Preview updates automatically when the structure changes; Refresh Preview remains available for an explicit refresh.
+- Saved structures are named automatically from their folder hierarchy.
+- Added folder-name sanitising for Windows-invalid characters, reserved names, punctuation-only values, case/sanitised collisions and very long names.
+- Added deterministic suffixes for folder-name collisions and length shortening.
+- Added full destination-path safety checks before routing.
+- Added preflight checks for read-only sources, unwritable destinations, missing sources, destination conflicts and other batch blockers.
+- Routing batches remain transactional: failures roll back earlier moves and MDB location changes.
+- Packages already at their exact destination are reported as Already at destination and are not moved again.
+- Scanner-derived routing fields now resolve safely from stored MDB data without changing the frozen scanner core.
+- Added explicit multi-value Outfit Category handling: Priority match, Combine all categories, or Block package for review.
+- Added compatibility guidance for folder levels so fields that cannot be used in a position are shown unavailable instead of producing invalid structures.
 
-- Added a simpler Status workflow with In Game Use, To Keep, To Review, or blank.
-- Added File Location management so packages can be linked to named folders, opened directly in Explorer, and moved between managed locations with identity/hash checks and rollback safeguards.
-- CAS Curator now records the new File Location after successful routing, and restores safely matched locations when Recover Last Routing puts files back.
-- Improved Profiles with compact assignment controls, Manage Profiles, and multi-select Merge Profiles support.
-- Added a manual Creator field. Creator can be edited per package, filled for several selected packages at once, searched, filtered, and used by the package/creator web-search shortcuts.
-- Added a universal + Add Filter… system. Extra filters can be stacked together, support conditions such as *is*, *contains*, *is blank* and *is not blank*, and work alongside Search and the permanent Status / CC Type / Creator / Profile filters.
-- Added compact CAS / Health / Organise column show/hide shortcuts while keeping the full Columns chooser for individual columns.
-- Column visibility choices persist between sessions.
-- Added safer Table editing tools including fill-down for displayed rows and guarded Delete Record handling. Deleting an MDB record does not delete the physical package file.
-- Added package right-click shortcuts including Open File Location, Search Web for Package, and Search Web for Creator when a Creator is available.
+Filters, columns and Table workflow
+-----------------------------------
+- Added a universal + Add Quick Filter… system for stacking extra column filters alongside the permanent Status / CC Type / Creator filters.
+- Added manual Creator and Converter fields and made them available to filtering, Table editing and routing where appropriate.
+- Added reusable per-Profile view rules while keeping ordinary Library filtering temporary.
+- Added compact CAS / Health / Organise column shortcut groups.
+- The column shortcut row can now be collapsed completely and restored from a small control in the Table header.
+- Added Columns → Choose visible columns… with Select all, Deselect all and Default; visibility choices persist between sessions.
+- Thumbnail is handled as a normal optional Table column.
+- Added smoother per-pixel horizontal Table scrolling plus small left/right nudge controls.
+- Added an optional Freeze Package mode so the Package name can remain visible during horizontal scrolling.
+- Added safer multi-row field clearing and staged record deletion. Physical package files are never deleted by the Library-record delete action.
+- Current File Location is protected from direct Table editing.
+- Improved CC Type wording in the interface and routing output: Tops, Bottoms and Full Body.
 
+Gallery and Library interface
+-----------------------------
+- Simplified the Gallery quick-filter strip to Thumbnail, Pinned and Unsaved.
+- Gallery Clear is now a separate utility action on the right and only appears while a Gallery quick filter is active.
+- Reduced Gallery filter controls to a compact mini-toolbar instead of a full-height button row.
+- Added a hide/show Details control for the right-side Library panel; the hidden state uses a compact restore arrow and is remembered.
+- Improved normal-window Table side-panel resizing and general splitter usability.
+- Scanner Log is resizable and adapts correctly to window size.
+- Reworked Tools into clearer categories for Scanning, Routing, Profiles & Locations, Library / Maintenance, Online / Attribution and Help.
+- Improved Library header spacing and alignment while preserving the full-width Table/Gallery layout.
+- Current Profile remains fixed-width to avoid collisions with neighbouring controls; long names remain available through the tooltip.
+- Improved themed dialogs, long-path wrapping and readability across light and dark themes.
+
+Scan, archive and intake
+------------------------
+- Fixed routing duplicate detection so packages just written by Run Scan are not mistaken for duplicates of themselves.
+- Removed Safe / Moderate / High / Extreme risk folders from physical routing. Risk Score remains a review value rather than a routing decision.
+- Automatic scanner thumbnails remain in a Thumbnails folder beside the MDB; matching hash-named thumbnails can be resolved when the MDB and thumbnail folder are moved together.
+- Added ZIP preview/extract support with unsafe-path rejection, no overwriting and preservation of the original ZIP.
+- ZIPs discovered during Run Scan can be extracted beside the original archive so extracted packages can join the same scan.
+- Added conservative Sims3Pack analysis during Scan without modifying the original Sims3Pack.
+- CASpart Sims3Packs can optionally extract missing embedded CAS package copies; exact standalone duplicates are not extracted again.
+- Multi-part CAS Sims3Packs are handled as one set, while lots, worlds, Sims/households, patterns, objects and unknown/mixed Sims3Packs remain protected and packed.
+- Added a pre-scan MDB compatibility check with a verified compatible-copy option when spreadsheet-specific OOXML extensions would otherwise be unsafe for the scanner.
+- Scan progress now includes a finalising stage so 100% is reached only when saving/refreshing is complete.
 
 CC Magic Import
+---------------
+- Added a configurable CC Magic Import destination.
+- Copy Selected to CC Magic Import… is copy-only: the organised master package remains in place and its File Location is unchanged.
+- Added live read-only CC Magic Import status, including in Import, not in Import and conflict states.
+- CC Magic Import status can be used in filters and refreshes after copy operations or external Import-folder changes.
 
-- Added a separate, configurable CC Magic Import destination.
-- Copy Selected to CC Magic Import… is copy-only: the organised master package remains in place and its File Location is not changed.
-- Added a live, read-only CC Magic Import status that reflects the real Import folder, including states such as in Import, not in Import and conflict.
-- CC Magic Import status can be used with + Add Filter… and refreshes after copy operations and external folder changes.
-- Once CC Magic processes content out of the Import folder, use CC Magic itself to manage or remove it; CAS Curator does not delete files from CC Magic-managed storage.
-
-
-Scan and archive intake
-
-- Added ZIP preview/extract support. ZIPs can be inspected before extraction, unsafe paths are rejected, existing files are not overwritten, and the original ZIP is kept.
-- When ZIPs are found during Run Scan, CAS Curator can extract them beside the original archives first so newly extracted packages join the same scan.
-- Added conservative Sims3Pack analysis during Scan. CAS Curator reads the manifest without modifying the original Sims3Pack.
-- CASpart Sims3Packs can optionally have missing embedded CAS package copies extracted beside the original. Exact standalone duplicates are detected by SHA-256 and are not extracted again.
-- Multi-part CAS Sims3Packs are handled as one set, with each embedded package checked separately and missing parts extracted together.
-- Lots, worlds, Sims/households, patterns, objects and unknown/mixed Sims3Packs remain protected and packed for normal intact routing.
-- Added a pre-scan MDB compatibility check for workbooks containing spreadsheet-specific OOXML extensions that the scanner cannot safely parse. CAS Curator can create and verify a separate compatible copy while leaving the original workbook untouched.
-- Normal Run Scan no longer asks for an unnecessary generic Yes/No confirmation after validation. Decision prompts still appear when a real choice is required, such as ZIP/Sims3Pack handling or MDB compatibility.
-- Scan progress now has a finalising stage so 100% is reached only when saving/refreshing is complete, and a large completion/log window no longer opens automatically.
-
-
-Routing and safety
-
-- Added a pre-routing scan-state check that distinguishes packages that are Ready, Changed since scan / not verifiable, or Not in MDB.
-- When attention is required, the warning itself is the decision point: Run Scan First, Continue Routing Anyway, or Cancel. Continuing no longer produces a second duplicate confirmation.
-- Successful routing now records exact routed locations back to safely matched MDB rows.
-- Recover Last Routing restores safely matched File Location values together with the recovered files.
-- Fixed image passthrough routing so images retain the selected source-folder name under IMAGES rather than being flattened directly into the IMAGES root.
-- Added an Open folder shortcut beside the configured Sort destination.
-
-
-Metadata and review tools
-
-- Age and Gender are now normal read-only metadata derived from direct CASP observations when available.
-- CASP linking is more resilient for older/routed records by falling back to direct CASP Instance IDs when the package-name link is stale.
-- Added opt-in Advanced features for trusted technical fields such as Biggest Texture, HQ Warning, Poly Warning, textual Risk, Duplicate Files, CASP Instance IDs, Health Issues, Last Scanned and Package Hash.
-- Added opt-in Experimental features for provisional Subtype, Skin Type, Outfit Category and EA Resource Status information.
-- Experimental fields are display/review aids only. They do not automatically control Routing or modify package files.
+Metadata and review
+-------------------
+- Added Age and Gender as normal read-only metadata when direct CASP observations are available.
+- Added opt-in Advanced fields for trusted technical information and opt-in Experimental fields for provisional review data such as Subtype, Skin Type, Outfit Category and EA Resource Status.
+- Experimental scanner-derived metadata remains review-only and never changes routing automatically.
+- CASP linking is more resilient for older/routed records by falling back to direct CASP Instance IDs when package-name links are stale.
 - Package Format can appear in Overview when available without adding another sparse Table column.
 
+Routing and recovery safety
+---------------------------
+- Added a pre-routing scan-state check that distinguishes Ready, Changed since scan / not verifiable, and Not in MDB packages.
+- Routing warnings now provide the decision directly: Run Scan First, Continue Routing Anyway, or Cancel.
+- Successful routing records exact routed locations back to safely matched MDB rows.
+- Recover Last Routing restores safely matched File Location values together with recovered files.
+- Fixed image passthrough routing so images retain the selected source-folder name under IMAGES.
+- Added an Open folder shortcut beside the configured Sort destination.
 
-Interface and readability
-
-- General UI polish improved resizing, layout consistency, readability and theme behaviour across Library, Scan, Guide and supporting windows.
-- Library is now the single place to create, open or change the active Master Database. Scan shows that same MDB read-only and always writes to it.
-- Improved dialog handling for long messages and Windows paths, with more consistent sizing, wrapping and centring.
-- Added the teal-green CAS Curator package/check application icon for the title bar/taskbar.
-- Updated the Guide and simplified Manual fields help to reflect the current workflows in plain language.
+Help and release information
+----------------------------
+- Updated the in-app Guide to match the final v1.0.1 workflows and terminology.
+- Added Help → About CAS Curator… with version, build date, creator and source/support information.
+- Added Copy version info and a View Source Code shortcut.
+- User-facing wording now consistently distinguishes temporary Quick Filters, saved Profile Rules, Profile Membership, Current File Location and Planned Location.
 
 Compatibility and safety notes
-
-- The frozen scanner core remains unchanged by these additions.
-- Existing routing classification decisions remain conservative; new Experimental metadata never changes Routing automatically.
-- Managed locations are explicit actions only — CAS Curator does not add background folder watching or automatic movement.
-- ZIP is the supported archive preview/extract format; RAR and 7Z are not supported.
+------------------------------
+- The frozen scanner core is unchanged in v1.0.1.
+- Existing scanner/routing classifications remain conservative; new Experimental metadata never changes routing automatically.
+- Managed locations and Profile Layouts are explicit actions only. Selecting or filtering a Profile never moves files.
+- ZIP is the supported archive preview/extract format. RAR and 7Z are not supported.
 - CC Magic Import remains a deployment-copy workflow and is deliberately separate from the master package's File Location.
-
