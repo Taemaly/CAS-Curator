@@ -1,0 +1,17 @@
+CAS Curator v1.0.1 — SHA-256 checksums
+=======================================
+
+CAS_Curator_v1.0.1_Installer.zip
+cecd3178c8b51574a34aeddc0e0343744220fbb2dc5b5da52e80a75cb29d6b5d
+
+CAS_Curator_v1.0.1_APP.zip
+69cc8f907136344e093c81f30bfd053bdc5f5009735bee1f851175ea7ea8375a
+
+CAS_Curator_v1.0.1_SOURCE.zip
+8597a9d61c2e007e9a8f4700ef844e6553b6574a5c8d9b7e90cd9ce5f5598cd0
+
+CAS_Curator_v1.0.1_THIRD_PARTY_SOURCE.zip
+72e9d22ede07c00b6aed8979dfaec582206e952d440ff82b6b7885410dce6650
+
+Installer Setup EXE contained in CAS_Curator_v1.0.1_Installer.zip
+78be04b3ae5d025128eaed434dd388dc616bff689c93e0a2496640549099c32b
