@@ -75,12 +75,12 @@ Scan, archive and intake
 - Added a pre-scan MDB compatibility check with a verified compatible-copy option when spreadsheet-specific OOXML extensions would otherwise be unsafe for the scanner.
 - Scan progress now includes a finalising stage so 100% is reached only when saving/refreshing is complete.
 
-CC Magic Import
----------------
-- Added a configurable CC Magic Import destination.
-- Copy Selected to CC Magic Import… is copy-only: the organised master package remains in place and its File Location is unchanged.
-- Added live read-only CC Magic Import status, including in Import, not in Import and conflict states.
-- CC Magic Import status can be used in filters and refreshes after copy operations or external Import-folder changes.
+Convenience tools
+-----------------
+- Added a configurable folder for CC Magic Import.
+- Added a convenience action to copy selected packages to that folder; the organised master package remains in place and its File Location is unchanged.
+- The Library can show read-only status for whether a package is present in the configured Import folder, including conflict states.
+- That status can be filtered and refreshed after copy operations or external changes to the folder.
 
 Metadata and review
 -------------------
@@ -112,4 +112,4 @@ Compatibility and safety notes
 - Existing scanner/routing classifications remain conservative; new Experimental metadata never changes routing automatically.
 - Managed locations and Profile Layouts are explicit actions only. Selecting or filtering a Profile never moves files.
 - ZIP is the supported archive preview/extract format. RAR and 7Z are not supported.
-- CC Magic Import remains a deployment-copy workflow and is deliberately separate from the master package's File Location.
+- Copying packages to the configured CC Magic Import folder is copy-only and remains separate from the master package's File Location.
