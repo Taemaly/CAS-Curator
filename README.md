@@ -30,11 +30,11 @@ Highlights include:
 - Creator and Converter metadata plus improved package web-search shortcuts
 - persistent column visibility, Select all / Deselect all / Default controls, collapsible column shortcuts and smoother horizontal Table navigation
 - a hideable Details panel and compact Gallery quick-filter toolbar
-- CC Magic Import deployment-copy workflow with live status
-- ZIP preview/extract and conservative Sims3Pack scan intake
 - Age/Gender plus opt-in Advanced and Experimental metadata views
 - resizable Scanner Log, clearer Tools organisation, improved dialogs and updated Guide
 - **About CAS Curator…**, Copy version info, source/support shortcuts and final application icon polish
+
+Additional convenience tools include copying selected packages to a configured CC Magic Import folder, ZIP preview/extraction, and conservative Sims3Pack scan intake.
 
 See [`CHANGELOG_v1.0.1.txt`](CHANGELOG_v1.0.1.txt) for the full user-facing list of changes since v1.0.
 
@@ -47,7 +47,7 @@ See [`CHANGELOG_v1.0.1.txt`](CHANGELOG_v1.0.1.txt) for the full user-facing list
 - Risk Score is a review value and does not decide routing folders.
 - Experimental scanner-derived metadata is for review only and never automatically controls Routing.
 - Experimental Profile Layouts are separate from scanner metadata. Saving a Planned Location stores only a plan; package files move only through the explicit previewed Apply Profile Locations action.
-- CC Magic Import uses deployment copies and does not replace the organised master package.
+- Copying selected packages to the configured CC Magic Import folder uses copies and does not replace the organised master package.
 - ZIP extraction is explicit, keeps the original ZIP, rejects unsafe paths and does not overwrite existing files.
 - RAR and 7Z preview/extraction are intentionally not supported.
 
