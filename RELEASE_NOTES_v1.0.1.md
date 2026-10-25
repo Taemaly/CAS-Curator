@@ -28,11 +28,11 @@ Users who prefer a portable build can use **`CAS_Curator_v1.0.1_APP.zip`** inste
 - Added Creator and Converter metadata and improved package web-search shortcuts.
 - Added persistent column visibility controls, collapsible column shortcuts and smoother horizontal Table navigation.
 - Added a hideable Details panel and compact Gallery quick-filter toolbar.
-- Added CC Magic Import deployment-copy support with live status.
-- Added ZIP preview/extract and conservative Sims3Pack scan intake.
 - Added Age/Gender plus opt-in Advanced and Experimental metadata views.
 - Improved Scanner Log resizing, dialogs, theme readability, Tools organisation and the built-in Guide.
 - Added **About CAS Curator…**, Copy version info and source/support shortcuts.
+
+Additional convenience tools include copying selected packages to a configured CC Magic Import folder, ZIP preview/extraction, and conservative Sims3Pack scan intake.
 
 ## Safety and compatibility
 
@@ -41,7 +41,7 @@ Users who prefer a portable build can use **`CAS_Curator_v1.0.1_APP.zip`** inste
 - Routing and Profile Location moves remain explicit user actions.
 - Experimental scanner-derived metadata never automatically controls Routing.
 - Profile Rules and selecting/filtering a Profile never move package files.
-- CC Magic Import remains a copy-only deployment workflow separate from the organised master package.
+- Copying selected packages to the configured CC Magic Import folder uses copies and does not replace the organised master package.
 - ZIP is the supported archive preview/extract format; RAR and 7Z are not supported.
 
 See [`CHANGELOG_v1.0.1.txt`](CHANGELOG_v1.0.1.txt) for the complete user-facing change list.
