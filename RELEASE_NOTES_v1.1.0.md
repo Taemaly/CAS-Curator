@@ -34,16 +34,16 @@ Pinned items now use compact one-line chips with full-name tooltips, a five-pin 
 - Theme Colour Studio and Guide scaling/polish improvements
 - small Ukrainian flag added to About
 
-For the complete list, see `CHANGELOG_v1.1.0.md`.
+For the complete list, see `CHANGELOG.md`.
 
 ## First launch
 
 Run:
 
-`run_CAS_Curator.bat`
+`run_CAS_Curator_v1.1.0.bat`
 
 CAS Curator uses a private Python environment in its own folder. The first launch may take longer while required GUI components are installed; later launches are normally much faster.
 
 ### Windows console note
 
-During a first-time source launch, avoid clicking/dragging inside the black Command Prompt window. On some Windows setups this can enter Select mode and pause the installation. If that happens, press **Esc** to leave Select mode and allow startup to continue.
+During a first-time install, avoid clicking/dragging inside the black Command Prompt window. On some Windows setups this can enter Select mode and pause the installation. If that happens, press **Esc** to leave Select mode and allow startup to continue.
