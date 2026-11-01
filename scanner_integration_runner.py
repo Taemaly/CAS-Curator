@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--mdb", required=True)
     parser.add_argument("--mode", choices=["INDIVIDUAL", "BIG_REVIEW_BATCH", "THUMBNAIL_BACKFILL"], default="INDIVIDUAL")
     parser.add_argument("--edition", choices=["DEV", "PUBLIC"], default=os.environ.get("CAS_CURATOR_EDITION", default_edition).upper())
+    parser.add_argument("--create-report", choices=["0", "1"], default="1")
     parser.add_argument("--preview-routing", action="store_true")
     parser.add_argument("--real-routing", action="store_true")
     parser.add_argument("--routing-root", default="")
@@ -38,6 +39,7 @@ def main():
     os.environ["S3CC_SCAN_MODE"] = args.mode
     os.environ["S3CC_MASTER_DATABASE"] = str(mdb)
     os.environ["S3CC_MOVE_FILES"] = "1" if args.real_routing else "0"
+    os.environ["S3CC_CREATE_SCAN_REPORT"] = args.create_report
 
     if args.preview_routing:
         preview_workdir = Path(args.preview_workdir).resolve() if args.preview_workdir else (Path(__file__).resolve().parent / "routing_preview_runs")
@@ -61,6 +63,8 @@ def main():
     if args.edition == "PUBLIC":
         print("GUI INTEGRATION RUNNER: conservative CAS-only guidance enabled; script/gameplay mods are outside supported scan scope")
     print("GUI INTEGRATION RUNNER: source moves ENABLED" if args.real_routing else "GUI INTEGRATION RUNNER: source moves disabled")
+    if not args.preview_routing and not args.real_routing:
+        print("GUI INTEGRATION RUNNER: optional scan report %s" % ("enabled" if args.create_report == "1" else "disabled"))
     if args.real_routing:
         print("GUI INTEGRATION RUNNER: ROUTING ENABLED")
         print("GUI INTEGRATION RUNNER: routing root=%s" % routing_root)
