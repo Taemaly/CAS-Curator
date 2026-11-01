@@ -16,7 +16,7 @@ from PySide6.QtGui import QDrag, QFont, QIcon, QPixmap, QPainter, QColor, QPalet
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QGridLayout,
     QHBoxLayout, QInputDialog, QLabel, QMessageBox, QPushButton,
-    QScrollArea, QSizePolicy, QStyle, QStyleOptionButton, QTabWidget, QVBoxLayout, QWidget,
+    QScrollArea, QSizePolicy, QSplitter, QStyle, QStyleOptionButton, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from theme_studio_core import (
@@ -89,9 +89,9 @@ class PaletteSwatch(QFrame):
     def __init__(self, colour: str, parent=None):
         super().__init__(parent)
         self.colour = colour
-        self.setFixedSize(42, 34)
+        self.setFixedSize(30, 24)
         self.setToolTip(f"{colour} — drag onto a colour section below")
-        self.setStyleSheet(f"background: {colour}; border: 2px solid #59606B; border-radius: 5px;")
+        self.setStyleSheet(f"background: {colour}; border: 2px solid #59606B; border-radius: 4px;")
 
     def mouseMoveEvent(self, event):
         if event.buttons() & Qt.LeftButton:
@@ -210,10 +210,18 @@ class PreviewCanvas(QWidget):
         self.section = section
         self.on_role_click = on_role_click
         self.painted = []
-        self.setMinimumWidth(310)
+        # TEST_064: keep the live preview as a compact visual sample rather
+        # than two near-full-size mini applications. This lets Current Saved
+        # and Your Edits fit side-by-side without nested scrollbars when the
+        # Studio is maximised, while every preview surface remains clickable.
+        self.setMinimumWidth(270)
+        preview_font = self.font()
+        if preview_font.pointSizeF() > 0:
+            preview_font.setPointSizeF(max(7.5, preview_font.pointSizeF() * 0.84))
+            self.setFont(preview_font)
         root = QVBoxLayout(self)
-        root.setContentsMargins(5, 5, 5, 5)
-        root.setSpacing(5)
+        root.setContentsMargins(3, 3, 3, 3)
+        root.setSpacing(3)
         if section == 'Library':
             self._build_library(root)
         elif section == 'Scan':
@@ -222,7 +230,7 @@ class PreviewCanvas(QWidget):
             self._build_guide(root)
         root.addStretch(1)
 
-    def block(self, parent_layout, role, title=None, height=0, border_role=None, margins=5, fixed_border=None):
+    def block(self, parent_layout, role, title=None, height=0, border_role=None, margins=4, fixed_border=None):
         frame = PreviewRoleFrame(role, self.on_role_click, self, border_role=border_role)
         frame.setObjectName('StudioBlock' + str(len(self.painted)))
         if border_role:
@@ -234,7 +242,7 @@ class PreviewCanvas(QWidget):
             frame.setToolTip(f'Click to jump to Theme Studio section: {ROLES.get(role, role)}')
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(margins, margins, margins, margins)
-        layout.setSpacing(4)
+        layout.setSpacing(2)
         if height:
             frame.setMinimumHeight(height)
         parent_layout.addWidget(frame)
@@ -251,7 +259,7 @@ class PreviewCanvas(QWidget):
         frame.setAttribute(Qt.WA_NoMousePropagation, True)
         frame.setToolTip(note or 'This surface uses a fixed app colour and has no Theme Studio colour section.')
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(5, 5, 5, 5)
+        layout.setContentsMargins(4, 3, 4, 3)
         layout.setSpacing(0)
         if height:
             frame.setMinimumHeight(height)
@@ -280,7 +288,7 @@ class PreviewCanvas(QWidget):
         return lab
 
     def _top(self, root):
-        top = self.block(root, 'ui_top_fill', height=42, fixed_border='#B7B7B7')
+        top = self.block(root, 'ui_top_fill', height=34, fixed_border='#B7B7B7')
         nav = QHBoxLayout()
         nav.setSpacing(4)
         self.write(nav, 'CAS CURATOR', 'ui_top_fill', bold=True)
@@ -292,7 +300,7 @@ class PreviewCanvas(QWidget):
         # the panel colour.
         for caption in ('Library', 'Scan', 'Guide'):
             self.block(
-                nav, 'ui_filter_button', caption, height=26, margins=3,
+                nav, 'ui_filter_button', caption, height=19, margins=3,
                 fixed_border='#BEBEBE'
             )
         top.addLayout(nav)
@@ -302,7 +310,7 @@ class PreviewCanvas(QWidget):
         # The MDB area and the path interior share ui_top_fill.  Only the
         # nested path outline uses ui_mdb_path_border, matching the real app:
         # the path has no independent fill colour of its own.
-        mdb = self.block(root, 'ui_top_fill', height=38)
+        mdb = self.block(root, 'ui_top_fill', height=32)
         mdb_row = QHBoxLayout()
         mdb_row.setSpacing(5)
         self.write(mdb_row, 'Opened Master Database:', 'ui_top_fill', bold=True)
@@ -318,22 +326,22 @@ class PreviewCanvas(QWidget):
         path_layout.setContentsMargins(6, 3, 6, 3)
         path_layout.setSpacing(0)
         self.write(path_layout, 'D:\\Sims3\\Library.xlsx', 'ui_top_fill')
-        path_frame.setMinimumHeight(27)
+        path_frame.setMinimumHeight(23)
         mdb_row.addWidget(path_frame, 1)
         mdb.addLayout(mdb_row)
         self.painted.append((path_frame, 'ui_top_fill', 'ui_mdb_path_border', None, None))
         # Toolbar and Search/filter areas intentionally share ui_top_fill.
         # The actual buttons remain a separate ui_filter_button role.
-        filters = self.block(root, 'ui_top_fill', height=88, border_role='ui_scrollbar_color')
+        filters = self.block(root, 'ui_top_fill', height=72, border_role='ui_scrollbar_color')
         self.write(filters, 'Packages: 10,369    Thumbnails: 9,191', 'ui_top_fill', bold=True, muted=True)
         filterrow = QHBoxLayout()
         # Search/input backgrounds are fixed white in app.py; do not pretend
         # ui_header_fill controls them. This was the main v0.4.71 mis-map.
         self.fixed_block(
-            filterrow, 'Search packages…', height=29,
+            filterrow, 'Search packages…', height=20,
             note='Search field fill is fixed white in CAS Curator. Click the surrounding filter panel or coloured filter button to edit those roles.'
         )
-        self.block(filterrow, 'ui_filter_button', 'Category ▾', height=29, fixed_border='#BEBEBE')
+        self.block(filterrow, 'ui_filter_button', 'Category ▾', height=20, fixed_border='#BEBEBE')
         filters.addLayout(filterrow)
         # ui_header_fill is used by real header/pinned-tab surfaces, not by the
         # white Search field. Give it its own honest preview target.
@@ -342,59 +350,59 @@ class PreviewCanvas(QWidget):
         # strip colour role rather than leaving the user to find the row.
         self.block(
             filters, 'ui_header_fill', 'Library header strip / pinned tab',
-            height=24, fixed_border='#B7B7B7'
+            height=20, fixed_border='#B7B7B7'
         )
 
         middle = QHBoxLayout()
         middle.setSpacing(5)
-        table = self.block(middle, 'ui_main_fill', height=228, fixed_border='#D6D6D6')
-        self.block(table, 'ui_table_header_fill', 'Package                 Type         Status', height=28, fixed_border='#B7B7B7')
-        self.block(table, 'ui_main_fill', '001   Cloudy Hair        Hair         Safe', height=33, fixed_border='#D6D6D6')
-        self.block(table, 'ui_row_alt', '002   Rose Dress          Outfit      Safe', height=33, fixed_border='#D6D6D6')
-        self.block(table, 'ui_main_fill', '003   Berry Liner        Makeup    Review', height=33, fixed_border='#D6D6D6')
-        self.block(table, 'ui_row_alt', '004   Cottage Shoes    Shoes       Safe', height=33, fixed_border='#D6D6D6')
+        table = self.block(middle, 'ui_main_fill', height=184, fixed_border='#D6D6D6')
+        self.block(table, 'ui_table_header_fill', 'Package                 Type         Status', height=23, fixed_border='#B7B7B7')
+        self.block(table, 'ui_main_fill', '001   Cloudy Hair        Hair         Safe', height=27, fixed_border='#D6D6D6')
+        self.block(table, 'ui_row_alt', '002   Rose Dress          Outfit      Safe', height=27, fixed_border='#D6D6D6')
+        self.block(table, 'ui_main_fill', '003   Berry Liner        Makeup    Review', height=27, fixed_border='#D6D6D6')
+        self.block(table, 'ui_row_alt', '004   Cottage Shoes    Shoes       Safe', height=27, fixed_border='#D6D6D6')
 
-        side = self.block(middle, 'ui_side_fill', height=228, fixed_border='#CFCFCF')
+        side = self.block(middle, 'ui_side_fill', height=184, fixed_border='#CFCFCF')
         self.write(side, 'Selected CC', 'ui_side_fill', bold=True)
-        self.block(side, 'ui_thumb_fill', 'PREVIEW', height=56, border_role='ui_info_card_border')
-        self.block(side, 'ui_tab_fill', 'Inactive detail tab', height=28, fixed_border='#C7C7C7')
-        self.block(side, 'ui_tab_selected_fill', 'Selected detail tab', height=28, fixed_border='#C7C7C7')
-        self.block(side, 'ui_info_card_fill', 'Hair collection\nProfile: Testing', height=52, border_role='ui_info_card_border')
+        self.block(side, 'ui_thumb_fill', 'PREVIEW', height=46, border_role='ui_info_card_border')
+        self.block(side, 'ui_tab_fill', 'Inactive detail tab', height=23, fixed_border='#C7C7C7')
+        self.block(side, 'ui_tab_selected_fill', 'Selected detail tab', height=23, fixed_border='#C7C7C7')
+        self.block(side, 'ui_info_card_fill', 'Hair collection\nProfile: Testing', height=42, border_role='ui_info_card_border')
         root.addLayout(middle)
 
         scrollbar = QHBoxLayout()
         scrollbar.addStretch(1)
-        self.block(scrollbar, 'ui_scrollbar_color', 'scrollbar', height=10, fixed_border='transparent', margins=1)
+        self.block(scrollbar, 'ui_scrollbar_color', 'scrollbar', height=8, fixed_border='transparent', margins=1)
         root.addLayout(scrollbar)
 
     def _build_scan(self, root):
         self._top(root)
-        page = self.block(root, 'ui_scan_page_fill', 'CAS Health Scanner', height=288, fixed_border='transparent')
+        page = self.block(root, 'ui_scan_page_fill', 'CAS Health Scanner', height=238, fixed_border='transparent')
         # For custom themes ui_info_card_border is the shared Scan structural
         # border role; centre clicks select the relevant fill, edge clicks select
         # Structural borders.
-        card = self.block(page, 'ui_scan_card_fill', '1. Scan setup', height=165, border_role='ui_info_card_border')
+        card = self.block(page, 'ui_scan_card_fill', '1. Scan setup', height=135, border_role='ui_info_card_border')
         for label in ('Source folder:', 'Master database:'):
-            joined = self.block(card, 'ui_scan_row_fill', height=45, border_role='ui_info_card_border')
+            joined = self.block(card, 'ui_scan_row_fill', height=37, border_role='ui_info_card_border')
             self.write(joined, label, 'ui_scan_row_fill', muted=True)
             row = QHBoxLayout()
-            self.block(row, 'ui_scan_input_fill', 'C:\\Sims3\\Packages\\…', height=22, fixed_border='#AFAFAF')
-            self.block(row, 'ui_scan_button_fill', 'Browse', height=22, fixed_border='#AFAFAF')
+            self.block(row, 'ui_scan_input_fill', 'C:\\Sims3\\Packages\\…', height=19, fixed_border='#AFAFAF')
+            self.block(row, 'ui_scan_button_fill', 'Browse', height=19, fixed_border='#AFAFAF')
             joined.addLayout(row)
-        self.block(page, 'ui_scan_button_fill', 'Preview scan', height=31, fixed_border='#AFAFAF')
-        self.block(page, 'ui_scan_log_fill', 'Scanner output\nPreparing scan…\nNo package files have been changed.', height=83, fixed_border='#AFAFAF')
-        self.block(page, 'ui_scan_progress_fill', '  0 / 100 scanned', height=24, fixed_border='#AFAFAF')
+        self.block(page, 'ui_scan_button_fill', 'Preview scan', height=26, fixed_border='#AFAFAF')
+        self.block(page, 'ui_scan_log_fill', 'Scanner output\nPreparing scan…\nNo package files have been changed.', height=68, fixed_border='#AFAFAF')
+        self.block(page, 'ui_scan_progress_fill', '  0 / 100 scanned', height=20, fixed_border='#AFAFAF')
 
     def _build_guide(self, root):
         self._top(root)
-        page = self.block(root, 'ui_guide_page_fill', 'CAS Curator Guide', height=315, fixed_border='transparent')
-        nav = self.block(page, 'ui_guide_card_fill', 'Quick navigation', height=66, border_role='ui_guide_border')
+        page = self.block(root, 'ui_guide_page_fill', 'CAS Curator Guide', height=265, fixed_border='transparent')
+        nav = self.block(page, 'ui_guide_card_fill', 'Quick navigation', height=54, border_role='ui_guide_border')
         self.write(nav, 'Library  •  Scan  •  Routing  •  Themes', 'ui_guide_card_fill', muted=True)
-        browser = self.block(page, 'ui_guide_browser_fill', 'Getting started', height=205, border_role='ui_guide_border')
-        self.block(browser, 'ui_guide_section_fill', 'What CAS Curator Can Do', height=30, border_role='ui_guide_border')
-        self.block(browser, 'ui_guide_highlight_1', 'Where to find it: Library / Scan / Tools', height=28, border_role='ui_guide_border')
-        self.block(browser, 'ui_guide_highlight_2', 'Tip / explanation highlight', height=28, border_role='ui_guide_border')
-        self.block(browser, 'ui_guide_highlight_3', 'Important / caution highlight', height=28, border_role='ui_guide_border')
+        browser = self.block(page, 'ui_guide_browser_fill', 'Getting started', height=168, border_role='ui_guide_border')
+        self.block(browser, 'ui_guide_section_fill', 'What CAS Curator Can Do', height=25, border_role='ui_guide_border')
+        self.block(browser, 'ui_guide_highlight_1', 'Where to find it: Library / Scan / Tools', height=23, border_role='ui_guide_border')
+        self.block(browser, 'ui_guide_highlight_2', 'Tip / explanation highlight', height=23, border_role='ui_guide_border')
+        self.block(browser, 'ui_guide_highlight_3', 'Important / caution highlight', height=23, border_role='ui_guide_border')
 
     def apply_colours(self, roles):
         for widget, role, border_role, typ, fixed_border in self.painted:
@@ -422,6 +430,11 @@ class ThemeStudio(QDialog):
         self.main = main_window
         self.setObjectName('ThemeStudio')
         self.setWindowTitle('Theme Colour Studio')
+        # TEST_063: make Theme Colour Studio behave like a normal resizable
+        # Windows tool window. QDialog does not always expose a Maximize button
+        # by default, so opt in explicitly; users can then maximise/restore it
+        # from the title bar while the existing scroll areas handle small screens.
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
         # Keep the modal usable on laptops and Windows high-DPI displays.
         # The editor body can scroll; the save/footer bar cannot.
         self.setMinimumSize(780, 460)
@@ -457,43 +470,39 @@ class ThemeStudio(QDialog):
         self._original_colour_library_rows = True
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 9, 10, 9)
+        outer.setContentsMargins(10, 9, 10, 5)
         outer.setSpacing(7)
         caption = QLabel('Import a palette or create your own swatches using the colour wheel, then assign colours to sections. '
                          'Preview changes before saving. Built-in themes are never editable.', self)
         caption.setWordWrap(True)
         outer.addWidget(caption)
-        first = QHBoxLayout()
-        first.addWidget(QLabel('Custom theme:'))
+        # TEST_063: create the theme-selection controls here, but place them
+        # above the Live Preview on the right rather than consuming two full-width
+        # rows above both panes. This gives the left editor more uninterrupted
+        # vertical space for palette and Colourable Sections work.
         self.theme_picker = QComboBox(self)
         self.theme_picker.setMinimumWidth(235)
         for name in sorted(self.main.custom_theme_files, key=str.casefold):
             self.theme_picker.addItem(name)
         self.theme_picker.currentTextChanged.connect(self._source_changed)
-        first.addWidget(self.theme_picker)
+
         self.manage_themes_button = QPushButton('Manage Themes…', self)
         _set_button_icon(self.manage_themes_button, 'SP_FileDialogDetailedView', 'SP_DialogOpenButton')
         self.manage_themes_button.setToolTip('Import themes or palettes, manage custom themes, export a backup, open the theme folder, or reload themes.')
         self.manage_themes_button.clicked.connect(self.open_manage_themes_menu)
-        first.addWidget(self.manage_themes_button)
-        first.addStretch(1)
-        self.source_label = QLabel('')
-        first.addWidget(self.source_label)
-        outer.addLayout(first)
+        self.manage_themes_button.setFixedHeight(28)
 
-        row_style_line = QHBoxLayout()
+        self.source_label = QLabel('')
+        self.source_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
         self.colour_library_rows_check = QCheckBox('Colour Library rows with this custom theme', self)
         self.colour_library_rows_check.setToolTip(
             'On: Library rows use this custom theme’s Main table background and Alternating table rows colours. '
             'Off: Library rows use the normal neutral white/grey treatment used by built-in themes.'
         )
         self.colour_library_rows_check.toggled.connect(self._colour_library_rows_changed)
-        row_style_line.addWidget(self.colour_library_rows_check)
         row_style_hint = QLabel('Turn off for default neutral rows.', self)
         row_style_hint.setStyleSheet('color: #5A6871;')
-        row_style_line.addWidget(row_style_hint)
-        row_style_line.addStretch(1)
-        outer.addLayout(row_style_line)
 
         body_widget = QWidget(self)
         content = QHBoxLayout(body_widget)
@@ -508,50 +517,78 @@ class ThemeStudio(QDialog):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(8, 7, 8, 7)
         left_layout.setSpacing(6)
+        # Palette and Colourable Sections share a user-resizable vertical splitter.
+        # Earlier builds fixed the palette at 132 px and left the role list with
+        # only a 190 px minimum, which could show roughly one editable row at a
+        # time at 125% scaling. Keep both panes useful, let the user drag the
+        # divider, and remember their preferred balance.
+        self.editor_splitter = QSplitter(Qt.Vertical, left)
+        self.editor_splitter.setObjectName('ThemeStudioEditorSplitter')
+        self.editor_splitter.setChildrenCollapsible(False)
+        self.editor_splitter.setHandleWidth(7)
+
+        palette_panel = QFrame()
+        palette_panel.setObjectName('ThemeStudioPalettePanel')
+        palette_layout = QVBoxLayout(palette_panel)
+        palette_layout.setContentsMargins(0, 0, 0, 0)
+        palette_layout.setSpacing(3)
+
         # Keep the palette title on its own compact row so it remains fully
         # readable at Windows 125–150% scaling. The three palette actions sit
         # directly beneath it rather than compressing the title horizontally.
         palette_title = QLabel('YOUR PALETTE — drag colours onto any unlocked section', self)
-        left_layout.addWidget(palette_title)
+        palette_layout.addWidget(palette_title)
         palette_header = QHBoxLayout()
         palette_header.setContentsMargins(0, 0, 0, 0)
-        palette_header.setSpacing(6)
+        palette_header.setSpacing(4)
+        # TEST_062: keep utility actions compact so the editor's vertical space
+        # belongs to the palette/colourable-section work rather than oversized buttons.
         self.my_colours_button = QPushButton('My Colours…', self)
         _set_colour_button_icon(self.my_colours_button, '#8B6FA8')
         self.my_colours_button.setToolTip('Open your persistent reusable colour shelf without changing the colour-role list layout.')
+        self.my_colours_button.setFixedHeight(28)
         self.my_colours_button.clicked.connect(self.open_my_colours_dialog)
         palette_header.addWidget(self.my_colours_button, 1)
         self.paste_palette_button = QPushButton('Paste Link / HEX…', self)
         _set_colour_button_icon(self.paste_palette_button, '#4D8F7A')
         self.paste_palette_button.setToolTip('Open the same Paste Link / HEX Colours importer available from the Theme menu. Paste a supported palette website link or HEX colour list.')
         self.paste_palette_button.clicked.connect(self.open_existing_palette_importer)
+        self.paste_palette_button.setFixedHeight(28)
         palette_header.addWidget(self.paste_palette_button, 1)
         self.add_colour_button = QPushButton('+ Colour Wheel…', self)
         _set_colour_button_icon(self.add_colour_button, '#5F9EC8')
         self.add_colour_button.setToolTip('Create a colour on the wheel or paste a HEX value, then add it to this palette.')
         self.add_colour_button.clicked.connect(self.open_colour_wheel)
+        self.add_colour_button.setFixedHeight(28)
         palette_header.addWidget(self.add_colour_button, 1)
         self.my_colours_button.setText(f'My Colours ({len(self.saved_colours)})…')
-        left_layout.addLayout(palette_header)
+        palette_layout.addLayout(palette_header)
         self.palette_scroll = QScrollArea(self)
         self.palette_scroll.setWidgetResizable(True)
-        self.palette_scroll.setFixedHeight(132)
+        self.palette_scroll.setMinimumHeight(58)
         self.palette_widget = QWidget()
         self.palette_grid = QGridLayout(self.palette_widget)
         self.palette_grid.setContentsMargins(4, 3, 4, 3)
-        self.palette_grid.setSpacing(3)
+        self.palette_grid.setHorizontalSpacing(4)
+        self.palette_grid.setVerticalSpacing(4)
+        self.palette_grid.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.palette_scroll.setWidget(self.palette_widget)
-        left_layout.addWidget(self.palette_scroll)
+        palette_layout.addWidget(self.palette_scroll, 1)
         self.palette_status = QLabel('')
         self.palette_status.setWordWrap(True)
-        left_layout.addWidget(self.palette_status)
+        palette_layout.addWidget(self.palette_status)
 
+        roles_panel = QFrame()
+        roles_panel.setObjectName('ThemeStudioRolesPanel')
+        roles_layout = QVBoxLayout(roles_panel)
+        roles_layout.setContentsMargins(0, 0, 0, 0)
+        roles_layout.setSpacing(5)
         lock_help = QLabel('COLOURABLE SECTIONS — Text colours are chosen automatically for readability. Section Lock keeps this row + colour fixed. Shuffle Lock keeps this colour in every Shuffle, but the colour may move to another unlocked row.')
         lock_help.setWordWrap(True)
-        left_layout.addWidget(lock_help)
+        roles_layout.addWidget(lock_help)
         self.roles_scroll = QScrollArea(self)
         self.roles_scroll.setWidgetResizable(True)
-        self.roles_scroll.setMinimumHeight(190)
+        self.roles_scroll.setMinimumHeight(260)
         scroll_inner = QWidget(self)
         self.role_layout = QVBoxLayout(scroll_inner)
         self.role_layout.setContentsMargins(2, 2, 3, 3)
@@ -619,7 +656,19 @@ class ThemeStudio(QDialog):
                 self.controls[role] = (combo, section_lock, shuffle_lock, colour_marker)
         self.role_layout.addStretch()
         self.roles_scroll.setWidget(scroll_inner)
-        left_layout.addWidget(self.roles_scroll, 1)
+        roles_layout.addWidget(self.roles_scroll, 1)
+
+        self.editor_splitter.addWidget(palette_panel)
+        self.editor_splitter.addWidget(roles_panel)
+        self.editor_splitter.setStretchFactor(0, 1)
+        self.editor_splitter.setStretchFactor(1, 3)
+        palette_panel.setMinimumHeight(128)
+        roles_panel.setMinimumHeight(360)
+        editor_splitter_sizes = self._editor_splitter_sizes()
+        self.editor_splitter.setSizes(editor_splitter_sizes)
+        self.editor_splitter.splitterMoved.connect(self._save_editor_splitter_sizes)
+        left_layout.addWidget(self.editor_splitter, 1)
+        QTimer.singleShot(0, lambda sizes=editor_splitter_sizes: self.editor_splitter.setSizes(sizes))
 
         swap_title = QLabel('SWAP ANY TWO UNLOCKED SECTIONS')
         left_layout.addWidget(swap_title)
@@ -642,8 +691,8 @@ class ThemeStudio(QDialog):
         self.sticky_actions = QFrame(self)
         self.sticky_actions.setObjectName('StudioStickyActions')
         actions = QHBoxLayout(self.sticky_actions)
-        actions.setContentsMargins(8, 6, 8, 6)
-        actions.setSpacing(8)
+        actions.setContentsMargins(6, 3, 6, 3)
+        actions.setSpacing(6)
         fill = QPushButton('Auto-fill')
         _set_button_icon(fill, 'SP_DialogApplyButton', 'SP_ArrowForward')
         fill.setToolTip('Spread distinct imported colours across as many unlocked sections as possible.')
@@ -671,6 +720,7 @@ class ThemeStudio(QDialog):
         sticky_buttons = (fill, shuffle, self.undo_btn, self.revert_btn)
         for button in sticky_buttons:
             button.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+            button.setFixedHeight(30)
             button.setMinimumWidth(button.sizeHint().width() + 8)
         actions.activate()
         sticky_width = max(535, actions.sizeHint().width())
@@ -683,6 +733,34 @@ class ThemeStudio(QDialog):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(5)
+
+        # Theme controls live with the preview rather than spanning the whole
+        # dialog. The left editing pane can therefore start immediately with
+        # YOUR PALETTE and use the recovered height for Colourable Sections.
+        theme_controls = QFrame(self)
+        theme_controls.setObjectName('ThemeStudioThemeControls')
+        theme_controls_layout = QVBoxLayout(theme_controls)
+        theme_controls_layout.setContentsMargins(7, 5, 7, 5)
+        theme_controls_layout.setSpacing(3)
+
+        theme_row = QHBoxLayout()
+        theme_row.setContentsMargins(0, 0, 0, 0)
+        theme_row.setSpacing(5)
+        theme_row.addWidget(QLabel('Custom theme:', self))
+        theme_row.addWidget(self.theme_picker, 1)
+        theme_row.addWidget(self.manage_themes_button)
+        theme_controls_layout.addLayout(theme_row)
+
+        theme_meta_row = QHBoxLayout()
+        theme_meta_row.setContentsMargins(0, 0, 0, 0)
+        theme_meta_row.setSpacing(5)
+        theme_meta_row.addWidget(self.colour_library_rows_check)
+        theme_meta_row.addWidget(row_style_hint)
+        theme_meta_row.addStretch(1)
+        theme_meta_row.addWidget(self.source_label)
+        theme_controls_layout.addLayout(theme_meta_row)
+        right_layout.addWidget(theme_controls, 0)
+
         title = QLabel('LIVE PREVIEW — current saved theme versus your unsaved edits', self)
         right_layout.addWidget(title)
         self.preview_tabs = QTabWidget(self)
@@ -690,17 +768,20 @@ class ThemeStudio(QDialog):
         for tab in ('Library', 'Scan', 'Guide'):
             page = QWidget(self)
             h = QHBoxLayout(page)
-            h.setContentsMargins(3, 5, 3, 3)
+            h.setContentsMargins(2, 3, 2, 2)
             for side, heading in (('before', 'CURRENT SAVED'), ('after', 'YOUR EDITS')):
                 wrapper = QFrame(page)
                 wrapper_layout = QVBoxLayout(wrapper)
-                wrapper_layout.setContentsMargins(3, 3, 3, 3)
+                wrapper_layout.setContentsMargins(2, 2, 2, 2)
                 label = QLabel(heading)
                 label.setStyleSheet('font-weight: bold; color: #334654;')
                 wrapper_layout.addWidget(label)
                 scroll = QScrollArea(wrapper)
                 scroll.setWidgetResizable(True)
-                scroll.setMinimumWidth(260)
+                scroll.setMinimumWidth(230)
+                scroll.setFrameShape(QFrame.NoFrame)
+                scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+                scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
                 canvas = PreviewCanvas(tab, self._preview_role_clicked)
                 scroll.setWidget(canvas)
                 wrapper_layout.addWidget(scroll, 1)
@@ -745,26 +826,36 @@ class ThemeStudio(QDialog):
 
         footer = QFrame(self)
         footer.setObjectName('StudioFooter')
+        # TEST_063: the footer is a control bar, not another stretchable work
+        # pane. Keep it at its natural height so maximising (or simply having a
+        # tall monitor) gives the extra space to Colourable Sections instead.
+        footer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         bottom = QHBoxLayout(footer)
-        bottom.setContentsMargins(8, 7, 8, 7)
-        bottom.addWidget(QLabel('Only the chosen custom theme / new variation can be changed. Built-in themes stay protected.'))
-        bottom.addStretch(1)
+        bottom.setContentsMargins(6, 3, 6, 3)
+        bottom.setSpacing(5)
+        footer_note = QLabel('Only the chosen custom theme / new variation can be changed. Built-in themes stay protected.')
+        footer_note.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        bottom.addWidget(footer_note, 1)
         apply_button = QPushButton('Apply This Theme')
         _set_button_icon(apply_button, 'SP_DialogApplyButton', 'SP_ArrowForward')
         apply_button.setToolTip('Use this custom theme in CAS Curator. If you have unsaved edits, CAS Curator will ask to save them first.')
         apply_button.clicked.connect(self.apply_this_theme)
+        apply_button.setFixedHeight(28)
         bottom.addWidget(apply_button)
         update = QPushButton('Update Theme…')
         _set_button_icon(update, 'SP_DialogApplyButton', 'SP_DialogSaveButton')
         update.clicked.connect(self.update_existing)
+        update.setFixedHeight(28)
         bottom.addWidget(update)
         save = QPushButton('Save as New Theme…')
         _set_button_icon(save, 'SP_DialogSaveButton', 'SP_FileIcon')
         save.clicked.connect(self.save_as_new)
+        save.setFixedHeight(28)
         bottom.addWidget(save)
         cancel = QPushButton('Close')
         _set_button_icon(cancel, 'SP_DialogCloseButton', 'SP_DialogCancelButton')
         cancel.clicked.connect(self.reject)
+        cancel.setFixedHeight(28)
         bottom.addWidget(cancel)
         outer.addWidget(footer, 0)
 
@@ -773,6 +864,9 @@ class ThemeStudio(QDialog):
             QFrame#EditorSidebar { background: #F6F7F9; border: 1px solid #C5CED4; border-radius: 8px; }
             QFrame#StudioStickyActions { background: #F6F7F9; border: 1px solid #C5CED4; border-radius: 8px; }
             QFrame#StudioFooter { background: #E0E8ED; border-top: 1px solid #ADBCC6; border-radius: 4px; }
+            QFrame#ThemeStudioThemeControls { background: #F6F7F9; border: 1px solid #C5CED4; border-radius: 6px; }
+            QSplitter#ThemeStudioEditorSplitter::handle { background: #C5CED4; border-radius: 2px; margin: 1px 0; }
+            QSplitter#ThemeStudioEditorSplitter::handle:hover { background: #8FA8B7; }
             QScrollArea#StudioBodyScroll { background: transparent; border: none; }
             QFrame#EditorSidebar QLabel { color: #24333C; }
             QScrollArea { border: 1px solid #C6CDD2; background: #F6F7F9; }
@@ -797,6 +891,31 @@ class ThemeStudio(QDialog):
             self.theme_picker.setCurrentText(chosen)
             self._updating = False
             self.load_theme(chosen)
+
+    def _editor_splitter_sizes(self):
+        """Return a safe saved/default palette-to-sections splitter balance."""
+        default = [150, 530]
+        settings = getattr(self.main, 'settings', None)
+        if settings is None:
+            return default
+        try:
+            raw = settings.value('theme_studio_palette_sections_splitter_sizes_v2', default)
+            if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                upper = max(128, int(raw[0]))
+                lower = max(360, int(raw[1]))
+                return [upper, lower]
+        except (TypeError, ValueError):
+            pass
+        return default
+
+    def _save_editor_splitter_sizes(self, *_):
+        settings = getattr(self.main, 'settings', None)
+        splitter = getattr(self, 'editor_splitter', None)
+        if settings is None or splitter is None:
+            return
+        sizes = splitter.sizes()
+        if len(sizes) >= 2 and sizes[0] > 0 and sizes[1] > 0:
+            settings.setValue('theme_studio_palette_sections_splitter_sizes_v2', sizes[:2])
 
     def _preview_role_clicked(self, role):
         """Jump from a clicked preview surface to its exact editable role.
@@ -978,10 +1097,9 @@ class ThemeStudio(QDialog):
             if item.widget():
                 item.widget().deleteLater()
         for index, colour in enumerate(self.palette):
-            self.palette_grid.addWidget(PaletteSwatch(colour, self.palette_widget), index // 8, index % 8)
+            self.palette_grid.addWidget(PaletteSwatch(colour, self.palette_widget), index // 12, index % 12)
         self.palette_status.setText(
-            f'All {len(self.palette)} colours shown ({MAX_IMPORT_COLOURS} maximum). '
-            'Changes are only saved when you choose Save or Update.')
+            f'{len(self.palette)} colours shown ({MAX_IMPORT_COLOURS} max). Save or Update to keep theme changes.')
         # The wheel remains useful even when this theme palette is full because
         # a colour can still be saved into the cross-theme My Colours shelf.
         self.add_colour_button.setEnabled(True)
