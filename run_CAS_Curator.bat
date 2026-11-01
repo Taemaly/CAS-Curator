@@ -1,9 +1,10 @@
 @echo off
 setlocal
+set "PYTHONDONTWRITEBYTECODE=1"
 cd /d "%~dp0"
 set "CAS_CURATOR_EDITION=PUBLIC"
 
-echo CAS Curator v1.0.1
+echo CAS Curator v1.1.0
 echo.
 
 set "PYEXE="
@@ -59,32 +60,32 @@ if exist "%VENV_PY%" (
 )
 
 if not exist "%VENV_PY%" (
-  echo Creating private CAS Curator environment...
+  echo Creating CAS Curator environment...
   %PYEXE% -m venv ".venv" || goto :fail
 )
 
-"%VENV_PY%" -c "import PySide6; import sys; raise SystemExit(0)" >nul 2>nul
+"%VENV_PY%" -c "import PySide6,sys; raise SystemExit(0 if getattr(PySide6, '__version__', '') == '6.12.0' else 1)" >nul 2>nul
 if errorlevel 1 (
-  echo Installing PySide6 into this folder's private .venv...
+  echo Installing tested PySide6 6.12.0 into this folder's private .venv...
   "%VENV_PY%" -m pip install --upgrade pip || goto :fail
   "%VENV_PY%" -m pip install -r requirements.txt || goto :fail
 )
 
 echo Starting CAS Curator...
-"%VENV_PY%" app.py
+"%VENV_PY%" -B app.py
 if errorlevel 1 goto :appcrash
 exit /b 0
 
 :appcrash
 echo.
 echo CAS Curator stopped with an error.
-echo Please copy or screenshot the error shown above and report it with the error details.
+echo Please copy or screenshot the error shown above when asking for support.
 pause
 exit /b 1
 
 :fail
 echo.
 echo Could not start CAS Curator.
-echo Copy everything shown above and report it with the error details so the launcher can be fixed.
+echo Copy everything shown above when asking for support.
 pause
 exit /b 1

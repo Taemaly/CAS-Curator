@@ -8,7 +8,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, QRectF, Signal, QRegularExpression
 from PySide6.QtGui import QColor, QPainter, QPen, QImage, QRegularExpressionValidator
 from PySide6.QtWidgets import (
-    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
+    QCheckBox, QDialog, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QSlider, QDialogButtonBox, QMessageBox,
 )
 
@@ -184,6 +184,10 @@ class ColourWheelDialog(QDialog):
         self.sample.setFixedSize(64, 26)
         hex_row.addWidget(self.sample)
         main.addLayout(hex_row)
+        self.save_to_my_colours = QCheckBox('Save in My Colours for reuse in other themes', self)
+        self.save_to_my_colours.setChecked(True)
+        self.save_to_my_colours.setToolTip('My Colours is a persistent personal swatch shelf shared across custom themes.')
+        main.addWidget(self.save_to_my_colours)
         self.wheel.colourChanged.connect(self._wheel_changed)
         self._wheel_changed(self.wheel.current_colour())
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
@@ -217,3 +221,6 @@ class ColourWheelDialog(QDialog):
 
     def selected_hex(self):
         return self.wheel.current_colour().name(QColor.HexRgb).upper()
+
+    def save_in_my_colours(self):
+        return self.save_to_my_colours.isChecked()

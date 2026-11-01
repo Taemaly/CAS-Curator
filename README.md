@@ -1,73 +1,82 @@
-# CAS Curator v1.0.1
+# CAS Curator v1.1.0
 
 CAS Curator is a specialist **The Sims 3 CAS catalogue, review and organisation tool**.
 
-It works with a CC Master Database (MDB) and the validated CAS scanner to help inspect, classify, review and organise Sims 3 CAS custom content.
+It works with a CC Master Database (MDB) and the CAS scanner to help inspect, classify, review and organise Sims 3 CAS custom content.
 
 ## Download
 
-The recommended download is the **CAS Curator v1.0.1 installer** from the [v1.0.1 release](https://github.com/Taemaly/CAS-Curator/releases/tag/v1.0.1).
+The recommended download is the **CAS Curator v1.1.0 Windows installer** from the v1.1.0 GitHub release.
 
 Release packages:
 
-- **`CAS_Curator_v1.0.1_Installer.zip`** — recommended Windows installer. Lets you choose the install location, creates shortcuts, includes an uninstaller, and can launch CAS Curator when setup finishes.
-- **`CAS_Curator_v1.0.1_APP.zip`** — portable compiled application for users who prefer to extract and run the app without installing it.
-- **`CAS_Curator_v1.0.1_SOURCE.zip`** — complete v1.0.1 source package for reference and source-based use.
-- **`CAS_Curator_v1.0.1_THIRD_PARTY_SOURCE.zip`** — corresponding third-party source/licence bundle.
+- **`CAS_Curator_v1.1.0_Setup.exe`** — direct Windows installer; also used by CAS Curator's in-app updater.
+- **`CAS_Curator_v1.1.0_Installer.zip`** — the same installer inside a ZIP for sites/downloads that prefer archived files.
+- **`CAS_Curator_v1.1.0_APP.zip`** — portable compiled application.
+- **`CAS_Curator_v1.1.0_SOURCE.zip`** — complete v1.1.0 application/source reference package.
+- **`CAS_Curator_v1.1.0_THIRD_PARTY_SOURCE.zip`** — corresponding third-party source/licence bundle.
 
-## What's new in v1.0.1
+## What's new in v1.1.0
 
-v1.0.1 keeps the **frozen scanner core unchanged** while substantially expanding the organisation and review workflow around it.
+v1.1.0 is a major usability, theme-customisation and maintenance update.
 
 Highlights include:
 
-- Profile Rules that remember each Profile's filter view and visible Table columns
-- safer Profile Membership and Experimental Profile Layout workflows with explicit Planned Locations
-- read-only and conflict preflight for Apply Profile Locations, plus stronger rollback cleanup
-- the Experimental Routing Structure Builder with reusable folder structures, preview, sanitising and transactional routing
-- managed File Locations and safer routing/recovery location updates
-- universal **+ Add Quick Filter…** support alongside Status / CC Type / Creator
-- Creator and Converter metadata plus improved package web-search shortcuts
-- persistent column visibility, Select all / Deselect all / Default controls, collapsible column shortcuts and smoother horizontal Table navigation
-- a hideable Details panel and compact Gallery quick-filter toolbar
-- Age/Gender plus opt-in Advanced and Experimental metadata views
-- resizable Scanner Log, clearer Tools organisation, improved dialogs and updated Guide
-- **About CAS Curator…**, Copy version info, source/support shortcuts and final application icon polish
+- **Theme Colour Studio** with live preview, click-to-jump sections, Auto-fill, **Shuffle Unlocked**, locks, Undo/Revert, My Colours, readability checks, import/export and **Apply This Theme**
+- clearer **Manage Themes** tools and dated theme-backup ZIP export
+- **Find ID…** for technical CASP/resource IDs, hashes and stored paths, including identifiers that are not visible as Library columns
+- a dedicated **Identifiers** view with package, CAS/resource, in-game lookup and location/source evidence separated clearly
+- a compact **Copy** button beside CASP ID(s) in CASP Observations
+- clearer separation of **Health Status** from **Performance Risk Score**
+- recalibrated category-aware Performance Risk scoring and **Refresh Performance Scores…** for existing Libraries
+- full-row Library hover/selection improvements and stronger dark/custom-theme readability
+- compact one-line pinned-package chips, visible pin icons and direct Pin/Unpin actions
+- switchable left/right Library Details pane
+- searchable built-in Guide, optional Health Scan Report creation and stable-release update checking
+- numerous scaling, theme, wording and UI refinements
 
-Additional convenience tools include copying selected packages to a configured CC Magic Import folder, ZIP preview/extraction, and conservative Sims3Pack scan intake.
+See [`CHANGELOG_v1.1.0.md`](CHANGELOG_v1.1.0.md) for the complete user-facing list of changes since v1.0.1.
 
-See [`CHANGELOG_v1.0.1.txt`](CHANGELOG_v1.0.1.txt) for the full user-facing list of changes since v1.0.
+## Search and technical identifiers
+
+The normal Library **Search** is for ordinary Library information such as package names, creators, types, Status, Profiles and notes.
+
+For technical identifiers — including CASP/resource IDs, package hashes and stored paths — enable **Advanced features** and use **Find ID…**. Find ID can search hidden technical evidence, clear temporary filters when needed, select the matching package and open its identifier information.
+
+## Performance Risk Score
+
+**Health Status** and **Performance Risk Score** are intentionally separate:
+
+- **Health Status** reports supported package/structural problems.
+- **Performance Risk Score** is an advisory estimate of likely game-performance load/risk based on supported evidence such as polycount, GEOM size, texture resolution/quantity and category-aware thresholds.
+
+A high Performance Risk Score does not mean that CC is broken or unsafe.
 
 ## Safety
 
-- The frozen scanner core used by this release is unchanged.
 - Run Scan does not move source files.
-- Run Routing is an explicit action and can move source files.
-- Routing duplicate handling was corrected so a package is not treated as a duplicate of its own freshly scanned MDB record.
-- Risk Score is a review value and does not decide routing folders.
-- Experimental scanner-derived metadata is for review only and never automatically controls Routing.
-- Experimental Profile Layouts are separate from scanner metadata. Saving a Planned Location stores only a plan; package files move only through the explicit previewed Apply Profile Locations action.
-- Copying selected packages to the configured CC Magic Import folder uses copies and does not replace the organised master package.
-- ZIP extraction is explicit, keeps the original ZIP, rejects unsafe paths and does not overwrite existing files.
-- RAR and 7Z preview/extraction are intentionally not supported.
+- Run Routing is an explicit action and can be previewed before files are moved.
+- Scanner writes create MDB backups.
+- Saving a Planned Location does not move files.
+- Applying Profile Locations requires its own explicit previewed action.
+- CC Magic Import uses copies and does not replace the organised master package.
+- ZIP extraction keeps the original archive, rejects unsafe paths and does not silently overwrite existing files.
+
+Keep normal backups of important MDBs and custom content.
 
 ## Running from source
 
 For the complete source package:
 
-1. Extract the whole CAS Curator v1.0.1 source folder to a normal writable folder.
-2. Run `run_CAS_Curator.bat`.
+1. Extract the whole CAS Curator v1.1.0 source folder to a normal writable folder.
+2. Run `run_CAS_Curator_v1.1.0.bat`.
 3. CAS Curator uses a private `.venv` in its own folder.
 4. A supported 64-bit Python 3.10–3.14 installation is required.
-5. On first start, PySide6 may be installed into that private environment.
+5. The published v1.1.0 source launcher uses the tested **PySide6 / Qt 6.12.0** runtime.
 
-Your existing Sims scanner Python installation can remain unchanged.
+The compiled Windows build additionally uses a separated Python 3.8 scanner/helper architecture. The complete tested Windows build kit is kept separately from the public source package.
 
-## Important
-
-Keep backups of important MDBs and custom content. CAS Curator includes safety checks, previews and MDB backups, but any tool that can move files should still be used with normal backup precautions.
-
-## Source and license
+## Source and licence
 
 The source is published for visibility and reference, but **CAS Curator is proprietary software, not open-source software**.
 
@@ -75,4 +84,6 @@ Copyright © 2026 Taemaly. All Rights Reserved.
 
 Copying, modification, redistribution, reuse, mirroring, or creation of derivative works is not permitted without prior written permission.
 
-See the [`LICENSE`](LICENSE) file for the full terms.
+Third-party components remain under their own licences. See the included notices and the corresponding third-party source bundle.
+
+See [`LICENSE`](LICENSE) for the full CAS Curator licence terms.

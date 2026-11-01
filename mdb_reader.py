@@ -20,6 +20,11 @@ PKG_REL_NS = "http://schemas.openxmlformats.org/package/2006/relationships"
 NS = {"m": MAIN_NS, "r": REL_NS}
 
 EDITABLE_FIELDS = ("Image", "Status", "Creator", "Converter", "File Location", "CC Magic Profiles", "Merge Profiles", "Notes")
+PERFORMANCE_SCORE_REFRESH_FIELDS = ("Risk", "Risk Score", "HQ Warning", "Poly Warning", "Biggest Texture")
+PERFORMANCE_DATA_FIELDS = ("Texture Resolutions", "GEOM Total Bytes", "4K Texture Count", "Performance Data Version")
+PERFORMANCE_REFRESH_FIELDS = PERFORMANCE_SCORE_REFRESH_FIELDS + PERFORMANCE_DATA_FIELDS
+CURRENT_PERFORMANCE_SCORE_VERSION = "2"
+PERFORMANCE_SCORE_VERSION_METADATA_KEY = "Performance Score Version"
 
 
 def _normalise_cc_magic_profiles(value: str) -> str:
@@ -119,7 +124,10 @@ def _sheet_paths(zf: zipfile.ZipFile) -> Dict[str, str]:
     rel_root = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
     rels = {r.attrib["Id"]: r.attrib["Target"] for r in rel_root}
     out: Dict[str, str] = {}
-    for sheet in wb_root.find(f"{{{MAIN_NS}}}sheets") or []:
+    sheets = wb_root.find(f"{{{MAIN_NS}}}sheets")
+    if sheets is None:
+        return out
+    for sheet in sheets:
         name = sheet.attrib["name"]
         rid = sheet.attrib[f"{{{REL_NS}}}id"]
         target = rels[rid].lstrip("/")
@@ -488,6 +496,7 @@ class MDBData:
     file_locations: List[Tuple[str, str]]
     merge_profile_options: List[str]
     profile_layouts: List[Tuple[str, str, str, str]]
+    metadata: Dict[str, str]
     thumbnail_count: int
     casp_count: int
     package_history_count: int
@@ -622,7 +631,7 @@ class MDBWorkbook:
                 if ea_status:
                     record["EA Resource Status"] = ea_status
 
-            status_options, library_options, profile_options, file_locations, merge_profile_options, profile_layouts = self._load_settings(zf, sheets, shared)
+            status_options, library_options, profile_options, file_locations, merge_profile_options, profile_layouts, metadata = self._load_settings(zf, sheets, shared)
             # Older workbooks may not yet have a persisted profile registry.
             # Always include profile names already assigned to packages so the UI
             # can manage them, then persist the registry on the next profile save.
@@ -669,6 +678,7 @@ class MDBWorkbook:
             file_locations=file_locations,
             merge_profile_options=merge_profile_options,
             profile_layouts=profile_layouts,
+            metadata=metadata,
             thumbnail_count=thumbnail_count,
             casp_count=casp_count,
             package_history_count=package_history_count,
@@ -1102,6 +1112,314 @@ class MDBWorkbook:
                 except Exception:
                     pass
 
+
+    def save_performance_score_refresh(
+        self,
+        mdb: MDBData,
+        changes: Dict[int, Dict[str, str]],
+        performance_score_version: Optional[str] = None,
+    ) -> SaveResult:
+        """Safely update advisory score fields and stored performance measurements.
+
+        This writer is intentionally separate from manual Library editing. It patches
+        the CC Master Database, adds the performance-data storage columns to older MDBs
+        when needed, and mirrors corresponding Risk/Score/Texture values into Packages
+        when an unambiguous package identity is available. Health Status, classification,
+        routing and Last Scanned are never touched.
+        """
+        clean: Dict[int, Dict[str, str]] = {}
+        changed_fields = 0
+        known_rows = {int(rec.get("_ExcelRow", "0") or 0): rec for rec in mdb.records}
+
+        for raw_row, row_changes in changes.items():
+            row_num = int(raw_row)
+            if row_num <= 1 or row_num not in known_rows:
+                raise ValueError(f"Performance refresh row {row_num} is not a loaded package record.")
+            allowed: Dict[str, str] = {}
+            for field, value in row_changes.items():
+                if field not in PERFORMANCE_REFRESH_FIELDS:
+                    raise ValueError(f"'{field}' is not a Performance Score refresh field.")
+                allowed[field] = "" if value is None else str(value)
+            if allowed:
+                clean[row_num] = allowed
+                changed_fields += len(allowed)
+
+        clean_version = str(performance_score_version or "").strip()
+        if not clean and not clean_version:
+            raise ValueError("There are no Performance Score changes to save.")
+
+        path = Path(mdb.path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        current_hash = _sha256_file(path)
+        if current_hash != mdb.source_sha256:
+            raise WorkbookChangedError(
+                "The Master Database changed on disk after it was opened in the library. "
+                "Reload it before refreshing Performance Scores so external changes are not overwritten."
+            )
+
+        backup_dir = path.parent / "MDB_Backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        backup_path = backup_dir / f"{path.stem}_backup_{stamp}{path.suffix}"
+        shutil.copy2(path, backup_path)
+
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{path.stem}_performance_refresh_",
+            suffix=".xlsx",
+            dir=str(path.parent),
+        )
+        os.close(fd)
+        tmp_path = Path(tmp_name)
+
+        try:
+            with zipfile.ZipFile(path, "r") as zin:
+                shared = _load_shared_strings(zin)
+                sheets = _sheet_paths(zin)
+                cc_path = sheets.get(self.CC_SHEET)
+                packages_path = sheets.get(self.PACKAGES_SHEET)
+                settings_path = sheets.get(self.SETTINGS_SHEET)
+                if not cc_path:
+                    raise ValueError("This workbook does not contain 'CC Master Database'.")
+                if clean_version and not settings_path:
+                    raise ValueError("This workbook does not contain a Settings sheet for Performance Score metadata.")
+
+                cc_headers_by_col: Dict[int, str] = {}
+                for row_num, values in _read_sheet_rows(zin, cc_path, shared):
+                    if row_num == 1:
+                        cc_headers_by_col = {n: v for n, v in values.items() if v}
+                        break
+                cc_header_to_col = {header: col for col, header in cc_headers_by_col.items()}
+                needed_fields = {field for row_changes in clean.values() for field in row_changes}
+                cc_xml = zin.read(cc_path).decode("utf-8")
+
+                missing_required = sorted(
+                    field for field in needed_fields
+                    if field not in cc_header_to_col and field not in PERFORMANCE_DATA_FIELDS
+                )
+                if missing_required:
+                    raise ValueError(
+                        "Performance refresh column(s) missing from CC Master Database: "
+                        + ", ".join(missing_required)
+                    )
+
+                # Older MDBs predate the raw performance-input storage columns. Add only
+                # the columns needed by this refresh, preserving all existing data. Once
+                # backfilled, future score-model updates can run from the MDB alone.
+                for data_field in PERFORMANCE_DATA_FIELDS:
+                    if data_field in needed_fields and data_field not in cc_header_to_col:
+                        next_col = max(cc_header_to_col.values(), default=0) + 1
+                        cc_header_to_col[data_field] = next_col
+                        cc_xml, header_rows = self._patch_sheet_xml(
+                            cc_xml,
+                            {1: {data_field: data_field}},
+                            cc_header_to_col,
+                            {next_col: None},
+                        )
+                        if 1 not in header_rows:
+                            raise ValueError(
+                                f"Could not add the {data_field} storage column to the Master Database header."
+                            )
+                        cc_xml = self._expand_dimension_for_column(cc_xml, next_col)
+
+                if clean:
+                    cc_styles = self._find_column_styles(cc_xml, cc_header_to_col, needed_fields)
+                    patched_cc_xml, patched_rows = self._patch_sheet_xml(
+                        cc_xml, clean, cc_header_to_col, cc_styles
+                    )
+                    if patched_rows != set(clean):
+                        missing_rows = sorted(set(clean) - patched_rows)
+                        raise ValueError(
+                            "Could not locate CC Master Database row(s): "
+                            + ", ".join(str(n) for n in missing_rows[:20])
+                        )
+                else:
+                    patched_cc_xml = cc_xml
+
+                patched_settings_xml = None
+                if clean_version:
+                    patched_settings_xml = self._patch_settings_metadata_xml(
+                        zin.read(settings_path).decode("utf-8"),
+                        {PERFORMANCE_SCORE_VERSION_METADATA_KEY: clean_version},
+                        shared_strings=shared,
+                    )
+
+                patched_packages_xml = None
+                package_changes: Dict[int, Dict[str, str]] = {}
+                if packages_path:
+                    packages_headers_by_col: Dict[int, str] = {}
+                    package_rows = []
+                    for row_num, values in _read_sheet_rows(zin, packages_path, shared):
+                        if row_num == 1:
+                            packages_headers_by_col = {n: v for n, v in values.items() if v}
+                            continue
+                        package_rows.append((row_num, values))
+                    packages_header_to_col = {
+                        header: col for col, header in packages_headers_by_col.items()
+                    }
+                    package_col = packages_header_to_col.get("Package")
+                    hash_col = packages_header_to_col.get("Package Hash")
+
+                    by_hash: Dict[str, List[int]] = {}
+                    by_name: Dict[str, List[int]] = {}
+                    for row_num, values in package_rows:
+                        if package_col:
+                            name = str(values.get(package_col, "") or "").strip()
+                            if name:
+                                by_name.setdefault(name.casefold(), []).append(row_num)
+                        if hash_col:
+                            package_hash = str(values.get(hash_col, "") or "").strip().lower()
+                            if package_hash:
+                                by_hash.setdefault(package_hash, []).append(row_num)
+
+                    field_map = {
+                        "Risk": "Risk Level",
+                        "Risk Score": "Risk Score",
+                        "Biggest Texture": "Highest Texture",
+                    }
+                    for cc_row, row_changes in clean.items():
+                        rec = known_rows[cc_row]
+                        package_hash = str(rec.get("Package Hash", "") or "").strip().lower()
+                        package_name = str(rec.get("Package", "") or "").strip().casefold()
+                        target_rows = list(by_hash.get(package_hash, [])) if package_hash else []
+                        if not target_rows and package_name:
+                            name_rows = by_name.get(package_name, [])
+                            if len(name_rows) == 1:
+                                target_rows = list(name_rows)
+                        for package_row in target_rows:
+                            mapped = {}
+                            for cc_field, package_field in field_map.items():
+                                if cc_field in row_changes and package_field in packages_header_to_col:
+                                    mapped[package_field] = row_changes[cc_field]
+                            if mapped:
+                                package_changes.setdefault(package_row, {}).update(mapped)
+
+                    if package_changes:
+                        packages_xml = zin.read(packages_path).decode("utf-8")
+                        package_needed = {
+                            field for updates in package_changes.values() for field in updates
+                        }
+                        package_styles = self._find_column_styles(
+                            packages_xml, packages_header_to_col, package_needed
+                        )
+                        patched_packages_xml, patched_package_rows = self._patch_sheet_xml(
+                            packages_xml, package_changes, packages_header_to_col, package_styles
+                        )
+                        if patched_package_rows != set(package_changes):
+                            missing_rows = sorted(set(package_changes) - patched_package_rows)
+                            raise ValueError(
+                                "Could not locate Packages row(s): "
+                                + ", ".join(str(n) for n in missing_rows[:20])
+                            )
+
+                with zipfile.ZipFile(tmp_path, "w") as zout:
+                    for info in zin.infolist():
+                        if info.filename == cc_path:
+                            data = patched_cc_xml.encode("utf-8")
+                        elif patched_packages_xml is not None and info.filename == packages_path:
+                            data = patched_packages_xml.encode("utf-8")
+                        elif patched_settings_xml is not None and info.filename == settings_path:
+                            data = patched_settings_xml.encode("utf-8")
+                        else:
+                            data = zin.read(info.filename)
+                        zout.writestr(info, data)
+
+            with zipfile.ZipFile(tmp_path, "r") as ztest:
+                bad_member = ztest.testzip()
+                if bad_member:
+                    raise ValueError(f"Workbook validation failed at ZIP member: {bad_member}")
+                if clean:
+                    self._verify_sheet_field_values(
+                        ztest, self.CC_SHEET, clean, set(PERFORMANCE_REFRESH_FIELDS)
+                    )
+                if clean_version:
+                    self._verify_settings_metadata(
+                        ztest, {PERFORMANCE_SCORE_VERSION_METADATA_KEY: clean_version}
+                    )
+                if package_changes:
+                    self._verify_sheet_field_values(
+                        ztest, self.PACKAGES_SHEET, package_changes,
+                        {"Risk Level", "Risk Score", "Highest Texture"}
+                    )
+
+            try:
+                os.replace(tmp_path, path)
+            except PermissionError as exc:
+                raise PermissionError(
+                    "Windows would not let CAS Curator replace the Master Database. "
+                    "If the workbook is open in Excel, close Excel and try Refresh Performance Scores again."
+                ) from exc
+
+            new_stat = path.stat()
+            new_hash = _sha256_file(path)
+            mdb.source_sha256 = new_hash
+            mdb.source_size = new_stat.st_size
+            mdb.source_mtime_ns = new_stat.st_mtime_ns
+            if clean_version:
+                mdb.metadata[PERFORMANCE_SCORE_VERSION_METADATA_KEY] = clean_version
+
+            return SaveResult(
+                backup_path=backup_path,
+                changed_rows=len(clean),
+                changed_fields=changed_fields,
+                source_sha256=new_hash,
+                source_size=new_stat.st_size,
+                source_mtime_ns=new_stat.st_mtime_ns,
+                deleted_rows=0,
+            )
+        except Exception:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
+        finally:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
+
+    def _verify_sheet_field_values(
+        self,
+        zf: zipfile.ZipFile,
+        sheet_name: str,
+        changes: Dict[int, Dict[str, str]],
+        allowed_fields: set,
+    ) -> None:
+        shared = _load_shared_strings(zf)
+        sheets = _sheet_paths(zf)
+        sheet_path = sheets.get(sheet_name)
+        if not sheet_path:
+            raise ValueError(f"Save verification could not find worksheet '{sheet_name}'.")
+        headers_by_col: Dict[int, str] = {}
+        target_rows = set(changes)
+        seen: Dict[int, Dict[str, str]] = {}
+        for row_num, values in _read_sheet_rows(zf, sheet_path, shared):
+            if row_num == 1:
+                headers_by_col = {n: v for n, v in values.items() if v}
+                continue
+            if row_num not in target_rows:
+                continue
+            row_values: Dict[str, str] = {}
+            for col, header in headers_by_col.items():
+                if header in allowed_fields:
+                    row_values[header] = values.get(col, "")
+            seen[row_num] = row_values
+            if len(seen) == len(target_rows):
+                break
+        for row_num, expected_fields in changes.items():
+            actual = seen.get(row_num)
+            if actual is None:
+                raise ValueError(
+                    f"Save verification could not read {sheet_name} row {row_num}."
+                )
+            for field, expected in expected_fields.items():
+                if actual.get(field, "") != expected:
+                    raise ValueError(
+                        f"Save verification failed for {sheet_name} row {row_num}, field '{field}'."
+                    )
+
     def _clear_record_rows(self, xml_text: str, rows_to_clear: set[int]) -> Tuple[str, set[int]]:
         """Clear every cell value in selected package rows while preserving worksheet row/style structure."""
         row_pattern = re.compile(r'(<row\b[^>]*\br="(\d+)"[^>]*>)(.*?)(</row>)', re.DOTALL)
@@ -1339,23 +1657,25 @@ class MDBWorkbook:
         self, zf, sheets, shared
     ) -> Tuple[
         List[str], List[str], List[str], List[Tuple[str, str]], List[str],
-        List[Tuple[str, str, str, str]],
+        List[Tuple[str, str, str, str]], Dict[str, str],
     ]:
         path = sheets.get(self.SETTINGS_SHEET)
         if not path:
-            return [], [], [], [], [], []
+            return [], [], [], [], [], [], {}
         status: List[str] = []
         library: List[str] = []
         profiles: List[str] = []
         file_locations: List[Tuple[str, str]] = []
         merge_profiles: List[str] = []
         profile_layouts: List[Tuple[str, str, str, str]] = []
+        metadata: Dict[str, str] = {}
         seen_profiles = set()
         seen_merge_profiles = set()
         seen_location_names = set()
         has_file_location_headers = False
         has_merge_profile_header = False
         has_profile_layout_headers = False
+        has_metadata_headers = False
         seen_profile_layouts = set()
         for row_num, values in _read_sheet_rows(zf, path, shared):
             if row_num == 1:
@@ -1370,6 +1690,10 @@ class MDBWorkbook:
                     and values.get(9, "").strip() == "Profile Layout Package"
                     and values.get(10, "").strip() == "Profile Layout File Location"
                 )
+                has_metadata_headers = (
+                    values.get(11, "").strip() == "CAS Curator Metadata Key"
+                    and values.get(12, "").strip() == "CAS Curator Metadata Value"
+                )
                 continue
             a = values.get(1, "").strip()
             b = values.get(2, "").strip()
@@ -1381,6 +1705,8 @@ class MDBWorkbook:
             layout_hash = values.get(8, "").strip().lower() if has_profile_layout_headers else ""
             layout_package = Path(values.get(9, "").strip()).name if has_profile_layout_headers else ""
             layout_location = values.get(10, "").strip() if has_profile_layout_headers else ""
+            metadata_key = values.get(11, "").strip() if has_metadata_headers else ""
+            metadata_value = values.get(12, "").strip() if has_metadata_headers else ""
             if a:
                 status.append(a)
             if b:
@@ -1402,12 +1728,14 @@ class MDBWorkbook:
                     profile_layouts.append(
                         (layout_profile, layout_hash, layout_package, layout_location)
                     )
+            if metadata_key and metadata_key.casefold() not in {key.casefold() for key in metadata}:
+                metadata[metadata_key] = metadata_value
         file_locations.sort(key=lambda item: item[0].casefold())
         merge_profiles.sort(key=str.casefold)
         profile_layouts.sort(
             key=lambda item: (item[0].casefold(), item[2].casefold(), item[1], item[3].casefold())
         )
-        return status, library, profiles, file_locations, merge_profiles, profile_layouts
+        return status, library, profiles, file_locations, merge_profiles, profile_layouts, metadata
 
     def _patch_settings_status_xml(self, xml_text: str, statuses: List[str]) -> str:
         """Replace only the Status registry in Settings column A, preserving other columns."""
@@ -1946,6 +2274,155 @@ class MDBWorkbook:
         )
         if actual != expected:
             raise ValueError("Save verification failed for Experimental Profile Layouts.")
+
+    def _patch_settings_metadata_xml(
+        self, xml_text: str, updates: Dict[str, str], shared_strings: Optional[List[str]] = None
+    ) -> str:
+        """Patch CAS Curator internal metadata in Settings columns K:L without touching registries."""
+        ET.register_namespace("", MAIN_NS)
+        root = ET.fromstring(xml_text)
+        sheet_data = root.find(f"{{{MAIN_NS}}}sheetData")
+        if sheet_data is None:
+            raise ValueError("Settings sheet has no sheetData element.")
+
+        rows = {}
+        for row in sheet_data.findall(f"{{{MAIN_NS}}}row"):
+            try:
+                rows[int(row.attrib.get("r", "0") or 0)] = row
+            except ValueError:
+                continue
+
+        def ensure_row(row_num: int):
+            row = rows.get(row_num)
+            if row is not None:
+                return row
+            row = ET.Element(f"{{{MAIN_NS}}}row", {"r": str(row_num)})
+            inserted = False
+            for idx, existing in enumerate(list(sheet_data)):
+                try:
+                    existing_num = int(existing.attrib.get("r", "0") or 0)
+                except ValueError:
+                    existing_num = 0
+                if existing_num > row_num:
+                    sheet_data.insert(idx, row)
+                    inserted = True
+                    break
+            if not inserted:
+                sheet_data.append(row)
+            rows[row_num] = row
+            return row
+
+        def cell_text(row, col: str) -> str:
+            ref = f"{col}{row.attrib.get('r', '')}"
+            for cell in list(row):
+                if cell.attrib.get("r", "") != ref:
+                    continue
+                if cell.attrib.get("t") == "inlineStr":
+                    node = cell.find(f"{{{MAIN_NS}}}is/{{{MAIN_NS}}}t")
+                    return "" if node is None or node.text is None else node.text
+                value = cell.find(f"{{{MAIN_NS}}}v")
+                raw = "" if value is None or value.text is None else value.text
+                if cell.attrib.get("t") == "s" and raw and shared_strings is not None:
+                    try:
+                        idx = int(raw)
+                        return shared_strings[idx] if 0 <= idx < len(shared_strings) else raw
+                    except (TypeError, ValueError):
+                        return raw
+                return raw
+            return ""
+
+        def set_cell(row_num: int, col: str, value: str):
+            row = ensure_row(row_num)
+            target_ref = f"{col}{row_num}"
+            old = None
+            style = None
+            for cell in list(row):
+                if cell.attrib.get("r", "") == target_ref:
+                    old = cell
+                    style = cell.attrib.get("s")
+                    break
+            if style is None:
+                previous_col = "J" if col == "K" else "K"
+                for cell in list(row):
+                    if cell.attrib.get("r", "") == f"{previous_col}{row_num}":
+                        style = cell.attrib.get("s")
+                        break
+            if old is not None:
+                row.remove(old)
+            if not value:
+                return
+            attrs = {"r": target_ref, "t": "inlineStr"}
+            if style:
+                attrs["s"] = style
+            cell = ET.Element(f"{{{MAIN_NS}}}c", attrs)
+            is_node = ET.SubElement(cell, f"{{{MAIN_NS}}}is")
+            t = ET.SubElement(
+                is_node, f"{{{MAIN_NS}}}t",
+                {"{http://www.w3.org/XML/1998/namespace}space": "preserve"},
+            )
+            t.text = value
+            row.append(cell)
+            row[:] = sorted(list(row), key=lambda item: _col_num(item.attrib.get("r", "")))
+
+        set_cell(1, "K", "CAS Curator Metadata Key")
+        set_cell(1, "L", "CAS Curator Metadata Value")
+
+        key_rows = {}
+        for row_num, row in rows.items():
+            if row_num <= 1:
+                continue
+            key = cell_text(row, "K").strip()
+            if key:
+                key_rows.setdefault(key.casefold(), row_num)
+
+        next_row = max(rows.keys(), default=1) + 1
+        for key, value in updates.items():
+            clean_key = str(key or "").strip()
+            if not clean_key:
+                continue
+            row_num = key_rows.get(clean_key.casefold())
+            if row_num is None:
+                row_num = next_row
+                next_row += 1
+                key_rows[clean_key.casefold()] = row_num
+            set_cell(row_num, "K", clean_key)
+            set_cell(row_num, "L", str(value or ""))
+
+        dim = root.find(f"{{{MAIN_NS}}}dimension")
+        if dim is not None:
+            current_ref = dim.attrib.get("ref", "A1:L1")
+            end = current_ref.split(":")[-1]
+            match = re.match(r"([A-Z]+)", end)
+            last_col = match.group(1) if match else "L"
+            if _col_num(last_col + "1") < _col_num("L1"):
+                last_col = "L"
+            last_row = max(rows.keys(), default=1)
+            dim.set("ref", f"A1:{last_col}{last_row}")
+        return ET.tostring(root, encoding="unicode")
+
+    def _verify_settings_metadata(self, zf: zipfile.ZipFile, expected: Dict[str, str]) -> None:
+        shared = _load_shared_strings(zf)
+        sheets = _sheet_paths(zf)
+        path = sheets.get(self.SETTINGS_SHEET)
+        if not path:
+            raise ValueError("Save verification could not find the Settings sheet.")
+        actual = {}
+        headers_ok = False
+        for row_num, values in _read_sheet_rows(zf, path, shared):
+            if row_num == 1:
+                headers_ok = (
+                    values.get(11, "").strip() == "CAS Curator Metadata Key"
+                    and values.get(12, "").strip() == "CAS Curator Metadata Value"
+                )
+                continue
+            if not headers_ok:
+                continue
+            key = values.get(11, "").strip()
+            if key:
+                actual[key] = values.get(12, "").strip()
+        for key, value in expected.items():
+            if actual.get(key, "") != str(value or ""):
+                raise ValueError(f"Save verification failed for CAS Curator metadata '{key}'.")
 
     def _count_real_rows(self, zf, path: Optional[str], shared: List[str]) -> int:
         if not path:

@@ -70,6 +70,7 @@ ALLOW_EXPERIMENTAL_FEATURES = IS_DEV_BUILD and _env_flag(
 # Master Database behaviour are unchanged.  PUBLIC is always quiet; DEV can
 # temporarily opt out by setting SIMS3_CC_QUIET=0.
 QUIET_FULL_SCAN = True if IS_PUBLIC_BUILD else _env_flag("SIMS3_CC_QUIET", True)
+CREATE_SCAN_REPORT = _env_flag("S3CC_CREATE_SCAN_REPORT", True)
 
 
 class _ScannerConsoleLogger:
@@ -2168,7 +2169,10 @@ def calculate_risk(hq_warning, poly_warning, geom_bytes, fourk, vpxy, cc_type):
             score += 1
 
     elif hq_warning == "2048 HIGH":
-        score += 2
+        # 2K textures are above typical Sims 3/EA texture guidance and remain
+        # useful performance-review information, but one 2K texture alone is
+        # not enough evidence for a Moderate rating. Treat it as a mild +1.
+        score += 1
 
 
     # Mesh risk
@@ -2189,13 +2193,9 @@ def calculate_risk(hq_warning, poly_warning, geom_bytes, fourk, vpxy, cc_type):
     elif geom_mb >= 1:
         score += 1
 
-    # VPXY Complexity Risk
-
-    if vpxy >= 20:
-        score += 2
-
-    elif vpxy >= 10:
-        score += 1    
+    # VPXY count is technical linkage/dependency data, not a validated
+    # performance-load metric. Keep collecting it for health/dependency analysis,
+    # but do not add Performance Risk Score points from the raw resource count.
 
     # Cap score
     if score > 10:
@@ -2280,13 +2280,8 @@ def get_risk_reasons(
         reasons.append(
             f"GEOM size: {geom_mb:.2f} MB (Moderate)"
         )
-    # VPXY Complexity
-
-    if vpxy >= 20:
-        reasons.append(f"Very High VPXY Count: {vpxy}")
-
-    elif vpxy >= 10:
-        reasons.append(f"High VPXY Count: {vpxy}")
+    # VPXY count stays available as technical linkage/dependency information.
+    # It is intentionally not presented as a performance-risk reason.
 
     if fourk > 1:
         reasons.append(f"{fourk}x 4K Textures")
@@ -2296,19 +2291,19 @@ def get_risk_reasons(
 
 def get_poly_warning(poly_count, cc_type):
 
-    # Shoes - very strict
+    # Shoes - use the TS3 "Other" CAS guidance as the Heavy boundary.
     if cc_type == "Shoes":
 
-        if poly_count >= 8000:
+        if poly_count >= 12000:
             return "VERY HEAVY"
 
-        elif poly_count >= 4000:
+        elif poly_count >= 7000:
             return "HEAVY"
 
         return "Normal"
 
 
-    # Tops - stricter because they combine with bottoms
+    # Tops - current threshold already matches TS3 creator guidance.
     elif cc_type == "Top":
 
         if poly_count >= 12000:
@@ -2320,43 +2315,45 @@ def get_poly_warning(poly_count, cc_type):
         return "Normal"
 
 
-    # Bottoms - stricter because they combine with tops
+    # Bottoms - align with tops; TS3 guidance gives both the same allowance.
     elif cc_type == "Bottom":
 
-        if poly_count >= 10000:
+        if poly_count >= 12000:
             return "VERY HEAVY"
 
-        elif poly_count >= 5000:
+        elif poly_count >= 7000:
             return "HEAVY"
 
         return "Normal"
 
 
-    # Full body outfits
+    # Full body outfits - Heavy starts around the TS3 full-body guideline.
     elif cc_type == "Body":
 
-        if poly_count >= 15000:
+        if poly_count >= 20000:
             return "VERY HEAVY"
 
-        elif poly_count >= 7500:
+        elif poly_count >= 13000:
             return "HEAVY"
 
         return "Normal"
 
 
-    # Hair gets more allowance
+    # Hair - 30k is the current TS3 creator-guideline region; reserve
+    # Very Heavy for meshes clearly beyond it.
     elif cc_type == "Hair":
 
-        if poly_count >= 30000:
+        if poly_count >= 40000:
             return "VERY HEAVY"
 
-        elif poly_count >= 20000:
+        elif poly_count >= 30000:
             return "HEAVY"
 
         return "Normal"
 
 
-    # Accessories / small CAS parts
+    # Accessories / small CAS parts - use the TS3 "Other" CAS guidance
+    # rather than penalising ordinary 3k-5k accessories automatically.
     elif cc_type in [
         "Accessory",
         "Earrings",
@@ -2377,10 +2374,10 @@ def get_poly_warning(poly_count, cc_type):
         "Eyeliner"
     ]:
 
-        if poly_count >= 5000:
+        if poly_count >= 12000:
             return "VERY HEAVY"
 
-        elif poly_count >= 3000:
+        elif poly_count >= 7000:
             return "HEAVY"
 
         return "Normal"
@@ -2684,6 +2681,10 @@ MASTER_REVIEW_FRONT_COLUMNS = [
 MASTER_REVIEW_TAIL_COLUMNS = [
     "Subtype",
     "Original Source Path",
+    "Texture Resolutions",
+    "GEOM Total Bytes",
+    "4K Texture Count",
+    "Performance Data Version",
     "Package Hash",
     "Normalized Package",
 ]
@@ -3428,6 +3429,8 @@ def update_master_database(rows, casp_records):
         print("ROWS DEBUG:")
         print(rows[0] if rows else "NO ROWS")
 
+    creating_new_master_database = not os.path.exists(MASTER_DATABASE)
+
     if os.path.exists(MASTER_DATABASE):
 
         print("MASTER DB: loading existing workbook...")
@@ -3673,6 +3676,20 @@ def update_master_database(rows, casp_records):
         settings_ws["B5"] = "CC Magic Merge"
         settings_ws["B6"] = "Archive"
         settings_ws["B7"] = "Deleted"
+
+    # -------------------------
+    # PERFORMANCE SCORE MODEL METADATA
+    # -------------------------
+    # A brand-new MDB contains only scores calculated by this scanner model, so
+    # it can safely be marked current. Existing MDBs may contain rows scored by
+    # older releases and are deliberately NOT marked current by a partial scan;
+    # CAS Curator's full-Library Performance Score refresh handles that upgrade.
+    if creating_new_master_database:
+        settings_ws = wb["Settings"]
+        settings_ws["K1"] = "CAS Curator Metadata Key"
+        settings_ws["L1"] = "CAS Curator Metadata Value"
+        settings_ws["K2"] = "Performance Score Version"
+        settings_ws["L2"] = "2"
 
     # -------------------------
     # CREATE PACKAGES SHEET
@@ -4155,6 +4172,10 @@ def update_master_database(rows, casp_records):
         "Poly Warning",
         "Highest Polys",
         "Biggest Texture",
+        "Texture Resolutions",
+        "GEOM Total Bytes",
+        "4K Texture Count",
+        "Performance Data Version",
         "Skin Type",
         "Last Scanned",
         "CASP Instance IDs",
@@ -4615,6 +4636,10 @@ def update_master_database(rows, casp_records):
                 ws.cell(matched_row, column_map["Poly Warning"]).value = r[11]
                 ws.cell(matched_row, column_map["Highest Polys"]).value = r[12]
                 ws.cell(matched_row, column_map["Biggest Texture"]).value = r[13]
+                ws.cell(matched_row, column_map["Texture Resolutions"]).value = r[143] if len(r) > 143 else ""
+                ws.cell(matched_row, column_map["GEOM Total Bytes"]).value = r[144] if len(r) > 144 else 0
+                ws.cell(matched_row, column_map["4K Texture Count"]).value = r[145] if len(r) > 145 else 0
+                ws.cell(matched_row, column_map["Performance Data Version"]).value = r[146] if len(r) > 146 else ""
                 ws.cell(matched_row, column_map["Skin Type"]).value = r[14]
                 ws.cell(matched_row, column_map["Last Scanned"]).value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 ws.cell(matched_row, column_map["STBL IDs"]).value = r[15]
@@ -4823,6 +4848,10 @@ def update_master_database(rows, casp_records):
             ws.cell(new_row, column_map["Poly Warning"]).value = r[11]
             ws.cell(new_row, column_map["Highest Polys"]).value = r[12]
             ws.cell(new_row, column_map["Biggest Texture"]).value = r[13]
+            ws.cell(new_row, column_map["Texture Resolutions"]).value = r[143] if len(r) > 143 else ""
+            ws.cell(new_row, column_map["GEOM Total Bytes"]).value = r[144] if len(r) > 144 else 0
+            ws.cell(new_row, column_map["4K Texture Count"]).value = r[145] if len(r) > 145 else 0
+            ws.cell(new_row, column_map["Performance Data Version"]).value = r[146] if len(r) > 146 else ""
             ws.cell(new_row, column_map["Skin Type"]).value = r[14]
             ws.cell(new_row, column_map["Last Scanned"]).value = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             ws.cell(new_row, column_map["STBL IDs"]).value = r[15]
@@ -21423,6 +21452,10 @@ for root, dirs, files in os.walk(folder):
                     risk_reasons,
                     ea_status,
                     data[151] if len(data) > 151 else "",  # 142 structural subtype
+                    data[2],                                # 143 Texture Resolutions
+                    data[10],                               # 144 GEOM Total Bytes
+                    data[3],                                # 145 4K Texture Count
+                    "1",                                   # 146 Performance Data Version
                 ])
 
                 tech_rows.append([
@@ -21786,6 +21819,11 @@ for root, dirs, files in os.walk(folder):
                     ("BROKEN" if empty_package_file else "ERROR"),
                     _condense_package_health_issue(error_text),
                     "ERROR",
+                    "",     # 142 structural subtype unavailable
+                    "",     # 143 Texture Resolutions unavailable
+                    0,      # 144 GEOM Total Bytes unavailable
+                    0,      # 145 4K Texture Count unavailable
+                    "",     # 146 Performance Data Version intentionally blank
                 ])
                                 
                 tech_rows.append([
@@ -22871,7 +22909,14 @@ for r in rows:
 if "Technical Details" in wb.sheetnames:
     wb.remove(wb["Technical Details"])
 
-wb.save(OUTPUT)
+if CREATE_SCAN_REPORT:
+    wb.save(OUTPUT)
+else:
+    try:
+        wb.close()
+    except Exception:
+        pass
+    print("SCAN REPORT: disabled by CAS Curator option; MDB data will still be saved.")
 # -------------------------
 # UPDATE MASTER DATABASE
 # -------------------------
@@ -22973,7 +23018,10 @@ else:
     )
 
 
-print("Finished! Scan summary saved:", OUTPUT)
+if CREATE_SCAN_REPORT:
+    print("Finished! Scan summary saved:", OUTPUT)
+else:
+    print("Finished! Scan report disabled; Master Database updated without a separate report.")
 print("Console log saved:", LOG_OUTPUT)
 
 

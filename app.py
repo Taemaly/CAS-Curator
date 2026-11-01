@@ -10,6 +10,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -34,7 +35,7 @@ from PySide6.QtCore import (
     QSize,
     QRect,
 )
-from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QFontMetrics, QIcon, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QFontMetrics, QIcon, QPainter, QPalette, QPen, QPixmap, QPolygon, QTextCharFormat, QTextCursor, QTextDocument
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -62,6 +63,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QProgressBar,
+    QProgressDialog,
     QScrollArea,
     QScrollBar,
     QSizePolicy,
@@ -70,19 +72,33 @@ from PySide6.QtWidgets import (
     QStyledItemDelegate,
     QStyle,
     QStyleFactory,
+    QStyleOptionButton,
     QStackedWidget,
     QTabWidget,
     QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTextBrowser,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from mdb_reader import MDBData, MDBWorkbook, WorkbookChangedError, target_to_local_path
+from mdb_reader import (
+    MDBData, MDBWorkbook, WorkbookChangedError, target_to_local_path,
+    CURRENT_PERFORMANCE_SCORE_VERSION, PERFORMANCE_SCORE_VERSION_METADATA_KEY,
+)
 from mdb_compat import inspect_mdb_compatibility, create_compatible_copy
 from custom_theme_tools import palette_metadata, palette_source
+from theme_studio_core import (
+    guide_section_tint, guide_highlight_tint, ensure_guide_highlight_separation,
+    guide_highlight_border,
+)
+from custom_theme_storage import (
+    default_custom_theme_dir, export_native_theme_file, export_theme_backup, migrate_discovered_legacy_themes,
+    migrate_legacy_custom_themes, read_native_theme_payload,
+)
+from custom_colour_storage import default_saved_colour_file
 from random_sim_core import (
     category_label,
     default_count_for_category,
@@ -100,6 +116,18 @@ from random_sim_exporter import (
     package_identity,
 )
 from attribution_lookup import lookup_attribution, clean_package_terms, clean_search_query
+from update_manager import (
+    UpdateError,
+    fetch_latest_stable_release,
+    is_newer_version,
+    choose_installer_asset,
+    choose_checksum_asset,
+    download_verified_installer,
+    release_summary,
+)
+
+MAX_PINNED_PACKAGES = 5
+
 from random_sim_usage import (
     default_usage_registry_path,
     dependency_usages_for_record,
@@ -112,6 +140,23 @@ from random_sim_usage import (
     usages_for_sim,
 )
 
+class VisibleColumnCheckBox(QCheckBox):
+    """Native checkbox with a stronger theme-aware outline for the column chooser."""
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        option = QStyleOptionButton()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, self)
+        if not rect.isValid():
+            return
+        outline = self.palette().color(QPalette.ColorRole.Text)
+        outline.setAlpha(215 if self.isEnabled() else 120)
+        painter = QPainter(self)
+        painter.setPen(QPen(outline, 1))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+
+
 APP_NAME = "CAS Curator"
 _DEFAULT_EDITION = "PUBLIC" if (Path(__file__).resolve().parent / "PUBLIC_EDITION").exists() else "DEV"
 APP_EDITION = str(os.environ.get("CAS_CURATOR_EDITION", _DEFAULT_EDITION) or _DEFAULT_EDITION).strip().upper()
@@ -120,13 +165,15 @@ if APP_EDITION not in {"DEV", "PUBLIC"}:
 IS_PUBLIC_BUILD = APP_EDITION == "PUBLIC"
 IS_DEV_BUILD = not IS_PUBLIC_BUILD
 VERSION = (
-    "v1.0.1"
+    "v1.1.0"
     if IS_PUBLIC_BUILD else
-    "v0.4.63 - DEV Scanner Log + Table Panel Resize TEST"
+    "v0.4.82 - DEV Sticky Theme Actions TEST"
 )
-BUILD_DATE = "23 October 2026"
+BUILD_DATE = "31 October 2026"
 PROJECT_CREATOR = "Taemaly"
 PROJECT_SOURCE_URL = "https://github.com/Taemaly/CAS-Curator"
+IS_TEST_BUILD = bool(re.search(r"\bTEST[_\s-]?\d+", VERSION, re.IGNORECASE))
+UPDATE_CHANNEL = "stable" if IS_PUBLIC_BUILD and not IS_TEST_BUILD else "test/dev"
 
 
 from zip_tools import (
@@ -189,7 +236,6 @@ PUBLIC_BASIC_FIELDS = {
     "Converter",
     "Health Status",
     "CC Type",
-    "Risk Score",
     "Highest Polys",
     "Age",
     "Gender",
@@ -201,6 +247,7 @@ PUBLIC_BASIC_FIELDS = {
 }
 PUBLIC_ADVANCED_FIELDS = {
     "Health Issues",
+    "Risk Score",
     "CASP Instance IDs",
     "HQ Warning",
     "Poly Warning",
@@ -226,6 +273,7 @@ VIRTUAL_LIBRARY_FIELDS = {"CC Magic Import"}
 _ADVANCED_FEATURES_ENABLED = False
 _EXPERIMENTAL_FEATURES_ENABLED = False
 DIRTY_ROLE = 257  # Qt.UserRole + 1
+PINNED_ROLE = 258  # Qt.UserRole + 2
 
 def _public_field_visible(field: str) -> bool:
     if field == "Library Location":
@@ -259,16 +307,26 @@ _BASE_DEFAULT_COLUMNS = [
 ]
 DEFAULT_COLUMNS = [field for field in _BASE_DEFAULT_COLUMNS if _public_field_visible(field)]
 
+# Normal Library Search is deliberately user-facing. Technical identity lookup
+# belongs to Find ID… so the live proxy filter never needs to inspect arbitrary
+# hidden/raw scanner columns while the user is typing or pasting.
 _BASE_SEARCH_FIELDS = [
     "Package", "Status", "Health Status", "Health Issues", "CC Type",
-    "Subtype", "Age", "Gender", "Outfit Category", "CASP Instance IDs", "Risk", "Risk Score", "EA Resource Status",
-    "Creator", "Converter", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes", "Package Hash", "Normalized Package",
-    "Original Source Path",
+    "Subtype", "Age", "Gender", "Outfit Category", "Risk", "Risk Score", "EA Resource Status",
+    "Creator", "Converter", "File Location", "CC Magic Import", "CC Magic Profiles", "Merge Profiles", "Notes",
 ]
-SEARCH_FIELDS = [
-    field for field in _BASE_SEARCH_FIELDS
-    if _public_field_visible(field)
+TECHNICAL_IDENTIFIER_FIELDS = [
+    "CASP Instance IDs", "Package Hash", "Normalized Package", "Original Source Path",
+    "GEOM Instance IDs", "IMG Instance IDs", "VPXY Instance IDs",
+    "GEOM IDs", "IMG IDs", "VPXY IDs",
+    "STBL IDs", "BGEO IDs", "FACE IDs", "FBLN IDs", "KEY IDs",
 ]
+RESOURCE_IDENTIFIER_FIELDS = [
+    "CASP Instance IDs", "GEOM Instance IDs", "IMG Instance IDs", "VPXY Instance IDs",
+    "GEOM IDs", "IMG IDs", "VPXY IDs", "STBL IDs", "BGEO IDs",
+    "FACE IDs", "FBLN IDs", "KEY IDs",
+]
+SEARCH_FIELDS = [field for field in _BASE_SEARCH_FIELDS if _public_field_visible(field)]
 
 _BASE_SUMMARY_FIELDS = [
     # Normal package summary first. CC Type / Highest Polys are skipped below
@@ -323,12 +381,25 @@ DISPLAY_FIELD_NAMES = {
     "Merge Profiles": "Merge Profiles",
     "CC Magic Import": "CC Magic Import",
     "File Location": "Current File Location",
+    "Risk": "Stored Risk",
+    "Risk Score": "Performance Risk Score",
     PROFILE_LOCATION_FIELD: "Planned Location",
+}
+
+# Keep the full user-facing name everywhere except the dense Table header.
+# The compact header avoids pushing this Advanced-only column out of view
+# while its tooltip, Columns dialog, Details panel and Guide retain the full name.
+TABLE_DISPLAY_FIELD_NAMES = {
+    "Risk Score": "Performance Score",
 }
 
 
 def _display_field_name(field: str) -> str:
     return DISPLAY_FIELD_NAMES.get(field, field)
+
+
+def _table_display_field_name(field: str) -> str:
+    return TABLE_DISPLAY_FIELD_NAMES.get(field, _display_field_name(field))
 
 
 def _storage_field_name(display_name: str) -> str:
@@ -480,7 +551,7 @@ COLUMN_WIDTHS = {
     "Outfit Category": 260,
     "CASP Instance IDs": 240,
     "Risk": 95,
-    "Risk Score": 90,
+    "Risk Score": 138,
     "File Location": 190,
     "CC Magic Import": 140,
     "CC Magic Profiles": 220,
@@ -758,6 +829,102 @@ def _button_text_for(bg: str, dark: str = "#2F2F2F", light: str = "#FFFFFF") -> 
     return light if _luma_hex(bg) < 148 else dark
 
 
+def _relative_luminance_hex(value: str) -> float:
+    value = value.lstrip("#")
+    channels = []
+    for i in (0, 2, 4):
+        channel = int(value[i:i+2], 16) / 255.0
+        channels.append(channel / 12.92 if channel <= 0.04045 else ((channel + 0.055) / 1.055) ** 2.4)
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast_ratio_hex(foreground: str, background: str) -> float:
+    a = _relative_luminance_hex(foreground)
+    b = _relative_luminance_hex(background)
+    lighter, darker = max(a, b), min(a, b)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _adaptive_text_variants(base: str) -> tuple[str, str]:
+    """Legacy helper retained for compatibility with older theme data."""
+    raw = str(base or '').strip().lstrip('#')
+    if re.fullmatch(r'[0-9A-Fa-f]{6}', raw):
+        base = '#' + raw.upper()
+    elif re.fullmatch(r'[0-9A-Fa-f]{3}', raw):
+        base = '#' + ''.join(ch * 2 for ch in raw).upper()
+    else:
+        base = '#202020'
+    return _mix_hex(base, "#000000", 0.46), _mix_hex(base, "#FFFFFF", 0.56)
+
+
+def _adaptive_text_for(base: str, background: str) -> str:
+    """Legacy helper retained for compatibility with older theme data."""
+    dark, light = _adaptive_text_variants(base)
+    return max((dark, light), key=lambda colour: _contrast_ratio_hex(colour, background))
+
+
+def _automatic_theme_text_for(background: str, muted: bool = False) -> str:
+    """Choose fixed readable text for a user-colourable custom-theme surface."""
+    candidates = (('#5A5A5A', '#DADADA') if muted else ('#171717', '#F7F7F7'))
+    return max(candidates, key=lambda colour: _contrast_ratio_hex(colour, background))
+
+
+def _secondary_text_for_surface(background: str, target_ratio: float = 4.5) -> str:
+    """Return readable secondary text tailored to the exact surface colour.
+
+    Start from whichever near-black/near-white endpoint has the strongest
+    contrast, then blend it toward the surface until it is as soft as possible
+    while still meeting the requested contrast target.  This keeps helper text
+    visibly secondary without relying on one fixed grey that can disappear on
+    shuffled/custom colours.
+    """
+    background = _normalize_hex(str(background or "")) or "#FFFFFF"
+    endpoints = ("#171717", "#F7F7F7")
+    primary = max(endpoints, key=lambda colour: _contrast_ratio_hex(colour, background))
+
+    # If even the strongest endpoint cannot meet the target, use it unchanged.
+    if _contrast_ratio_hex(primary, background) < target_ratio:
+        return primary
+
+    best = primary
+    # Move progressively toward the card colour.  Keep the last colour that
+    # still satisfies the target so the result is muted rather than stark.
+    for step in range(5, 96, 5):
+        candidate = _mix_hex(primary, background, step / 100.0)
+        if _contrast_ratio_hex(candidate, background) >= target_ratio:
+            best = candidate
+        else:
+            break
+    return best
+
+
+def _selection_outline_for(preferred: str, row_fill: str, min_ratio: float = 2.20) -> str:
+    """Keep the selected-row outline visibly separate from the row fill.
+
+    Theme selection colours can be attractive but still disappear against a
+    similarly coloured table row. Preserve the requested hue when possible,
+    then move it toward the higher-contrast dark/light endpoint until the
+    border is unmistakable.
+    """
+    preferred = _normalize_hex(str(preferred or "")) or "#4F7FA8"
+    row_fill = _normalize_hex(str(row_fill or "")) or "#FFFFFF"
+    if _contrast_ratio_hex(preferred, row_fill) >= min_ratio:
+        return preferred
+
+    endpoints = ("#171717", "#F7F7F7")
+    target = max(endpoints, key=lambda colour: _contrast_ratio_hex(colour, row_fill))
+    best = preferred
+    best_ratio = _contrast_ratio_hex(preferred, row_fill)
+    for step in range(10, 91, 5):
+        candidate = _mix_hex(preferred, target, step / 100.0)
+        ratio = _contrast_ratio_hex(candidate, row_fill)
+        if ratio > best_ratio:
+            best, best_ratio = candidate, ratio
+        if ratio >= min_ratio:
+            return candidate
+    return best
+
+
 def _normalize_hex(value: str) -> Optional[str]:
     value = value.strip().lstrip("#")
     if re.fullmatch(r"[0-9A-Fa-f]{6}", value):
@@ -895,6 +1062,7 @@ def build_theme_from_palette(name: str, colours: List[str]) -> Dict[str, object]
         "ui_scrollbar_hover": scrollbar_hover,
         "ui_thumb_fill": thumb_fill,
         "ui_info_card_border": info_border,
+        "_colour_library_rows": True,
     }
     return theme
 
@@ -928,6 +1096,8 @@ class LibraryTableModel(QAbstractTableModel):
         self.virtual_setter = None
         self.virtual_tooltip_provider = None
         self.virtual_dirty_provider = None
+        self.pinned_provider = None
+        self.pin_icon_provider = None
 
     def set_virtual_field_handlers(
         self,
@@ -942,6 +1112,18 @@ class LibraryTableModel(QAbstractTableModel):
         self.virtual_setter = setter
         self.virtual_tooltip_provider = tooltip_provider
         self.virtual_dirty_provider = dirty_provider
+
+    def set_pin_handlers(self, pinned_provider=None, icon_provider=None):
+        self.pinned_provider = pinned_provider
+        self.pin_icon_provider = icon_provider
+
+    def refresh_pin_decorations(self):
+        if not self.records or "Package" not in self.columns:
+            return
+        column = self.columns.index("Package")
+        first = self.index(0, column)
+        last = self.index(len(self.records) - 1, column)
+        self.dataChanged.emit(first, last, [Qt.DecorationRole, PINNED_ROLE])
 
     def set_pending_changes(self, pending_changes: Dict[int, Dict[str, str]]):
         # Keep the same shared dict as MainWindow so the table is only an editor/view,
@@ -1034,12 +1216,30 @@ class LibraryTableModel(QAbstractTableModel):
                 return (value or "(empty)") + suffix
             if field == "File Location":
                 return (value or "(empty)") + "\n\nCurrent File Location is read-only in the Table. Route first, or use Edit to correct the recorded physical location."
+            if field == "Risk Score":
+                return (value or "(empty)") + "\n\nLegacy advisory score from older scanner heuristics. A high score does not by itself mean the package is broken or unsafe; performance-heavy CC can also score higher. The scoring model is being re-audited by CC category."
+            if field == "Highest Polys":
+                return (value or "(empty)") + "\n\nRaw performance-related evidence. Polycount needs CC-category context and is not, by itself, a health/safety verdict."
             if field != "#" and value:
                 return _cc_type_label(value) if field == "CC Type" else value
         if role == Qt.UserRole:
             return rec
         if role == DIRTY_ROLE:
             return self.is_row_dirty(index.row())
+        if role == PINNED_ROLE:
+            if self.pinned_provider is not None:
+                try:
+                    return bool(self.pinned_provider(index.row()))
+                except Exception:
+                    return False
+            return False
+        if role == Qt.DecorationRole and field == "Package":
+            if self.pinned_provider is not None:
+                try:
+                    if bool(self.pinned_provider(index.row())) and self.pin_icon_provider is not None:
+                        return self.pin_icon_provider()
+                except Exception:
+                    pass
         if role == Qt.TextAlignmentRole and field in ("#", "Thumbnail", "Risk Score"):
             return int(Qt.AlignCenter)
         if role == Qt.ForegroundRole and field == "#" and self.is_row_dirty(index.row()):
@@ -1177,16 +1377,21 @@ class LibraryTableModel(QAbstractTableModel):
         if orientation == Qt.Horizontal and 0 <= section < len(self.columns):
             field = self.columns[section]
             if role == Qt.DisplayRole:
-                return _display_field_name(field)
-            if role == Qt.ToolTipRole and field in EDITABLE_FIELDS:
-                label = _display_field_name(field)
-                if field == "CC Magic Profiles":
-                    return (
-                        "Profile Membership — shows every Profile this package belongs to. "
-                        "It does not change when Current Profile changes. "
-                        "Double-click to add another Profile; use Delete to clear memberships only after confirmation."
-                    )
-                return f"{label} — double-click to edit; drag a populated value down to copy it, or select rows in this column and press Delete to clear"
+                return _table_display_field_name(field)
+            if role == Qt.ToolTipRole:
+                if field == "Risk Score":
+                    return "Performance Risk Score — advisory estimate of likely game-performance load/risk from measured package characteristics. It is separate from Health Status: a high score does not mean CC is broken or unsafe."
+                if field == "Highest Polys":
+                    return "Highest Polys — raw performance evidence. Appropriate values depend on the CC category; this is not a health/safety verdict by itself."
+                if field in EDITABLE_FIELDS:
+                    label = _display_field_name(field)
+                    if field == "CC Magic Profiles":
+                        return (
+                            "Profile Membership — shows every Profile this package belongs to. "
+                            "It does not change when Current Profile changes. "
+                            "Double-click to add another Profile; use Delete to clear memberships only after confirmation."
+                        )
+                    return f"{label} — double-click to edit; drag a populated value down to copy it, or select rows in this column and press Delete to clear"
         return super().headerData(section, orientation, role)
 
     def record(self, row: int) -> Dict[str, str]:
@@ -1336,7 +1541,13 @@ class LibraryFilterProxy(QSortFilterProxyModel):
             return False
 
         if self.search_text:
-            values = [model.effective_value(source_row, field) if hasattr(model, "effective_value") else rec.get(field, "") for field in SEARCH_FIELDS]
+            # Normal Search only inspects the stable user-facing search fields.
+            # CASP/resource IDs, hashes and stored/source paths are handled by
+            # Find ID… instead of the live proxy filter.
+            values = [
+                str(model.effective_value(source_row, field) if hasattr(model, "effective_value") else rec.get(field, "") or "")
+                for field in SEARCH_FIELDS
+            ]
             haystack = "\n".join(values).casefold()
             if self.search_text not in haystack:
                 return False
@@ -1387,6 +1598,34 @@ class RowOutlineDelegate(QStyledItemDelegate):
         self.table = table
         self.theme = theme
         self.options_provider = options_provider
+        self.table.setMouseTracking(True)
+        self.table.viewport().installEventFilter(self)
+        if not hasattr(self.table, "_hover_row"):
+            self.table._hover_row = -1
+
+    def _sync_hover_row(self, row: int):
+        row = int(row)
+        views = [self.table]
+        for view in getattr(self.table, "_hover_sync_views", []):
+            if view is not None and view not in views:
+                views.append(view)
+        changed = False
+        for view in views:
+            if getattr(view, "_hover_row", -1) != row:
+                view._hover_row = row
+                changed = True
+        if changed:
+            for view in views:
+                view.viewport().update()
+
+    def eventFilter(self, watched, event):
+        if watched is self.table.viewport():
+            if event.type() == QEvent.MouseMove:
+                index = self.table.indexAt(event.position().toPoint())
+                self._sync_hover_row(index.row() if index.isValid() else -1)
+            elif event.type() in (QEvent.Leave, QEvent.HoverLeave):
+                self._sync_hover_row(-1)
+        return super().eventFilter(watched, event)
 
     def set_theme(self, theme: Dict[str, str]):
         self.theme = theme
@@ -1398,22 +1637,44 @@ class RowOutlineDelegate(QStyledItemDelegate):
     def paint(self, painter: QPainter, option, index: QModelIndex):
         from PySide6.QtWidgets import QStyleOptionViewItem
         selected = bool(option.state & QStyle.State_Selected)
+        hovered = bool(option.state & QStyle.State_MouseOver) or index.row() == getattr(self.table, "_hover_row", -1)
+        custom_theme = bool(self.theme.get("_custom"))
         opt = option
-        if selected:
-            from PySide6.QtWidgets import QStyleOptionViewItem
+        if selected or hovered:
+            # Row hover/selection is painted explicitly below.  Remove Qt's
+            # per-cell hover/selection brushes so the whole row uses one
+            # continuous theme-aware treatment instead of highlighting only
+            # the filename cell under the pointer.
             opt = QStyleOptionViewItem(option)
-            opt.state &= ~QStyle.State_Selected
+            if selected:
+                opt.state &= ~QStyle.State_Selected
+            if hovered:
+                opt.state &= ~QStyle.State_MouseOver
 
-        painter.save()
         row_bg = (self.theme["line_alt"] if index.row() % 2 else
                   self.theme.get("row_main", "#FFFFFF"))
-        painter.fillRect(option.rect, QColor(row_bg))
+        paint_bg = row_bg
+        selection_colour = self.theme.get("selection", "#4F7FA8")
+        if hovered:
+            # Hover is a whole-row state for built-in and custom themes.  A
+            # modest tint keeps neutral rows readable while making the row
+            # unmistakable from the filename column through the final column.
+            paint_bg = _mix_hex(paint_bg, selection_colour, 0.12)
+
+        if selected:
+            # Keep the selected row recognisable as a row, rather than drawing
+            # a heavy floating rectangle around it.  Selected rows get a
+            # slightly stronger version of the same full-row tint.
+            paint_bg = _mix_hex(paint_bg, selection_colour, 0.14)
+
+        painter.save()
+        painter.fillRect(option.rect, QColor(paint_bg))
         painter.restore()
-        if self.theme.get("_custom"):
+        if custom_theme or hovered or selected:
             from PySide6.QtGui import QPalette
             opt = QStyleOptionViewItem(opt) if opt is option else opt
             opt.palette.setColor(QPalette.Text, QColor(_button_text_for(
-                row_bg, dark="#171717", light="#FAFAFA")))
+                paint_bg, dark="#171717", light="#FAFAFA")))
 
         super().paint(painter, opt, index)
 
@@ -1657,20 +1918,26 @@ class FrozenPackageTableView(QTableView):
         if not rows:
             return
         painter = QPainter(self.viewport())
-        pen = QPen(QColor(self.theme.get("selection", "#4A90E2")))
-        pen.setWidth(2)
-        painter.setPen(pen)
         x1 = 0
         x2 = self.viewport().width() - 1
         for idx in rows:
             row_rect = self.visualRect(idx)
             if not row_rect.isValid():
                 continue
+            row_fill = (self.theme["line_alt"] if idx.row() % 2 else
+                        self.theme.get("row_main", "#FFFFFF"))
+            outline = _selection_outline_for(self.theme.get("selection", "#4A90E2"), row_fill)
+            pen = QPen(QColor(outline))
+            pen.setWidth(2)
+            painter.setPen(pen)
             top = row_rect.top() + 1
             bottom = row_rect.bottom() - 1
             painter.drawLine(x1, top, x2, top)
             painter.drawLine(x1, bottom, x2, bottom)
-            painter.drawLine(x1, top, x1, bottom)
+            accent_pen = QPen(QColor(outline))
+            accent_pen.setWidth(4)
+            painter.setPen(accent_pen)
+            painter.drawLine(x1 + 2, top + 2, x1 + 2, bottom - 2)
 
 
 class ResizeAwareFrame(QFrame):
@@ -1687,7 +1954,14 @@ class DetailPanelSplitter(QSplitter):
     def __init__(self, orientation=Qt.Horizontal, parent=None):
         super().__init__(orientation, parent)
         self.detail_panel_collapsed = False
+        self.detail_panel_on_left = False
         self.last_detail_panel_width = 353
+
+    def _detail_index(self) -> int:
+        return 0 if self.detail_panel_on_left else 1
+
+    def _content_index(self) -> int:
+        return 1 - self._detail_index()
 
     def _refresh_handle(self):
         # Compatibility hook used by the main window.  The collapse control now
@@ -1699,17 +1973,24 @@ class DetailPanelSplitter(QSplitter):
         collapsed = bool(collapsed)
         sizes = self.sizes()
         total = sum(sizes) or max(1, self.width())
-        if len(sizes) >= 2 and sizes[1] > 0:
-            self.last_detail_panel_width = sizes[1]
+        detail_index = self._detail_index()
+        content_index = self._content_index()
+        if len(sizes) >= 2 and sizes[detail_index] > 0:
+            self.last_detail_panel_width = sizes[detail_index]
         self.detail_panel_collapsed = collapsed
         if collapsed:
-            self.setSizes([max(1, total), 0])
+            new_sizes = [0, 0]
+            new_sizes[content_index] = max(1, total)
+            self.setSizes(new_sizes)
         else:
             wanted = max(300, int(self.last_detail_panel_width or 353))
             wanted = min(720, wanted)
             if total > 1:
                 wanted = min(wanted, max(1, total - 220))
-            self.setSizes([max(1, total - wanted), max(1, wanted)])
+            new_sizes = [0, 0]
+            new_sizes[detail_index] = max(1, wanted)
+            new_sizes[content_index] = max(1, total - wanted)
+            self.setSizes(new_sizes)
         self.detailPanelToggled.emit(collapsed)
 
     def toggle_detail_panel(self):
@@ -1822,21 +2103,30 @@ class OutlineTableView(QTableView):
         if selection:
             rows = selection.selectedRows()
             if rows:
-                pen = QPen(QColor(self.theme["selection"]))
-                pen.setWidth(2)
-                painter.setPen(pen)
                 x1 = 0
                 x2 = self.viewport().width() - 1
                 for idx in rows:
                     row_rect = self.visualRect(idx)
                     if not row_rect.isValid():
                         continue
+                    row_fill = (self.theme["line_alt"] if idx.row() % 2 else
+                                self.theme.get("row_main", "#FFFFFF"))
+                    outline = _selection_outline_for(self.theme["selection"], row_fill)
+                    pen = QPen(QColor(outline))
+                    pen.setWidth(2)
+                    painter.setPen(pen)
                     top = row_rect.top() + 1
                     bottom = row_rect.bottom() - 1
+                    # Emphasise the row without enclosing it in a heavy box.
                     painter.drawLine(x1, top, x2, top)
                     painter.drawLine(x1, bottom, x2, bottom)
-                    painter.drawLine(x1, top, x1, bottom)
-                    painter.drawLine(x2, top, x2, bottom)
+
+                    # A solid left marker gives a clear selection cue even on
+                    # very pale or very dark custom-theme rows.
+                    accent_pen = QPen(QColor(outline))
+                    accent_pen.setWidth(4)
+                    painter.setPen(accent_pen)
+                    painter.drawLine(x1 + 2, top + 2, x1 + 2, bottom - 2)
 
         current = self._current_fill_index()
         if current.isValid():
@@ -2047,8 +2337,8 @@ class AttributionLookupDialog(QDialog):
         self.manual_converter_edit = QLineEdit()
         self.manual_converter_edit.setPlaceholderText("Type converter name if explicitly credited")
         manual_layout.addWidget(self.manual_converter_edit, 1)
-        self.manual_stage_btn = QPushButton("Stage Manual Values")
-        self.manual_stage_btn.setToolTip("Stage the names you entered. You still need to use Save Changes afterwards.")
+        self.manual_stage_btn = QPushButton("Use Manual Values")
+        self.manual_stage_btn.setToolTip("Add the names you entered to the Library as unsaved changes. Use Save Changes afterwards.")
         self.manual_stage_btn.clicked.connect(self._stage_manual_values)
         manual_layout.addWidget(self.manual_stage_btn)
         root.addWidget(manual_group)
@@ -2059,8 +2349,8 @@ class AttributionLookupDialog(QDialog):
         buttons.addWidget(self.open_source_btn)
         self.open_source_btn.hide()
         buttons.addStretch(1)
-        self.apply_btn = QPushButton("Stage Checked Suggestions")
-        self.apply_btn.setToolTip("Stage Creator/Converter edits in the Library. You still need to use Save Changes afterwards.")
+        self.apply_btn = QPushButton("Use Checked Suggestions")
+        self.apply_btn.setToolTip("Add the checked Creator/Converter suggestions to the Library as unsaved changes. Use Save Changes afterwards.")
         self.apply_btn.clicked.connect(self._apply_checked)
         buttons.addWidget(self.apply_btn)
         self.apply_btn.hide()
@@ -2190,7 +2480,7 @@ class AttributionLookupDialog(QDialog):
             field_item.setFlags(field_item.flags() & ~Qt.ItemIsEditable)
             self.suggestions_table.setItem(row_index, 1, field_item)
             name_item = QTableWidgetItem(str(candidate.get("name", "")))
-            name_item.setToolTip("You can correct the suggested name before staging it.")
+            name_item.setToolTip("You can correct the suggested name before saving it.")
             self.suggestions_table.setItem(row_index, 2, name_item)
             conf_item = QTableWidgetItem(confidence)
             conf_item.setFlags(conf_item.flags() & ~Qt.ItemIsEditable)
@@ -2292,7 +2582,7 @@ class AttributionLookupDialog(QDialog):
                 "Replace existing attribution?",
                 "These values would replace existing attribution:\n\n"
                 + "\n".join(replacements)
-                + "\n\nStage these changes? They will still remain unsaved until Save Changes.",
+                + "\n\nApply these changes? They will remain unsaved until you choose Save Changes.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -2317,13 +2607,13 @@ class AttributionLookupDialog(QDialog):
         self.owner._update_selected_dirty_label()
         self.owner._apply_filters()
         self.owner.statusBar().showMessage(
-            f"{source_label} attribution staged: " + ", ".join(changed_fields) + " — unsaved until Save Changes",
+            f"{source_label} attribution updated: " + ", ".join(changed_fields) + " — not saved until Save Changes",
             9000,
         )
         QMessageBox.information(
             self,
-            "Attribution staged",
-            "Staged " + ", ".join(changed_fields) + ".\n\nReview the Library values, then use Save Changes when you are satisfied.",
+            "Attribution updated",
+            "Updated " + ", ".join(changed_fields) + ".\n\nReview the Library values, then use Save Changes when you are satisfied.",
         )
         self.accept()
         return True
@@ -2370,6 +2660,144 @@ class AttributionLookupDialog(QDialog):
             return
         super().reject()
 
+
+class UpdateCheckThread(QThread):
+    releaseReady = Signal(object)
+    checkFailed = Signal(str)
+
+    def run(self):
+        try:
+            self.releaseReady.emit(fetch_latest_stable_release())
+        except Exception as exc:
+            self.checkFailed.emit(str(exc))
+
+
+class UpdateDownloadThread(QThread):
+    progressChanged = Signal(int, int)
+    downloadReady = Signal(object)
+    downloadFailed = Signal(str)
+
+    def __init__(self, release: dict, parent=None):
+        super().__init__(parent)
+        self.release = dict(release or {})
+
+    def run(self):
+        try:
+            result = download_verified_installer(
+                self.release,
+                progress=lambda done, total: self.progressChanged.emit(int(done), int(total)),
+            )
+            self.downloadReady.emit(result)
+        except Exception as exc:
+            self.downloadFailed.emit(str(exc))
+
+
+class UpdateAvailableDialog(QDialog):
+    def __init__(self, owner, release: dict):
+        super().__init__(owner)
+        self.owner = owner
+        self.release = dict(release or {})
+        self.summary = release_summary(self.release)
+        self.setWindowTitle("CAS Curator Update")
+        self.setModal(True)
+        self.resize(700, 600)
+        self.setMinimumSize(560, 460)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(10)
+
+        heading = QLabel("A new CAS Curator version is available")
+        font = heading.font()
+        font.setPointSize(max(font.pointSize() + 3, 13))
+        font.setBold(True)
+        heading.setFont(font)
+        layout.addWidget(heading)
+
+        versions = QLabel(
+            f"<b>Current:</b> {html.escape(VERSION)} &nbsp;&nbsp; → &nbsp;&nbsp; "
+            f"<b>Available:</b> {html.escape(self.summary.get('tag') or '—')}"
+        )
+        versions.setWordWrap(True)
+        layout.addWidget(versions)
+
+        name = str(self.summary.get("name") or "").strip()
+        if name and name != self.summary.get("tag"):
+            release_name = QLabel(html.escape(name))
+            release_name.setWordWrap(True)
+            layout.addWidget(release_name)
+
+        changelog_label = QLabel("<b>Changelog</b>")
+        layout.addWidget(changelog_label)
+        self.changelog = QTextBrowser()
+        self.changelog.setOpenExternalLinks(False)
+        body = str(self.summary.get("body") or "").strip()
+        if body:
+            try:
+                self.changelog.setMarkdown(body)
+            except Exception:
+                self.changelog.setPlainText(body)
+        else:
+            self.changelog.setPlainText("No release notes were provided for this update.")
+        layout.addWidget(self.changelog, 1)
+
+        installer = choose_installer_asset(self.release)
+        checksum = choose_checksum_asset(self.release, str(installer.get("name") or "")) if installer else None
+        if installer and checksum:
+            security_text = (
+                f"Installer: {html.escape(str(installer.get('name') or ''))}<br>"
+                f"Verification file: {html.escape(str(checksum.get('name') or 'checksum file'))}"
+            )
+        elif installer:
+            security_text = (
+                f"Installer: {html.escape(str(installer.get('name') or ''))}<br>"
+                "<b>Automatic installation unavailable:</b> this release does not include the verification file required for safe automatic installation."
+            )
+        else:
+            security_text = "<b>Automatic installation unavailable:</b> no recognised Windows installer asset was found."
+        self.security_label = QLabel(security_text)
+        self.security_label.setWordWrap(True)
+        layout.addWidget(self.security_label)
+
+        self.status_label = QLabel("")
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setVisible(False)
+        self.progress.setRange(0, 100)
+        layout.addWidget(self.progress)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        self.install_button = QPushButton("Download && Install")
+        self.close_button = QPushButton("Not now")
+        self.install_button.setDefault(True)
+        can_install = bool(installer and checksum and IS_PUBLIC_BUILD and not IS_TEST_BUILD)
+        self.install_button.setEnabled(can_install)
+        if not can_install and IS_TEST_BUILD:
+            self.install_button.setToolTip("Automatic installation is disabled in TEST builds. The stable public build enables it.")
+            self.status_label.setText("TEST build: update installation is disabled, but this is the exact changelog/update window used by stable releases.")
+        self.install_button.clicked.connect(lambda: owner._download_and_install_update(self.release, self))
+        self.close_button.clicked.connect(self.reject)
+        buttons.addWidget(self.install_button)
+        buttons.addWidget(self.close_button)
+        layout.addLayout(buttons)
+
+    def set_download_progress(self, done: int, total: int):
+        self.progress.setVisible(True)
+        if total > 0:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(max(0, min(100, int(done * 100 / total))))
+            self.status_label.setText(f"Downloading update… {done / (1024*1024):.1f} / {total / (1024*1024):.1f} MB")
+        else:
+            self.progress.setRange(0, 0)
+            self.status_label.setText(f"Downloading update… {done / (1024*1024):.1f} MB")
+
+    def set_busy(self, busy: bool):
+        self.install_button.setEnabled(not busy and IS_PUBLIC_BUILD and not IS_TEST_BUILD)
+        self.close_button.setEnabled(not busy)
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2386,6 +2814,7 @@ class MainWindow(QMainWindow):
         self.experimental_features = _stored_bool("experimental_features", False) if IS_PUBLIC_BUILD else True
         self.freeze_package_column = _stored_bool("freeze_package_column", False)
         self.detail_panel_collapsed = _stored_bool("detail_panel_collapsed", False)
+        self.detail_panel_on_left = _stored_bool("detail_panel_on_left", False)
         self.column_shortcuts_visible = _stored_bool("column_shortcuts_visible", True)
         try:
             self.detail_panel_width = max(300, min(720, int(self.settings.value("detail_panel_width", 353) or 353)))
@@ -2405,11 +2834,32 @@ class MainWindow(QMainWindow):
             self.themes = {name: dict(THEMES[name]) for name in PUBLIC_THEME_ORDER if name in THEMES}
         else:
             self.themes = {name: dict(theme) for name, theme in THEMES.items()}
-        self.custom_theme_dir = Path(__file__).resolve().parent / "custom_themes"
+        # Custom themes live in stable per-user storage so extracting/updating
+        # CAS Curator never requires copying .s3theme files forward by hand.
+        # PUBLIC uses its own store; when first introduced in v1.1 it copies any
+        # compatible DEV themes non-destructively so existing work is not lost.
+        self.theme_storage_edition = "PUBLIC" if IS_PUBLIC_BUILD else "DEV"
+        self.custom_theme_dir = default_custom_theme_dir(self.theme_storage_edition)
         self.custom_theme_files: Dict[str, Path] = {}
         self.custom_theme_info: Dict[str, dict] = {}
-        if IS_DEV_BUILD:
-            self._load_custom_themes()
+        self.custom_theme_migrated_paths: List[Path] = []
+        if IS_PUBLIC_BUILD:
+            # One-time bridge for people who already created themes in DEV.
+            # Do not keep mirroring DEV on every launch: the release becomes its
+            # own independent theme library as soon as it has any saved theme.
+            public_has_themes = self.custom_theme_dir.is_dir() and any(self.custom_theme_dir.glob("*.s3theme"))
+            if not public_has_themes:
+                self.custom_theme_migrated_paths.extend(
+                    migrate_legacy_custom_themes(default_custom_theme_dir("DEV"), self.custom_theme_dir)
+                )
+                self.custom_theme_migrated_paths.extend(
+                    migrate_discovered_legacy_themes(__file__, self.custom_theme_dir)
+                )
+        else:
+            self.custom_theme_migrated_paths.extend(
+                migrate_discovered_legacy_themes(__file__, self.custom_theme_dir)
+            )
+        self._load_custom_themes()
         default_theme = "Carbon Blue" if IS_PUBLIC_BUILD else "Shades of Grey"
         self.theme_name = self.settings.value("theme", default_theme)
         if self.theme_name not in self.themes:
@@ -2445,6 +2895,7 @@ class MainWindow(QMainWindow):
         # "Not now" allows it to appear again next launch, while the manual review
         # command can always show all current suggestions.
         self._attribution_memory_prompted_signatures: set[tuple] = set()
+        self._performance_score_prompted_paths: set[str] = set()
         self.current_source_row: Optional[int] = None
         self._loading_editor = False
         self.pinned_packages: List[Dict[str, str]] = []
@@ -2461,6 +2912,10 @@ class MainWindow(QMainWindow):
         # data and are rebuilt as removable chips below the permanent filter bar.
         self.extra_column_filters: List[Dict[str, str]] = []
         self.scan_process: Optional[QProcess] = None
+        self.performance_refresh_process: Optional[QProcess] = None
+        self.performance_refresh_progress = None
+        self.performance_refresh_context: Dict[str, object] = {}
+        self._performance_refresh_output_buffer = ""
         self.scan_run_kind = "scan"
         self.scan_total_packages = 0
         self.scan_current_package = 0
@@ -2477,6 +2932,9 @@ class MainWindow(QMainWindow):
         self.last_scan_summary_text = ""
         self._post_scan_refresh_target: Optional[Path] = None
         self._scan_log_dialog = None
+        self._update_check_thread: Optional[UpdateCheckThread] = None
+        self._update_download_thread: Optional[UpdateDownloadThread] = None
+        self._update_dialog = None
 
         # DEV-only Random Sim Studio state. Exclusions live in private app
         # settings so the experimental generator never changes scanner-owned
@@ -2526,6 +2984,7 @@ class MainWindow(QMainWindow):
             self._table_virtual_tooltip,
             self._table_virtual_dirty,
         )
+        self.model.set_pin_handlers(self._source_row_is_pinned, self._pin_icon)
         self.model.manualFieldEdited.connect(self._table_manual_edit_changed)
         self.proxy = LibraryFilterProxy(self)
         self.proxy.setSourceModel(self.model)
@@ -2551,11 +3010,18 @@ class MainWindow(QMainWindow):
         self.apply_theme(self.theme_name)
         self.statusBar().showMessage("No Master Database loaded — choose File > Open Master Database…")
         # v1.0 behaviour: reopen the last successfully loaded MDB unless the
-        # user explicitly disabled File > Open last used MDB on startup.
+        # user explicitly disabled File > Open last used Master Database on startup.
         raw_open_last = self.settings.value("open_last_mdb_on_startup", True)
         open_last = raw_open_last if isinstance(raw_open_last, bool) else str(raw_open_last).strip().lower() not in {"0", "false", "no", "off", ""}
         if open_last:
             QTimer.singleShot(0, self._restore_last_mdb)
+
+        # Stable PUBLIC builds can check quietly after startup. TEST/DEV builds
+        # never auto-contact the release feed, preventing accidental channel crossover.
+        raw_update_check = self.settings.value("updates/check_on_startup", True)
+        update_check = raw_update_check if isinstance(raw_update_check, bool) else str(raw_update_check).strip().lower() not in {"0", "false", "no", "off", ""}
+        if IS_PUBLIC_BUILD and not IS_TEST_BUILD and update_check:
+            QTimer.singleShot(3500, lambda: self._check_for_updates(manual=False))
 
     def _autosize_plain_text_edit(self, edit: QPlainTextEdit, min_rows: int, max_rows: int):
         """Keep short multiline fields compact and grow only as content needs."""
@@ -2596,6 +3062,39 @@ class MainWindow(QMainWindow):
         if hasattr(self, "column_fold_restore_btn"):
             QTimer.singleShot(0, self._position_column_fold_restore_btn)
 
+    def _tool_icon(self, name: str, fallback: str = "SP_FileIcon") -> QIcon:
+        """Return a Qt standard icon for menus/actions with a safe fallback."""
+        enum = getattr(QStyle.StandardPixmap, name, None)
+        if enum is None:
+            enum = getattr(QStyle.StandardPixmap, fallback, QStyle.StandardPixmap.SP_FileIcon)
+        return self.style().standardIcon(enum)
+
+    def _pin_icon(self) -> QIcon:
+        """Return a small palette-aware push-pin icon for Pin/Unpin actions."""
+        size = 18
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        color = self.palette().color(QPalette.WindowText)
+        pen = QPen(color)
+        pen.setWidthF(1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        # Simple push-pin silhouette: head, shoulders and point.
+        painter.drawLine(6, 3, 12, 3)
+        painter.drawLine(7, 3, 7, 6)
+        painter.drawLine(11, 3, 11, 6)
+        painter.drawLine(5, 7, 13, 7)
+        painter.drawLine(7, 6, 5, 7)
+        painter.drawLine(11, 6, 13, 7)
+        painter.drawLine(9, 7, 9, 14)
+        painter.drawLine(9, 14, 7.5, 16)
+        painter.end()
+        return QIcon(pixmap)
+
     def _build_menus(self):
         file_menu = self.menuBar().addMenu("File")
         open_action = QAction("Open Master Database…", self)
@@ -2604,15 +3103,16 @@ class MainWindow(QMainWindow):
         reload_action = QAction("Reload", self)
         reload_action.triggered.connect(self.reload)
         file_menu.addAction(reload_action)
-        self.open_last_mdb_action = QAction("Open last used MDB on startup", self, checkable=True)
+        self.open_last_mdb_action = QAction("Open last used Master Database on startup", self, checkable=True)
         raw_open_last = self.settings.value("open_last_mdb_on_startup", True)
         open_last = raw_open_last if isinstance(raw_open_last, bool) else str(raw_open_last).strip().lower() not in {"0", "false", "no", "off", ""}
         self.open_last_mdb_action.setChecked(open_last)
         self.open_last_mdb_action.toggled.connect(self._set_open_last_mdb_on_startup)
         file_menu.addAction(self.open_last_mdb_action)
         self.legacy_status_action = QAction("Review legacy Status values…", self)
+        self.legacy_status_action.setVisible(False)
         self.legacy_status_action.setToolTip(
-            "Preview old Status labels and stage the agreed conversions without saving automatically."
+            "Preview old Status labels and prepare the agreed conversions without saving automatically."
         )
         self.legacy_status_action.triggered.connect(self.review_legacy_status_values)
         file_menu.addAction(self.legacy_status_action)
@@ -2637,18 +3137,12 @@ class MainWindow(QMainWindow):
         # reused inside each submenu so frequent actions are easier to recognise.
         tools_menu = self.menuBar().addMenu("Tools")
 
-        def tool_icon(name: str, fallback: str = "SP_FileIcon") -> QIcon:
-            enum = getattr(QStyle.StandardPixmap, name, None)
-            if enum is None:
-                enum = getattr(QStyle.StandardPixmap, fallback)
-            return self.style().standardIcon(enum)
-
-        scan_icon = tool_icon("SP_BrowserReload")
-        routing_icon = tool_icon("SP_ArrowForward")
-        locations_icon = tool_icon("SP_DirIcon")
-        maintenance_icon = tool_icon("SP_FileDialogDetailedView")
-        online_icon = tool_icon("SP_DriveNetIcon")
-        help_icon = tool_icon("SP_DialogHelpButton")
+        scan_icon = self._tool_icon("SP_BrowserReload")
+        routing_icon = self._tool_icon("SP_ArrowForward")
+        locations_icon = self._tool_icon("SP_DirIcon")
+        maintenance_icon = self._tool_icon("SP_FileDialogDetailedView")
+        online_icon = self._tool_icon("SP_DriveNetIcon")
+        help_icon = self._tool_icon("SP_DialogHelpButton")
 
         scanning_menu = tools_menu.addMenu(scan_icon, "Scanning")
         routing_menu = tools_menu.addMenu(routing_icon, "Routing")
@@ -2661,15 +3155,15 @@ class MainWindow(QMainWindow):
         run_scan_action.setToolTip("Run the configured package scan using the current Scan-page source and MDB settings.")
         run_scan_action.triggered.connect(self._start_scan_test)
         scanning_menu.addAction(run_scan_action)
-        scanner_log_action = QAction(tool_icon("SP_FileIcon"), "Scanner Log", self)
+        scanner_log_action = QAction(self._tool_icon("SP_FileIcon"), "Scanner Log", self)
         scanner_log_action.setToolTip("Open the current Scanner Log in its resizable window.")
         scanner_log_action.triggered.connect(self._open_scan_log_window)
         scanning_menu.addAction(scanner_log_action)
-        open_scan_page_action = QAction(tool_icon("SP_FileDialogContentsView"), "Open Scan page", self)
+        open_scan_page_action = QAction(self._tool_icon("SP_FileDialogContentsView"), "Open Scan page", self)
         open_scan_page_action.triggered.connect(lambda checked=False: self._set_app_page("scan"))
         scanning_menu.addAction(open_scan_page_action)
 
-        preview_routing_action = QAction(tool_icon("SP_FileDialogContentsView"), "Preview Routing", self)
+        preview_routing_action = QAction(self._tool_icon("SP_FileDialogContentsView"), "Preview Routing", self)
         preview_routing_action.setToolTip("Calculate normal scanner routing destinations without moving files.")
         preview_routing_action.triggered.connect(self._start_routing_preview)
         routing_menu.addAction(preview_routing_action)
@@ -2679,21 +3173,21 @@ class MainWindow(QMainWindow):
         routing_menu.addAction(run_routing_action)
         routing_menu.addSeparator()
 
-        self.routing_structure_action = QAction(tool_icon("SP_DirOpenIcon"), "Routing Structure Builder…", self)
+        self.routing_structure_action = QAction(self._tool_icon("SP_DirOpenIcon"), "Routing Structure Builder…", self)
         self.routing_structure_action.setToolTip(
             "Experimental: build a folder hierarchy visually (for example Creator → CC Type → Subtype), preview exact destinations, "
-            "then route package files with SHA-256 verification."
+            "then route package files with file verification."
         )
         self.routing_structure_action.setEnabled(bool(IS_DEV_BUILD or self.experimental_features))
         self.routing_structure_action.triggered.connect(self._open_routing_structure_builder)
         routing_menu.addAction(self.routing_structure_action)
 
-        move_selected_action = QAction(tool_icon("SP_ArrowForward"), "Move Selected to Location…", self)
+        move_selected_action = QAction(self._tool_icon("SP_ArrowForward"), "Move Selected to Location…", self)
         move_selected_action.setToolTip("Preview and move selected original package files to a saved File Location, then update the MDB after hash verification.")
         move_selected_action.triggered.connect(self.move_selected_to_location)
         routing_menu.addAction(move_selected_action)
 
-        self.profile_layouts_action = QAction(tool_icon("SP_DirLinkIcon", "SP_DirIcon"), "Experimental Profile Layouts…", self)
+        self.profile_layouts_action = QAction(self._tool_icon("SP_DirLinkIcon", "SP_DirIcon"), "Experimental Profile Layouts…", self)
         self.profile_layouts_action.setToolTip(
             "Plan different managed File Locations per Profile. Apply Profile Locations previews and performs the explicit verified batch moves."
         )
@@ -2705,29 +3199,37 @@ class MainWindow(QMainWindow):
         manage_locations_action.setToolTip("Manage the active MDB's shared File Location folders. Add Folder uses the selected Windows folder name automatically.")
         manage_locations_action.triggered.connect(self.manage_file_locations)
         profiles_menu.addAction(manage_locations_action)
-        set_creator_selected_action = QAction(tool_icon("SP_FileDialogInfoView"), "Set Creator for Selected…", self)
-        set_creator_selected_action.setToolTip("Stage one Creator value for all selected Library packages. Changes remain unsaved until Save Changes.")
+        set_creator_selected_action = QAction(self._tool_icon("SP_FileDialogInfoView"), "Set Creator for Selected…", self)
+        set_creator_selected_action.setToolTip("Set one Creator value for all selected Library packages. Changes remain unsaved until you choose Save Changes.")
         set_creator_selected_action.triggered.connect(self.set_creator_for_selected)
         profiles_menu.addAction(set_creator_selected_action)
-        remembered_attribution_action = QAction(tool_icon("SP_MessageBoxInformation"), "Review Remembered Creator / Converter Suggestions…", self)
+        remembered_attribution_action = QAction(self._tool_icon("SP_MessageBoxInformation"), "Review Remembered Creator / Converter Suggestions…", self)
         remembered_attribution_action.setToolTip(
             "Review local Creator/Converter name matches learned from previously confirmed MDB values. Nothing is filled without your approval."
         )
         remembered_attribution_action.triggered.connect(self.review_remembered_attribution_suggestions)
         profiles_menu.addAction(remembered_attribution_action)
         profiles_menu.addSeparator()
-        set_dropin_action = QAction(tool_icon("SP_DialogOpenButton"), "Set CC Magic Import Folder…", self)
+        set_dropin_action = QAction(self._tool_icon("SP_DialogOpenButton"), "Set CC Magic Import Folder…", self)
         set_dropin_action.triggered.connect(self.set_cc_magic_dropin_folder)
         profiles_menu.addAction(set_dropin_action)
-        open_dropin_action = QAction(tool_icon("SP_DirOpenIcon"), "Open CC Magic Import Folder", self)
+        open_dropin_action = QAction(self._tool_icon("SP_DirOpenIcon"), "Open CC Magic Import Folder", self)
         open_dropin_action.triggered.connect(self.open_cc_magic_dropin_folder)
         profiles_menu.addAction(open_dropin_action)
 
-        zip_tools_action = QAction(tool_icon("SP_FileIcon"), "Preview / Extract ZIP…", self)
-        zip_tools_action.setToolTip("Preview a ZIP archive safely, then extract it only after explicit confirmation.")
-        zip_tools_action.triggered.connect(self._choose_zip_preview_extract)
-        maintenance_menu.addAction(zip_tools_action)
-        copy_dropin_action = QAction(tool_icon("SP_ArrowRight", "SP_ArrowForward"), "Copy Selected to CC Magic Import…", self)
+        refresh_performance_action = QAction(
+            self._tool_icon("SP_BrowserReload"),
+            "Refresh Performance Scores…",
+            self,
+        )
+        refresh_performance_action.setToolTip(
+            "Recalculate advisory Performance Risk Scores without running a full Health Status rescan."
+        )
+        refresh_performance_action.triggered.connect(self._refresh_performance_scores)
+        maintenance_menu.addAction(refresh_performance_action)
+        maintenance_menu.addSeparator()
+
+        copy_dropin_action = QAction(self._tool_icon("SP_ArrowRight", "SP_ArrowForward"), "Copy Selected to CC Magic Import…", self)
         copy_dropin_action.setToolTip("Copy selected original package files to the configured CC Magic Import folder. Originals remain in place and File Location is not changed.")
         copy_dropin_action.triggered.connect(self.copy_selected_to_cc_magic_dropin)
         maintenance_menu.addAction(copy_dropin_action)
@@ -2741,10 +3243,20 @@ class MainWindow(QMainWindow):
         guide_tools_action.triggered.connect(lambda checked=False: self._set_app_page("guide"))
         help_tools_menu.addAction(guide_tools_action)
         help_tools_menu.addSeparator()
-        about_action = QAction(tool_icon("SP_MessageBoxInformation"), "About CAS Curator…", self)
+        check_updates_action = QAction(self._tool_icon("SP_BrowserReload"), "Check for Updates…", self)
+        check_updates_action.setToolTip("Check the official CAS Curator stable GitHub Release feed and show the changelog inside the app.")
+        check_updates_action.triggered.connect(lambda checked=False: self._check_for_updates(manual=True))
+        help_tools_menu.addAction(check_updates_action)
+        if IS_TEST_BUILD:
+            preview_update_action = QAction(self._tool_icon("SP_MessageBoxInformation"), "Preview Update Window (TEST)…", self)
+            preview_update_action.setToolTip("Preview the stable in-app update/changelog window without downloading or installing anything.")
+            preview_update_action.triggered.connect(self._preview_update_dialog_test)
+            help_tools_menu.addAction(preview_update_action)
+        help_tools_menu.addSeparator()
+        about_action = QAction(self._tool_icon("SP_MessageBoxInformation"), "About CAS Curator…", self)
         about_action.triggered.connect(self._show_about_dialog)
         help_tools_menu.addAction(about_action)
-        copy_version_action = QAction(tool_icon("SP_DialogSaveButton", "SP_FileIcon"), "Copy version info", self)
+        copy_version_action = QAction(self._tool_icon("SP_DialogSaveButton", "SP_FileIcon"), "Copy version info", self)
         copy_version_action.triggered.connect(self._copy_version_info)
         help_tools_menu.addAction(copy_version_action)
 
@@ -2760,13 +3272,39 @@ class MainWindow(QMainWindow):
         # always performs the existing automatic MDB backup without an extra prompt.
         self.settings.setValue("confirm_before_save", False)
 
-        self.confirm_fill_action = QAction("Confirm before fill-down", self, checkable=True)
+        self.confirm_fill_action = QAction("Confirm before fill-down prompt", self, checkable=True)
         self.confirm_fill_action.setChecked(setting_bool("confirm_before_fill_down", True))
         self.confirm_fill_action.setToolTip("Turn this off to apply drag-fill immediately to the displayed rows crossed by the drag.")
         self.confirm_fill_action.toggled.connect(
             lambda checked: (self.settings.setValue("confirm_before_fill_down", checked), self.settings.sync())
         )
         options_menu.addAction(self.confirm_fill_action)
+
+        if IS_PUBLIC_BUILD:
+            options_menu.addSeparator()
+            self.create_scan_report_action = QAction("Create Health Scan Report after Scan", self, checkable=True)
+            self.create_scan_report_action.setChecked(setting_bool("scan/create_report", True))
+            self.create_scan_report_action.setToolTip(
+                "Create the optional Excel scan report after Scan. The MDB remains the permanent source of truth, "
+                "so future Performance Score refreshes do not depend on this report."
+            )
+            self.create_scan_report_action.toggled.connect(
+                lambda checked: (self.settings.setValue("scan/create_report", checked), self.settings.sync())
+            )
+            options_menu.addAction(self.create_scan_report_action)
+
+            options_menu.addSeparator()
+            self.check_updates_startup_action = QAction("Check for updates on startup", self, checkable=True)
+            self.check_updates_startup_action.setChecked(setting_bool("updates/check_on_startup", True))
+            self.check_updates_startup_action.toggled.connect(
+                lambda checked: (self.settings.setValue("updates/check_on_startup", checked), self.settings.sync())
+            )
+            if IS_TEST_BUILD:
+                self.check_updates_startup_action.setEnabled(False)
+                self.check_updates_startup_action.setToolTip("Automatic startup checks are disabled in TEST builds to keep the test and stable channels separate.")
+            else:
+                self.check_updates_startup_action.setToolTip("Quietly check the official stable release feed after CAS Curator starts. You are only interrupted when an update is available.")
+            options_menu.addAction(self.check_updates_startup_action)
 
         if IS_PUBLIC_BUILD:
             options_menu.addSeparator()
@@ -2786,6 +3324,16 @@ class MainWindow(QMainWindow):
             )
             self.experimental_features_action.toggled.connect(self._set_experimental_features)
             options_menu.addAction(self.experimental_features_action)
+
+        options_menu.addSeparator()
+        self.detail_panel_left_action = QAction("Details panel on left", self, checkable=True)
+        self.detail_panel_left_action.setChecked(bool(self.detail_panel_on_left))
+        self.detail_panel_left_action.setToolTip(
+            "Move the Library details panel to the left side. Turn this off to keep it on the right. "
+            "CAS Curator remembers this choice."
+        )
+        self.detail_panel_left_action.toggled.connect(self._set_detail_panel_on_left)
+        options_menu.addAction(self.detail_panel_left_action)
 
         self.theme_menu = self.menuBar().addMenu("Theme")
         self._populate_theme_menu()
@@ -2834,6 +3382,13 @@ class MainWindow(QMainWindow):
         """Apply Advanced/Experimental display layers without touching workbook data."""
         if hasattr(self, "all_fields_tab_index"):
             self.tabs.setTabVisible(self.all_fields_tab_index, bool(IS_DEV_BUILD or self.advanced_features))
+        if hasattr(self, "find_identifier_btn"):
+            self.find_identifier_btn.setVisible(
+                bool(IS_DEV_BUILD or self.advanced_features)
+                and getattr(self, "app_page", "library") == "library"
+            )
+        if hasattr(self, "identifiers_tab_index"):
+            self.tabs.setTabVisible(self.identifiers_tab_index, bool(IS_DEV_BUILD or self.advanced_features))
         if hasattr(self, "profile_layouts_action"):
             self.profile_layouts_action.setEnabled(bool(IS_DEV_BUILD or self.experimental_features))
         if hasattr(self, "routing_structure_action"):
@@ -2897,13 +3452,75 @@ class MainWindow(QMainWindow):
                 # Invalid user files must not prevent the rest of the app launching.
                 continue
 
+    def _populate_manage_themes_menu(self, menu: QMenu, *, from_studio: bool = False):
+        """Populate the shared theme-management actions used by both UI entry points."""
+        menu.clear()
+
+        import_file = QAction(self._tool_icon("SP_DialogOpenButton"), "Import Palette File…", menu)
+        import_file.triggered.connect(self.import_palette_file)
+        menu.addAction(import_file)
+
+        paste_palette = QAction(self._tool_icon("SP_FileDialogDetailedView"), "Paste Link / HEX Colours…", menu)
+        paste_palette.triggered.connect(self.paste_palette)
+        menu.addAction(paste_palette)
+
+        import_theme = QAction(self._tool_icon("SP_DialogOpenButton"), "Import Theme File…", menu)
+        import_theme.triggered.connect(self.import_custom_theme_file)
+        menu.addAction(import_theme)
+
+        manager_action = QAction(self._tool_icon("SP_FileDialogDetailedView"), "Manage Custom Themes…", menu)
+        manager_action.triggered.connect(lambda checked=False, allow=not from_studio: self.manage_custom_themes(allow_studio=allow))
+        menu.addAction(manager_action)
+
+        backup_action = QAction(self._tool_icon("SP_DialogSaveButton"), "Export Theme Backup…", menu)
+        backup_action.setToolTip("Back up all custom themes and My Colours into one named ZIP file.")
+        backup_action.triggered.connect(self.export_custom_theme_backup)
+        menu.addAction(backup_action)
+
+        menu.addSeparator()
+        open_folder = QAction(self._tool_icon("SP_DirOpenIcon"), "Open Custom Themes Folder", menu)
+        open_folder.triggered.connect(self.open_custom_theme_folder)
+        menu.addAction(open_folder)
+
+        reload_themes = QAction(self._tool_icon("SP_BrowserReload"), "Reload Custom Themes", menu)
+        reload_themes.triggered.connect(self.reload_custom_themes)
+        menu.addAction(reload_themes)
+
+    def show_manage_themes_menu(self, anchor: QWidget, *, from_studio: bool = False):
+        """Open the shared Manage Themes actions below an on-screen button."""
+        menu = QMenu(anchor)
+        self._populate_manage_themes_menu(menu, from_studio=from_studio)
+        menu.exec(anchor.mapToGlobal(QPoint(0, anchor.height())))
+
     def _populate_theme_menu(self):
         self.theme_menu.clear()
         group = QActionGroup(self.theme_menu)
         group.setExclusive(True)
 
+        # Keep management and editing distinct: Manage Themes owns imports,
+        # backup and custom-theme administration; Theme Colour Studio is a
+        # direct editor shortcut with no nested management submenu.
+        manage_menu = self.theme_menu.addMenu(self._tool_icon("SP_FileDialogDetailedView"), "Manage Themes")
+        self._populate_manage_themes_menu(manage_menu)
+
+        studio_action = QAction(self._tool_icon("SP_FileDialogContentsView"), "Theme Colour Studio…", self)
+        studio_action.triggered.connect(self.visual_theme_studio)
+        self.theme_menu.addAction(studio_action)
+
+        custom_names = sorted(self.custom_theme_files, key=str.casefold)
+        if custom_names:
+            custom_menu = self.theme_menu.addMenu("Custom Themes")
+            for name in custom_names:
+                act = QAction(name, self, checkable=True)
+                act.setChecked(name == self.theme_name)
+                act.triggered.connect(lambda checked=False, n=name: self.apply_theme(n))
+                group.addAction(act)
+                custom_menu.addAction(act)
+
+        self.theme_menu.addSeparator()
+
         if IS_PUBLIC_BUILD:
-            # PUBLIC uses one flat curated list: no category submenus and no DEV themes.
+            # PUBLIC keeps the approved built-in themes in one flat list.
             for name in PUBLIC_THEME_ORDER:
                 if name not in self.themes:
                     continue
@@ -2924,45 +3541,6 @@ class MainWindow(QMainWindow):
                     act.triggered.connect(lambda checked=False, n=name: self.apply_theme(n))
                     group.addAction(act)
                     submenu.addAction(act)
-
-        if IS_DEV_BUILD:
-            custom_names = sorted(self.custom_theme_files, key=str.casefold)
-            if custom_names:
-                custom_menu = self.theme_menu.addMenu("Custom (Private)")
-                for name in custom_names:
-                    act = QAction(name, self, checkable=True)
-                    act.setChecked(name == self.theme_name)
-                    act.triggered.connect(lambda checked=False, n=name: self.apply_theme(n))
-                    group.addAction(act)
-                    custom_menu.addAction(act)
-
-            self.theme_menu.addSeparator()
-            dev_menu = self.theme_menu.addMenu("Private DEV Palette Tools")
-
-            import_file = QAction("Import Palette File…", self)
-            import_file.triggered.connect(self.import_palette_file)
-            dev_menu.addAction(import_file)
-
-            paste_palette = QAction("Paste HEX / Website URL…", self)
-            paste_palette.triggered.connect(self.paste_palette)
-            dev_menu.addAction(paste_palette)
-
-            manager_action = QAction("Manage Custom Themes…", self)
-            manager_action.triggered.connect(self.manage_custom_themes)
-            dev_menu.addAction(manager_action)
-
-            studio_action = QAction("Visual Theme Studio…", self)
-            studio_action.triggered.connect(self.visual_theme_studio)
-            dev_menu.addAction(studio_action)
-
-            dev_menu.addSeparator()
-            open_folder = QAction("Open Custom Themes Folder", self)
-            open_folder.triggered.connect(self.open_custom_theme_folder)
-            dev_menu.addAction(open_folder)
-
-            reload_themes = QAction("Reload Custom Themes", self)
-            reload_themes.triggered.connect(self.reload_custom_themes)
-            dev_menu.addAction(reload_themes)
 
     def _next_custom_theme_path(self, name: str, exclude: Optional[Path] = None) -> Path:
         # Display names are independent of safe disk filenames. Never replace a
@@ -2986,9 +3564,9 @@ class MainWindow(QMainWindow):
             if temp.exists():
                 temp.unlink()
 
-    def _install_palette(self, colours: List[str], meta: dict, theme_override: Optional[dict] = None):
+    def _install_palette(self, colours: List[str], meta: dict, theme_override: Optional[dict] = None, native_payload: Optional[dict] = None):
         if len(colours) < 2 and theme_override is None:
-            QMessageBox.warning(self, "Palette Import", "I could not find at least two valid colours. For Lospec, download its GPL/HEX file first.")
+            QMessageBox.warning(self, "Palette Import", "I could not find at least two valid colours. Paste HEX values, use a compatible palette link, or choose a supported palette file.")
             return
 
         suggested = meta.get("suggested_name") or "Custom Colour Palette"
@@ -2997,7 +3575,7 @@ class MainWindow(QMainWindow):
         # an unnamed Coolors URL has a real title. Keep a site's original
         # name in the first slot whenever one was actually available.
         name_dialog = QDialog(self)
-        name_dialog.setWindowTitle("Install Private Theme — Choose a Name")
+        name_dialog.setWindowTitle("Install Custom Theme — Choose a Name")
         name_dialog.setMinimumWidth(470)
         name_layout = QVBoxLayout(name_dialog)
         message = QLabel(("Original palette name found. Keep it, choose a creative alternative, "
@@ -3038,7 +3616,7 @@ class MainWindow(QMainWindow):
         palette_scroll.setWidget(palette_widget)
         name_layout.addWidget(palette_scroll)
         name_layout.addWidget(QLabel(f"{len(colours[:48])} unique imported colours", name_dialog))
-        note = QLabel("Suggestions are inspired by the palette, not official names from the website.", name_dialog)
+        note = QLabel("Suggestions are inspired by the palette and are not treated as official source names.", name_dialog)
         note.setWordWrap(True)
         name_layout.addWidget(note)
         name_buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel,
@@ -3085,8 +3663,12 @@ class MainWindow(QMainWindow):
                 or (meta.get("source_filename") and meta["source_filename"] == old_info.get("source_filename"))
             )
             saved_original = original_name or (old_info.get("original_name", "") if same_source else "")
-            payload = {
-                "schema": 2,
+            # Native .s3theme imports start from the complete source payload so
+            # current and future Theme Studio metadata survives a portable
+            # export/import round-trip. Known fields are refreshed below.
+            payload = dict(native_payload) if isinstance(native_payload, dict) else {}
+            payload.update({
+                "schema": max(2, int(payload.get("schema", 2) or 2)),
                 "name": name,
                 "original_name": saved_original,
                 "name_source": ("original" if saved_original and name.casefold() == str(saved_original).casefold()
@@ -3096,10 +3678,11 @@ class MainWindow(QMainWindow):
                 "source_site": meta.get("source_site", "") or (old_info.get("source_site", "") if same_source else ""),
                 "source_url": meta.get("source_url", "") or (old_info.get("source_url", "") if same_source else ""),
                 "source_filename": meta.get("source_filename", "") or (old_info.get("source_filename", "") if same_source else ""),
-                "private_dev_only": True,
+                "private_dev_only": bool(IS_DEV_BUILD),
+                "edition_origin": APP_EDITION,
                 "palette": colours,
                 "theme": theme,
-            }
+            })
             self._save_theme_payload(path, payload)
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "Palette Import", str(exc))
@@ -3111,29 +3694,37 @@ class MainWindow(QMainWindow):
         label_detail = (f"Original palette name: {payload['original_name']}"
                         if payload['original_name'] else "No original palette name supplied; suggested a name.")
         QMessageBox.information(self, "Theme Installed",
-            f"Installed '{name}' for this private DEV copy.\n{label_detail}\n\nSaved to:\n{path}")
+            f"Installed custom theme '{name}'.\n{label_detail}\n\nSaved to:\n{path}")
 
-    def import_palette_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Import Palette", str(Path.home()),
-            "Palette files (*.hex *.txt *.gpl *.pal *.css *.json *.s3theme);;All files (*)")
+    def import_palette_file(self, theme_only: bool = False):
+        title = "Import CAS Curator Theme" if theme_only else "Import Palette"
+        file_filter = ("CAS Curator themes (*.s3theme);;All files (*)" if theme_only else
+                       "Palette files (*.hex *.txt *.gpl *.pal *.css *.json *.s3theme);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(self, title, str(Path.home()), file_filter)
         if not path:
             return
         try:
+            suffix = Path(path).suffix.lower()
             raw = Path(path).read_text(encoding="utf-8-sig", errors="replace")
-            existing_data = json.loads(raw) if Path(path).suffix.lower() in {".json", ".s3theme"} else {}
-            if not isinstance(existing_data, dict):
-                existing_data = {}
+            if suffix == ".s3theme":
+                # Native themes are validated strictly. A malformed .s3theme
+                # must never silently fall back to being treated as a palette.
+                existing_data = read_native_theme_payload(path)
+            else:
+                existing_data = json.loads(raw) if suffix == ".json" else {}
+                if not isinstance(existing_data, dict):
+                    existing_data = {}
+                if theme_only:
+                    raise ValueError("Choose a CAS Curator .s3theme file.")
             palette = existing_data.get("palette", [])
             colours = [c for c in palette[:48] if isinstance(c, str)] if isinstance(palette, list) else []
             if len(colours) < 2:
+                # Older native files can still be portable if their palette was
+                # not stored explicitly; recover colours conservatively from JSON.
                 colours = parse_palette_text(raw)
             meta = palette_metadata(raw, colours, filename=path, online_lookup=False)
-            # A native theme preserves all stored settings and original provenance.
-            theme_override = existing_data.get("theme") if path.lower().endswith(".s3theme") else None
+            theme_override = existing_data.get("theme") if suffix == ".s3theme" else None
             if theme_override is not None:
-                # In a saved v2 theme, 'name' can be a user-edited display name.
-                # An absent original_name is intentional and must stay absent.
                 if "original_name" in existing_data:
                     meta["original_name"] = existing_data.get("original_name", "")
                 if existing_data.get("name"):
@@ -3142,22 +3733,75 @@ class MainWindow(QMainWindow):
                     if existing_data.get(key):
                         meta[key] = existing_data[key]
         except (OSError, ValueError) as exc:
-            QMessageBox.critical(self, "Palette Import", f"Could not read that palette file.\n\n{exc}")
+            heading = "Theme Import" if theme_only or str(path).lower().endswith(".s3theme") else "Palette Import"
+            QMessageBox.critical(self, heading, f"Could not read that file.\n\n{exc}")
             return
-        self._install_palette(colours, meta, theme_override=theme_override)
+        self._install_palette(colours, meta, theme_override=theme_override,
+                              native_payload=existing_data if theme_override is not None else None)
+
+    def import_custom_theme_file(self):
+        """Explicit portable-theme entry point; palette importing remains separate."""
+        self.import_palette_file(theme_only=True)
+
+    def export_custom_theme(self, name: str) -> bool:
+        if name not in self.custom_theme_files:
+            QMessageBox.warning(self, "Protected Theme", "Only custom themes can be exported as .s3theme files.")
+            return False
+        source = self.custom_theme_files[name]
+        default_path = Path.home() / source.name
+        path, _ = QFileDialog.getSaveFileName(
+            self, f"Export Theme — {name}", str(default_path),
+            "CAS Curator theme (*.s3theme)")
+        if not path:
+            return False
+        try:
+            destination = export_native_theme_file(source, path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "Theme Export Failed", str(exc))
+            return False
+        QMessageBox.information(self, "Theme Exported",
+            f"Exported '{name}' with its palette, Theme Colour Studio locks and metadata.\n\nSaved to:\n{destination}")
+        return True
+
+    def export_custom_theme_backup(self) -> bool:
+        """Back up every custom theme plus My Colours without changing live storage."""
+        default_name = f"CAS_Curator_Theme_Backup_{datetime.now():%Y-%m-%d}.zip"
+        default_path = Path.home() / default_name
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Theme Backup", str(default_path), "ZIP archive (*.zip)")
+        if not path:
+            return False
+        try:
+            destination = export_theme_backup(
+                self.custom_theme_files,
+                default_saved_colour_file(APP_EDITION),
+                path,
+            )
+        except (OSError, ValueError, zipfile.BadZipFile) as exc:
+            QMessageBox.warning(self, "Theme Backup Failed", f"Could not create the theme backup.\n\n{exc}")
+            return False
+        QMessageBox.information(
+            self, "Theme Backup Exported",
+            f"Backed up {len(self.custom_theme_files)} custom theme(s), with their names and metadata, "
+            f"plus My Colours when available.\n\nSaved to:\n{destination}")
+        return True
 
     def paste_palette(self):
         # A real QPlainTextEdit guarantees the normal right-click > Paste menu.
         dialog = QDialog(self)
-        dialog.setWindowTitle("Paste Palette or Website URL")
+        dialog.setWindowTitle("Paste Palette Link or HEX Colours")
         dialog.resize(610, 350)
         layout = QVBoxLayout(dialog)
         layout.addWidget(QLabel(
-            "Paste HEX colours, GIMP palette text, Coolors palette URL or supported website data.\n"
+            "Paste HEX colours, supported palette text, or a compatible palette link.\n"
             "Right-click in this box to Paste, or use Ctrl+V.\n"
-            "If a website has no available palette name, one will be suggested."))
+            "If the source has no available palette name, CAS Curator will suggest one."))
         editor = QPlainTextEdit(dialog)
-        editor.setPlaceholderText("https://coolors.co/00ced1-20b2aa-4682b4-b0e0e6")
+        editor.setPlaceholderText(
+            "Website palette link (example only):\n"
+            "https://palette.example/7B5AC8-5F9EC8-4D8F7A\n\n"
+            "Or HEX colours:\n"
+            "#00CED1 #20B2AA #4682B4 #B0E0E6")
         layout.addWidget(editor)
         row = QHBoxLayout()
         paste_button = QPushButton("Paste from Clipboard", dialog)
@@ -3180,9 +3824,9 @@ class MainWindow(QMainWindow):
 
     def _rename_custom_theme(self, name: str) -> Optional[str]:
         if name not in self.custom_theme_files:
-            QMessageBox.warning(self, "Protected Theme", "Only imported themes can be renamed.")
+            QMessageBox.warning(self, "Protected Theme", "Only custom themes can be renamed.")
             return None
-        new_name, ok = QInputDialog.getText(self, "Rename Imported Theme", "New display name:",
+        new_name, ok = QInputDialog.getText(self, "Rename Custom Theme", "New display name:",
                                              QLineEdit.Normal, name)
         if not ok or not new_name.strip():
             return None
@@ -3191,7 +3835,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Protected Theme", "A built-in theme already has this name.")
             return None
         if any(new_name.casefold() == n.casefold() and n != name for n in self.custom_theme_files):
-            QMessageBox.warning(self, "Theme Name", "Another imported theme already has this name.")
+            QMessageBox.warning(self, "Theme Name", "Another custom theme already has this name.")
             return None
         if new_name == name:
             return name
@@ -3223,8 +3867,8 @@ class MainWindow(QMainWindow):
         if name not in self.custom_theme_files:
             QMessageBox.warning(self, "Protected Theme", "Built-in themes cannot be deleted.")
             return False
-        answer = QMessageBox.question(self, "Delete Imported Theme?",
-            f"Permanently delete the imported theme '{name}'?\n\n"
+        answer = QMessageBox.question(self, "Delete Custom Theme?",
+            f"Permanently delete the custom theme '{name}'?\n\n"
             "Your built-in themes and all CC records will remain unchanged.",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
@@ -3237,23 +3881,54 @@ class MainWindow(QMainWindow):
         was_active = self.theme_name == name
         self._load_custom_themes()
         if was_active:
-            self.apply_theme("Shades of Grey")
+            self.apply_theme("Carbon Blue" if IS_PUBLIC_BUILD else "Shades of Grey")
         self._populate_theme_menu()
         return True
 
-    def manage_custom_themes(self):
+    def manage_custom_themes(self, *, allow_studio: bool = True):
         dialog = QDialog(self)
-        dialog.setWindowTitle("Custom Theme Manager — Private DEV")
+        dialog.setWindowTitle("Custom Theme Manager")
         dialog.resize(780, 480)
         layout = QVBoxLayout(dialog)
-        instruction = QLabel("Only imported themes can be renamed or deleted. Built-in themes are protected.")
+        instruction = QLabel("Only custom themes can be renamed or deleted. Built-in themes are protected.")
         instruction.setWordWrap(True)
         layout.addWidget(instruction)
         table = QTableWidget(0, 3, dialog)
-        table.setHorizontalHeaderLabels(["Imported theme", "Original palette name", "Source"])
+        table.setHorizontalHeaderLabels(["Custom theme", "Original palette name", "Source"])
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setSelectionMode(QAbstractItemView.SingleSelection)
         table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+
+        class ThemeManagerSelectionDelegate(QStyledItemDelegate):
+            """Draw one clear outline around the selected custom-theme row."""
+
+            def paint(delegate_self, painter, option, index):
+                super(ThemeManagerSelectionDelegate, delegate_self).paint(painter, option, index)
+                if not (option.state & QStyle.State_Selected):
+                    return
+
+                # Prefer the theme's selection accent, but strengthen it when it
+                # is too close to the surrounding panel so the delete target is
+                # still obvious in very light/dark custom themes.
+                panel_bg = self.theme.get("panel", self.theme.get("window", "#FFFFFF"))
+                border = self.theme.get("selection", "#4F7FA8")
+                if _contrast_ratio_hex(border, panel_bg) < 2.5:
+                    border = "#171717" if _luma_hex(panel_bg) >= 145 else "#FAFAFA"
+
+                rect = option.rect.adjusted(1, 1, -1, -1)
+                painter.save()
+                pen = QPen(QColor(border))
+                pen.setWidth(2)
+                painter.setPen(pen)
+                painter.drawLine(rect.topLeft(), rect.topRight())
+                painter.drawLine(rect.bottomLeft(), rect.bottomRight())
+                if index.column() == 0:
+                    painter.drawLine(rect.topLeft(), rect.bottomLeft())
+                if index.column() == table.columnCount() - 1:
+                    painter.drawLine(rect.topRight(), rect.bottomRight())
+                painter.restore()
+
+        table.setItemDelegate(ThemeManagerSelectionDelegate(table))
         table.verticalHeader().setVisible(False)
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
@@ -3272,16 +3947,54 @@ class MainWindow(QMainWindow):
         palette_scroll.setWidget(palette_widget)
         layout.addWidget(palette_scroll)
         buttons_row = QHBoxLayout()
+
+        def manager_button_icon(button: QPushButton, *names: str):
+            for icon_name in names:
+                enum = getattr(QStyle.StandardPixmap, icon_name, None)
+                if enum is not None:
+                    icon = button.style().standardIcon(enum)
+                    if not icon.isNull():
+                        button.setIcon(icon)
+                        button.setIconSize(QSize(16, 16))
+                        return
+
         apply_btn = QPushButton("Apply", dialog)
+        manager_button_icon(apply_btn, "SP_DialogApplyButton", "SP_DialogOkButton")
         rename_btn = QPushButton("Rename…", dialog)
+        manager_button_icon(rename_btn, "SP_FileDialogDetailedView", "SP_FileIcon")
         delete_btn = QPushButton("Delete…", dialog)
-        studio_btn = QPushButton("Visual Theme Studio…", dialog)
+        manager_button_icon(delete_btn, "SP_TrashIcon", "SP_DialogDiscardButton")
+        studio_btn = QPushButton("Theme Colour Studio…", dialog)
+        manager_button_icon(studio_btn, "SP_FileDialogContentsView", "SP_DialogHelpButton")
+        studio_btn.setVisible(bool(allow_studio))
         close_btn = QPushButton("Close", dialog)
+        manager_button_icon(close_btn, "SP_DialogCloseButton", "SP_DialogCancelButton")
         for btn in (apply_btn, rename_btn, delete_btn, studio_btn):
-            buttons_row.addWidget(btn)
+            if btn is not studio_btn or allow_studio:
+                buttons_row.addWidget(btn)
         buttons_row.addStretch(1)
         buttons_row.addWidget(close_btn)
         layout.addLayout(buttons_row)
+
+        portable_row = QHBoxLayout()
+        import_btn = QPushButton("Import Theme…", dialog)
+        manager_button_icon(import_btn, "SP_DialogOpenButton", "SP_DirOpenIcon")
+        export_btn = QPushButton("Export Theme…", dialog)
+        manager_button_icon(export_btn, "SP_DialogSaveButton", "SP_FileIcon")
+        backup_btn = QPushButton("Export Theme Backup…", dialog)
+        backup_btn.setToolTip("Back up all custom themes and My Colours into one ZIP file, preserving theme names.")
+        manager_button_icon(backup_btn, "SP_DialogSaveButton", "SP_DirIcon")
+        folder_btn = QPushButton("Open Theme Folder", dialog)
+        manager_button_icon(folder_btn, "SP_DirOpenIcon", "SP_DirIcon")
+        reload_btn = QPushButton("Reload Themes", dialog)
+        manager_button_icon(reload_btn, "SP_BrowserReload", "SP_DialogResetButton")
+        portable_row.addWidget(import_btn)
+        portable_row.addWidget(export_btn)
+        portable_row.addWidget(backup_btn)
+        portable_row.addWidget(folder_btn)
+        portable_row.addWidget(reload_btn)
+        portable_row.addStretch(1)
+        layout.addLayout(portable_row)
         close_btn.clicked.connect(dialog.accept)
 
         def selected_name():
@@ -3306,7 +4019,7 @@ class MainWindow(QMainWindow):
 
         def update_selection():
             name = selected_name()
-            for btn in (apply_btn, rename_btn, delete_btn, studio_btn):
+            for btn in (apply_btn, rename_btn, delete_btn, studio_btn, export_btn):
                 btn.setEnabled(bool(name))
             while palette_grid.count():
                 item = palette_grid.takeAt(0)
@@ -3314,7 +4027,7 @@ class MainWindow(QMainWindow):
                 if widget:
                     widget.deleteLater()
             if not name:
-                description.setText("No imported themes yet. Use Theme > Private DEV Palette Tools to import one.")
+                description.setText("No custom themes yet. Use Theme > Manage Themes to import colours or a theme.")
                 return
             info = self.custom_theme_info.get(name, {})
             original = info.get("original_name") or "Not recorded (older theme or suggested name)"
@@ -3354,21 +4067,38 @@ class MainWindow(QMainWindow):
                 self.visual_theme_studio(name)
                 refresh(self.theme_name if self.theme_name in self.custom_theme_files else name)
 
+        def import_portable_theme():
+            self.import_custom_theme_file()
+            refresh(self.theme_name if self.theme_name in self.custom_theme_files else selected_name())
+
+        def export_selected():
+            name = selected_name()
+            if name:
+                self.export_custom_theme(name)
+
+        def reload_manager():
+            current = selected_name()
+            self.reload_custom_themes()
+            refresh(current if current in self.custom_theme_files else self.theme_name)
+
         table.itemSelectionChanged.connect(update_selection)
         apply_btn.clicked.connect(apply_selected)
         rename_btn.clicked.connect(rename_selected)
         delete_btn.clicked.connect(delete_selected)
         studio_btn.clicked.connect(studio_selected)
+        import_btn.clicked.connect(import_portable_theme)
+        export_btn.clicked.connect(export_selected)
+        backup_btn.clicked.connect(self.export_custom_theme_backup)
+        folder_btn.clicked.connect(self.open_custom_theme_folder)
+        reload_btn.clicked.connect(reload_manager)
         refresh(self.theme_name)
         dialog.exec()
 
     def visual_theme_studio(self, selected_name: str = ""):
-        """Private DEV-only isolated preview editor; never edits a built-in."""
-        if not IS_DEV_BUILD:
-            return
+        """Theme Colour Studio editor; built-in themes remain protected."""
         if not self.custom_theme_files:
-            QMessageBox.information(self, "Visual Theme Studio",
-                "Import a custom palette first: Theme > Private DEV Palette Tools > Paste HEX / Website URL.")
+            QMessageBox.information(self, "Theme Colour Studio",
+                "Create or import a custom theme first: Theme > Manage Themes > Paste Link / HEX Colours… or Import Palette File…")
             return
         from theme_studio import ThemeStudio
         initial = selected_name if selected_name in self.custom_theme_files else self.theme_name
@@ -3382,10 +4112,10 @@ class MainWindow(QMainWindow):
     def reload_custom_themes(self):
         self._load_custom_themes()
         if self.theme_name not in self.themes:
-            self.theme_name = "Shades of Grey"
+            self.theme_name = "Carbon Blue" if IS_PUBLIC_BUILD else "Shades of Grey"
         self._populate_theme_menu()
         self.apply_theme(self.theme_name)
-        self.statusBar().showMessage(f"Reloaded {len(self.custom_theme_files)} private custom theme(s).", 5000)
+        self.statusBar().showMessage(f"Reloaded {len(self.custom_theme_files)} custom theme(s).", 5000)
 
     def _build_ui(self):
         root = QWidget()
@@ -3429,6 +4159,17 @@ class MainWindow(QMainWindow):
         stats.addWidget(self.guide_page_btn)
         if self.random_sim_page_btn is not None:
             stats.addWidget(self.random_sim_page_btn)
+        stats.addSpacing(4)
+        self.find_identifier_btn = QPushButton("Find ID…")
+        self.find_identifier_btn.setObjectName("AppPageButton")
+        self.find_identifier_btn.setIcon(self._tool_icon("SP_FileDialogContentsView", "SP_FileDialogDetailedView"))
+        self.find_identifier_btn.setIconSize(QSize(16, 16))
+        self.find_identifier_btn.setMinimumWidth(86)
+        self.find_identifier_btn.setMaximumHeight(32)
+        self.find_identifier_btn.setToolTip("Find Identifier — search by CASP/resource ID, package hash, or stored path")
+        self.find_identifier_btn.clicked.connect(self._open_identifier_lookup)
+        stats.addWidget(self.find_identifier_btn)
+        self.find_identifier_btn.setVisible(bool(IS_DEV_BUILD or self.advanced_features))
         stats.addSpacing(8)
 
         self.packages_label = QLabel("Packages: —")
@@ -3499,22 +4240,37 @@ class MainWindow(QMainWindow):
         ]
         card_layout.addLayout(stats)
 
+        # Keep the coloured Master Database strip around the database identity
+        # only. The Create/Open actions sit on the surrounding Library surface,
+        # so the small gaps around those buttons use the normal page background
+        # instead of looking like leftover pieces of the MDB strip.
         self.library_mdb_row = QFrame()
-        self.library_mdb_row.setObjectName("LibraryTopRow")
+        self.library_mdb_row.setObjectName("LibraryMdbRow")
         mdb_row = QHBoxLayout(self.library_mdb_row)
         mdb_row.setContentsMargins(0, 0, 0, 0)
         mdb_row.setSpacing(8)
-        mdb_caption = QLabel("Opened MDB:")
+
+        self.library_mdb_identity = QFrame()
+        self.library_mdb_identity.setObjectName("LibraryTopRow")
+        mdb_identity_layout = QHBoxLayout(self.library_mdb_identity)
+        # Keep the database caption and path together on one compact themed
+        # bar, while retaining a separate inner path field for readability.
+        mdb_identity_layout.setContentsMargins(10, 4, 10, 4)
+        mdb_identity_layout.setSpacing(8)
+        mdb_caption = QLabel("Opened Master Database:")
         mdb_caption.setObjectName("MDBPathCaption")
         self.mdb_path_label = QLabel("None — choose a Master Database")
         self.mdb_path_label.setObjectName("MDBPathLabel")
         self.mdb_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.mdb_path_label.setToolTip("No Master Database loaded")
-        create_mdb_btn = QPushButton("Create new MDB…")
+        mdb_identity_layout.addWidget(mdb_caption)
+        mdb_identity_layout.addWidget(self.mdb_path_label, 1)
+
+        create_mdb_btn = QPushButton("Create new Master Database…")
         create_mdb_btn.setObjectName("OpenMDBButton")
         create_mdb_btn.clicked.connect(self.create_new_mdb)
         create_mdb_btn.setMinimumWidth(125)
-        open_mdb_btn = QPushButton("Open MDB…")
+        open_mdb_btn = QPushButton("Open Master Database…")
         open_mdb_btn.setObjectName("OpenMDBButton")
         open_mdb_btn.clicked.connect(self.choose_file)
         open_mdb_btn.setMinimumWidth(100)
@@ -3525,8 +4281,7 @@ class MainWindow(QMainWindow):
         mdb_actions_layout.setSpacing(6)
         mdb_actions_layout.addWidget(create_mdb_btn)
         mdb_actions_layout.addWidget(open_mdb_btn)
-        mdb_row.addWidget(mdb_caption)
-        mdb_row.addWidget(self.mdb_path_label, 1)
+        mdb_row.addWidget(self.library_mdb_identity, 1)
         mdb_row.addWidget(mdb_actions)
         card_layout.addWidget(self.library_mdb_row)
 
@@ -3538,7 +4293,7 @@ class MainWindow(QMainWindow):
         filters.setVerticalSpacing(5)
 
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Filename, CASP ID, type, notes…")
+        self.search_edit.setPlaceholderText("Filename, creator, type, status, profile, notes…")
         self.search_edit.setMinimumWidth(230)
         # Native trailing X clears only the search text; Clear Quick Filters clears search plus every temporary Library filter.
         self.search_edit.setClearButtonEnabled(True)
@@ -3598,128 +4353,102 @@ class MainWindow(QMainWindow):
         self.current_profile_combo.currentIndexChanged.connect(self._current_profile_combo_changed)
         self._update_current_profile_indicator()
 
-        if IS_PUBLIC_BUILD:
-            # Keep only broad, everyday filters permanently visible. More
-            # specific metadata (Health, File Location, CC Magic Import, CAS
-            # classifications, Advanced/Experimental fields, etc.) lives under
-            # + Add Quick Filter… instead of consuming permanent toolbar space.
-            # Keep only Search, Status, CC Type and Creator as permanent public
-            # controls. Profile membership moves to + Add Quick Filter… while Profiles…
-            # selects the Current Profile context.
-            self.add_filter_btn = QPushButton("+ Add Quick Filter…")
-            self.add_filter_btn.setToolTip("Add a temporary Quick Filter, use a suggested filter, or save/reuse Quick Filter presets.")
-            self.add_filter_btn.setFixedWidth(126)
-            self.add_filter_menu = QMenu(self.add_filter_btn)
-            self.add_filter_menu.aboutToShow.connect(self._rebuild_add_filter_menu)
-            self.add_filter_btn.setMenu(self.add_filter_menu)
+        # Release-parity Library header for both editions. DEV-only metadata
+        # remains available through + Add Quick Filter… instead of taking
+        # permanent toolbar space.
+        # Keep only broad, everyday filters permanently visible. More
+        # specific metadata (Health, File Location, CC Magic Import, CAS
+        # classifications, Advanced/Experimental fields, etc.) lives under
+        # + Add Quick Filter… instead of consuming permanent toolbar space.
+        # Keep only Search, Status, CC Type and Creator as permanent public
+        # controls. Profile membership moves to + Add Quick Filter… while Profiles…
+        # selects the Current Profile context.
+        self.add_filter_btn = QPushButton("+ Add Quick Filter…")
+        self.add_filter_btn.setToolTip("Add a temporary Quick Filter, use a suggested filter, or save/reuse Quick Filter presets.")
+        self.add_filter_btn.setFixedWidth(126)
+        self.add_filter_menu = QMenu(self.add_filter_btn)
+        self.add_filter_menu.aboutToShow.connect(self._rebuild_add_filter_menu)
+        self.add_filter_btn.setMenu(self.add_filter_menu)
 
-            filter_actions = QWidget()
-            filter_actions.setObjectName("LibraryActionGroup")
-            filter_actions_layout = QHBoxLayout(filter_actions)
-            filter_actions_layout.setContentsMargins(0, 0, 0, 0)
-            filter_actions_layout.setSpacing(6)
-            filter_actions_layout.addWidget(self.add_filter_btn)
-            filter_actions_layout.addWidget(clear_btn)
+        filter_actions = QWidget()
+        filter_actions.setObjectName("LibraryActionGroup")
+        filter_actions_layout = QHBoxLayout(filter_actions)
+        filter_actions_layout.setContentsMargins(0, 0, 0, 0)
+        filter_actions_layout.setSpacing(6)
+        filter_actions_layout.addWidget(self.add_filter_btn)
+        filter_actions_layout.addWidget(clear_btn)
 
-            # Right side is two aligned action rows:
-            #   top    Status -> Locations -> Add Quick Filter
-            #   bottom Current Profile -> Manage Profiles -> Clear Quick Filters
-            # The shorter Status selector sits above the longer Current Profile
-            # selector, which gives the two rows a more natural visual weight.
-            status_actions = QWidget()
-            status_actions.setObjectName("LibraryActionGroup")
-            status_actions_layout = QHBoxLayout(status_actions)
-            status_actions_layout.setContentsMargins(0, 0, 8, 0)
-            status_actions_layout.setSpacing(6)
-            status_actions_layout.addWidget(filter_label("Status:"))
-            status_actions_layout.addWidget(self.filter_boxes["Status"])
-            # Shift only the Status label/dropdown left so its dropdown starts
-            # in line with Current Profile. Locations and Add Quick Filter stay
-            # exactly where they already are.
-            status_actions_layout.addSpacing(18)
-            status_actions_layout.addWidget(self.manage_locations_global_btn)
-            status_actions_layout.addWidget(self.add_filter_btn)
+        # Right side is two aligned action rows:
+        #   top    Status -> Locations -> Add Quick Filter
+        #   bottom Current Profile -> Manage Profiles -> Clear Quick Filters
+        # The shorter Status selector sits above the longer Current Profile
+        # selector, which gives the two rows a more natural visual weight.
+        status_actions = QWidget()
+        status_actions.setObjectName("LibraryActionGroup")
+        status_actions_layout = QHBoxLayout(status_actions)
+        status_actions_layout.setContentsMargins(0, 0, 8, 0)
+        status_actions_layout.setSpacing(6)
+        status_actions_layout.addWidget(filter_label("Status:"))
+        status_actions_layout.addWidget(self.filter_boxes["Status"])
+        # Shift only the Status label/dropdown left so its dropdown starts
+        # in line with Current Profile. Locations and Add Quick Filter stay
+        # exactly where they already are.
+        status_actions_layout.addSpacing(18)
+        status_actions_layout.addWidget(self.manage_locations_global_btn)
+        status_actions_layout.addWidget(self.add_filter_btn)
 
-            profile_actions = QWidget()
-            profile_actions.setObjectName("LibraryActionGroup")
-            profile_actions_layout = QHBoxLayout(profile_actions)
-            profile_actions_layout.setContentsMargins(0, 0, 8, 0)
-            profile_actions_layout.setSpacing(6)
-            profile_actions_layout.addWidget(self.current_profile_caption)
-            profile_actions_layout.addWidget(self.current_profile_combo)
-            profile_actions_layout.addWidget(self.profiles_btn)
-            profile_actions_layout.addWidget(clear_btn)
+        profile_actions = QWidget()
+        profile_actions.setObjectName("LibraryActionGroup")
+        profile_actions_layout = QHBoxLayout(profile_actions)
+        profile_actions_layout.setContentsMargins(0, 0, 8, 0)
+        profile_actions_layout.setSpacing(6)
+        profile_actions_layout.addWidget(self.current_profile_caption)
+        profile_actions_layout.addWidget(self.current_profile_combo)
+        profile_actions_layout.addWidget(self.profiles_btn)
+        profile_actions_layout.addWidget(clear_btn)
 
-            # Fine-tuned balance pass: Search and Creator gain a little room,
-            # Status matches the visual weight of Current Profile more closely,
-            # and the two Quick Filter action buttons are noticeably shorter.
-            self.current_profile_combo.setFixedWidth(160)
-            self.filter_boxes["Status"].setFixedWidth(160)
-            self.filter_boxes["CC Type"].setFixedWidth(170)
-            self.filter_boxes["Creator"].setFixedWidth(240)
-            self.search_edit.setFixedWidth(485)
+        # Fine-tuned balance pass: Search and Creator gain a little room,
+        # Status matches the visual weight of Current Profile more closely,
+        # and the two Quick Filter action buttons are noticeably shorter.
+        self.current_profile_combo.setFixedWidth(160)
+        self.filter_boxes["Status"].setFixedWidth(160)
+        self.filter_boxes["CC Type"].setFixedWidth(170)
+        self.filter_boxes["Creator"].setFixedWidth(240)
+        self.search_edit.setFixedWidth(485)
 
-            # Keep management buttons compact; Quick Filter buttons only need
-            # enough width for their full labels and menu arrow.
-            # Keep Manage Profiles exactly the same width as Locations so
-            # their left edges align across the two rows. Keep the Quick
-            # Filter actions visibly compact; fixed widths here avoid later
-            # minimum-width calls undoing the shorter sizing.
-            self.profiles_btn.setFixedWidth(128)
-            self.manage_locations_global_btn.setFixedWidth(120)
-            self.add_filter_btn.setFixedWidth(126)
-            clear_btn.setFixedWidth(136)
+        # Keep management buttons compact; Quick Filter buttons only need
+        # enough width for their full labels and menu arrow.
+        # Keep Manage Profiles exactly the same width as Locations so
+        # their left edges align across the two rows. Keep the Quick
+        # Filter actions visibly compact; fixed widths here avoid later
+        # minimum-width calls undoing the shorter sizing.
+        self.profiles_btn.setFixedWidth(128)
+        self.manage_locations_global_btn.setFixedWidth(120)
+        self.add_filter_btn.setFixedWidth(126)
+        clear_btn.setFixedWidth(136)
 
-            # Top-left: Search. Top-right: Status / Locations / Add Quick Filter.
-            filters.addWidget(filter_label("Search:"), 0, 0)
-            filters.addWidget(self.search_edit, 0, 1, 1, 3)
-            filters.addWidget(status_actions, 0, 4, 1, 3, Qt.AlignRight)
+        # Top-left: Search. Top-right: Status / Locations / Add Quick Filter.
+        filters.addWidget(filter_label("Search:"), 0, 0)
+        filters.addWidget(self.search_edit, 0, 1, 1, 3)
+        filters.addWidget(status_actions, 0, 4, 1, 3, Qt.AlignRight)
 
-            # Bottom-left: CC Type and Creator. Bottom-right: Current Profile / Manage / Clear.
-            filters.addWidget(filter_label("CC Type:"), 1, 0)
-            filters.addWidget(self.filter_boxes["CC Type"], 1, 1)
-            filters.addWidget(filter_label("Creator:"), 1, 2)
-            filters.addWidget(self.filter_boxes["Creator"], 1, 3)
-            filters.addWidget(profile_actions, 1, 4, 1, 3, Qt.AlignRight)
+        # Bottom-left: CC Type and Creator. Bottom-right: Current Profile / Manage / Clear.
+        filters.addWidget(filter_label("CC Type:"), 1, 0)
+        filters.addWidget(self.filter_boxes["CC Type"], 1, 1)
+        filters.addWidget(filter_label("Creator:"), 1, 2)
+        filters.addWidget(self.filter_boxes["Creator"], 1, 3)
+        filters.addWidget(profile_actions, 1, 4, 1, 3, Qt.AlignRight)
 
-            # Left-side fields use fixed practical widths. Any spare space goes
-            # into the separator before the right-side action groups instead of
-            # stretching Search / CC Type / Creator and squeezing the buttons.
-            filters.setColumnStretch(0, 0)
-            filters.setColumnStretch(1, 0)
-            filters.setColumnStretch(2, 0)
-            filters.setColumnStretch(3, 0)
-            filters.setColumnStretch(4, 1)
-            filters.setColumnStretch(5, 0)
-            filters.setColumnStretch(6, 0)
-        else:
-            # DEV retains its existing compact technical quick-filter row.
-            filters.addWidget(filter_label("Search:"), 0, 0)
-            filters.addWidget(self.search_edit, 0, 1, 1, 3)
-            filters.addWidget(filter_label("Status:"), 0, 4)
-            filters.addWidget(self.filter_boxes["Status"], 0, 5)
-            filters.addWidget(filter_label("Health:"), 0, 6)
-            filters.addWidget(self.filter_boxes["Health Status"], 0, 7)
-            filters.addWidget(clear_btn, 0, 8)
-            filters.addWidget(filter_label("CC Type:"), 1, 0)
-            filters.addWidget(self.filter_boxes["CC Type"], 1, 1)
-            filters.addWidget(filter_label("Risk:"), 1, 2)
-            filters.addWidget(self.filter_boxes["Risk"], 1, 3)
-            filters.addWidget(filter_label("File Location:"), 1, 4)
-            filters.addWidget(self.filter_boxes["File Location"], 1, 5)
-            filters.addWidget(filter_label("Profile:"), 1, 6)
-            filters.addWidget(self.filter_boxes["CC Magic Profiles"], 1, 7)
-            profile_actions = QWidget()
-            profile_actions_layout = QHBoxLayout(profile_actions)
-            profile_actions_layout.setContentsMargins(0, 0, 0, 0)
-            profile_actions_layout.setSpacing(6)
-            profile_actions_layout.addWidget(self.profiles_btn)
-            profile_actions_layout.addWidget(self.manage_locations_global_btn)
-            filters.addWidget(profile_actions, 1, 8)
-            filters.setColumnStretch(1, 1)
-            filters.setColumnStretch(3, 0)
-            filters.setColumnStretch(5, 0)
-            filters.setColumnStretch(7, 0)
+        # Left-side fields use fixed practical widths. Any spare space goes
+        # into the separator before the right-side action groups instead of
+        # stretching Search / CC Type / Creator and squeezing the buttons.
+        filters.setColumnStretch(0, 0)
+        filters.setColumnStretch(1, 0)
+        filters.setColumnStretch(2, 0)
+        filters.setColumnStretch(3, 0)
+        filters.setColumnStretch(4, 1)
+        filters.setColumnStretch(5, 0)
+        filters.setColumnStretch(6, 0)
         card_layout.addWidget(self.library_filters_row)
 
         # Universal filters are displayed as removable chips on a compact,
@@ -3758,15 +4487,21 @@ class MainWindow(QMainWindow):
         pinned_outer = QHBoxLayout(self.pinned_bar)
         pinned_outer.setContentsMargins(4, 0, 4, 0)
         pinned_outer.setSpacing(6)
-        pinned_label = QLabel("Pinned:")
-        pinned_label.setObjectName("PinnedLabel")
-        pinned_outer.addWidget(pinned_label)
+        self.pinned_icon_label = QLabel()
+        self.pinned_icon_label.setObjectName("PinnedIcon")
+        self.pinned_icon_label.setFixedSize(18, 18)
+        self.pinned_icon_label.setPixmap(self._pin_icon().pixmap(16, 16))
+        self.pinned_icon_label.setToolTip("Pinned packages")
+        pinned_outer.addWidget(self.pinned_icon_label)
+        self.pinned_label = QLabel("Pinned:")
+        self.pinned_label.setObjectName("PinnedLabel")
+        pinned_outer.addWidget(self.pinned_label)
         self.pinned_scroll = QScrollArea()
         self.pinned_scroll.setObjectName("PinnedScroll")
         self.pinned_scroll.setWidgetResizable(True)
         self.pinned_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.pinned_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        self.pinned_scroll.setFixedHeight(34)
+        self.pinned_scroll.setFixedHeight(28)
         self.pinned_scroll_widget = QWidget()
         self.pinned_tabs_layout = QHBoxLayout(self.pinned_scroll_widget)
         self.pinned_tabs_layout.setContentsMargins(0, 0, 0, 0)
@@ -3774,7 +4509,7 @@ class MainWindow(QMainWindow):
         self.pinned_tabs_layout.addStretch(1)
         self.pinned_scroll.setWidget(self.pinned_scroll_widget)
         pinned_outer.addWidget(self.pinned_scroll, 1)
-        self.pinned_bar.setFixedHeight(40)
+        self.pinned_bar.setFixedHeight(32)
         self.pinned_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.pinned_bar.setVisible(False)
         # The pinned strip belongs to the Library side only. Keep its height fixed so it
@@ -3783,6 +4518,7 @@ class MainWindow(QMainWindow):
         self.splitter = DetailPanelSplitter(Qt.Horizontal)
         self.splitter.setObjectName("MainLibrarySplitter")
         self.splitter.last_detail_panel_width = self.detail_panel_width
+        self.splitter.detail_panel_on_left = bool(self.detail_panel_on_left)
         root_layout.addWidget(self.splitter, 1)
 
         self.scan_page = self._build_scan_shell_page()
@@ -3819,12 +4555,13 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setHighlightSections(False)
         self.table.horizontalHeader().setStretchLastSection(False)
         self.table.setWordWrap(False)
+        self.table.setIconSize(QSize(13, 13))
         # Wide Library tables are much easier to inspect when horizontal movement
         # is pixel-based rather than jumping a whole column at a time.
         self.table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
         self.table.horizontalScrollBar().setSingleStep(18)
         self.table.setEditTriggers(QTableView.DoubleClicked | QTableView.EditKeyPressed)
-        self.table.setToolTip("Double-click an editable cell to edit it. To copy a populated value down, select an editable cell and drag the small fill handle at its lower-right corner across the displayed rows. Fill-down respects sorting/filtering and remains unsaved until Save Changes. To clear one editable field in several rows, Ctrl/Shift-select the rows in that column and press Delete; CAS Curator asks for confirmation first. Shift+Delete stages Library record deletion. Current File Location is read-only in the Table; use Planned Location for profile-specific editing. Unsaved rows get an amber marker at the left.")
+        self.table.setToolTip("Double-click an editable cell to edit it. To copy a populated value down, select an editable cell and drag the small fill handle at its lower-right corner across the displayed rows. Fill-down respects sorting/filtering and remains unsaved until Save Changes. To clear one editable field in several rows, Ctrl/Shift-select the rows in that column and press Delete; CAS Curator asks for confirmation first. Shift+Delete marks Library records for deletion. Current File Location is read-only in the Table; use Planned Location for profile-specific editing. Unsaved rows get an amber marker at the left.")
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_table_context_menu)
         self.table.fillRequested.connect(self._table_fill_requested)
@@ -3978,7 +4715,7 @@ class MainWindow(QMainWindow):
         self.gallery_quick_clear_btn.setVisible(False)
         gallery_quick_layout.addWidget(self.gallery_quick_clear_btn, 0)
 
-        # Keep the right-side Details panel freely draggable/widenable without
+        # Keep the Details panel freely draggable/widenable on either side without
         # introducing a second horizontal scrollbar row in Gallery.
         self.gallery_quick_bar.setMinimumWidth(0)
         self.gallery_quick_bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -4058,9 +4795,11 @@ class MainWindow(QMainWindow):
         self.library_stack.addWidget(self.table_page)
         self.library_stack.addWidget(self.gallery)
         left_layout.addWidget(self.library_stack, 1)
+        self.library_main_panel = left
         self.splitter.addWidget(left)
 
-        # Right details card.
+        # Details card. It defaults to the right, but Options can move the same
+        # panel to the far left without rebuilding its tabs/editor state.
         right = QFrame()
         self.detail_panel = right
         right.setObjectName("DetailPanel")
@@ -4113,6 +4852,7 @@ class MainWindow(QMainWindow):
         title_row.addWidget(self.copy_filename_btn)
         self.pin_button = QPushButton("Pin")
         self.pin_button.setObjectName("PinButton")
+        self.pin_button.setIcon(self._pin_icon())
         self.pin_button.setEnabled(False)
         self.pin_button.setToolTip("Keep this package in the persistent Pinned strip")
         self.pin_button.clicked.connect(self._toggle_current_pin)
@@ -4232,6 +4972,52 @@ class MainWindow(QMainWindow):
         self.overview_scroll.setWidget(overview)
         self.tabs.addTab(self.overview_scroll, "Overview")
 
+        # Shared Curator identity view: package identity is kept separate from
+        # resource identity so one package can expose many CAS/resource IDs
+        # without bloating the main Library row. Everything here is read-only.
+        identifiers_page = QWidget()
+        identifiers_page.setObjectName("IdentifiersPage")
+        self.identifiers_page = identifiers_page
+        identifiers_layout = QVBoxLayout(identifiers_page)
+        identifiers_layout.setContentsMargins(8, 8, 8, 8)
+        identifiers_layout.setSpacing(7)
+        identifiers_intro = QLabel(
+            "Identifiers for the selected package are shown here. To locate a package when you only know an in-game/resource ID, "
+            "use Find ID… in the top bar while Advanced features are enabled. Raw scanner evidence is preserved; no identifier is guessed from the filename."
+        )
+        identifiers_intro.setWordWrap(True)
+        identifiers_intro.setObjectName("EditHelp")
+        identifiers_layout.addWidget(identifiers_intro)
+
+        self.identifiers_browser = QTextBrowser()
+        self.identifiers_browser.setObjectName("IdentifiersBrowser")
+        self.identifiers_browser.setOpenExternalLinks(False)
+        identifiers_layout.addWidget(self.identifiers_browser, 1)
+        identifiers_buttons = QGridLayout()
+        identifiers_buttons.setHorizontalSpacing(5)
+        identifiers_buttons.setVerticalSpacing(5)
+        self.copy_identifiers_btn = QPushButton("Copy Identifiers")
+        self.copy_identifiers_btn.setToolTip("Copy package and resource identifiers for the selected Library row")
+        self.copy_identifiers_btn.clicked.connect(self._copy_current_identifiers)
+        identifiers_buttons.addWidget(self.copy_identifiers_btn, 0, 0)
+        self.copy_casp_ids_btn = QPushButton("Copy CASP IDs")
+        self.copy_casp_ids_btn.setToolTip("Copy CASP resource identifiers for the selected Library row")
+        self.copy_casp_ids_btn.clicked.connect(self._copy_current_casp_ids)
+        identifiers_buttons.addWidget(self.copy_casp_ids_btn, 0, 1)
+        self.copy_exact_path_btn = QPushButton("Copy Exact Path")
+        self.copy_exact_path_btn.setToolTip("Resolve and verify the selected package, then copy its exact current path")
+        self.copy_exact_path_btn.clicked.connect(self._copy_current_exact_path)
+        identifiers_buttons.addWidget(self.copy_exact_path_btn, 1, 0)
+        self.reveal_package_btn = QPushButton("Show Package in Explorer")
+        self.reveal_package_btn.setToolTip("Resolve and verify the selected package, then reveal it in Windows Explorer")
+        self.reveal_package_btn.clicked.connect(self._reveal_current_package)
+        identifiers_buttons.addWidget(self.reveal_package_btn, 1, 1)
+        identifiers_buttons.setColumnStretch(0, 1)
+        identifiers_buttons.setColumnStretch(1, 1)
+        identifiers_layout.addLayout(identifiers_buttons)
+        self.identifiers_tab_index = self.tabs.addTab(identifiers_page, "Identifiers")
+        self.tabs.setTabVisible(self.identifiers_tab_index, bool(IS_DEV_BUILD or self.advanced_features))
+
         # Restored from the distributed v1.0 PUBLIC release. This tab presents
         # direct CASP-linked information separately from manual organisation.
         casp_page = QWidget()
@@ -4240,12 +5026,38 @@ class MainWindow(QMainWindow):
         casp_layout.setContentsMargins(8, 8, 8, 8)
         casp_layout.setSpacing(7)
         casp_intro = QLabel(
-            "This tab shows direct CASP observations from the latest validated scan when an exact package identity link is available. "
-            "CAS Curator does not guess from filenames, and older scanner classifications are not treated as new findings."
+            "This tab shows CASP information found during the latest scan. "
+            "CAS Curator only shows confirmed information from the package and does not guess from filenames."
         )
         casp_intro.setWordWrap(True)
         casp_intro.setObjectName("EditHelp")
         casp_layout.addWidget(casp_intro)
+        # Advanced CASP identity gets a compact copy row above the observations.
+        # Keep the technical ID out of the prose browser so it can be copied
+        # precisely without selecting HTML text by hand.
+        self.casp_identity_row = QWidget()
+        self.casp_identity_row.setObjectName("CASPIdentityRow")
+        casp_identity_layout = QHBoxLayout(self.casp_identity_row)
+        casp_identity_layout.setContentsMargins(0, 0, 0, 0)
+        casp_identity_layout.setSpacing(6)
+        self.casp_identity_label = QLabel("CASP ID(s):")
+        self.casp_identity_label.setObjectName("CASPIdentityLabel")
+        self.casp_identity_value = QLineEdit()
+        self.casp_identity_value.setObjectName("CASPIdentityValue")
+        self.casp_identity_value.setReadOnly(True)
+        self.casp_identity_value.setToolTip("CASP resource identifier(s) observed in this package")
+        self.casp_identity_value.setMinimumWidth(0)
+        self.casp_identity_copy_btn = QPushButton("Copy")
+        self.casp_identity_copy_btn.setObjectName("CASPIdentityCopyButton")
+        self.casp_identity_copy_btn.setToolTip("Copy the CASP ID(s) exactly as stored")
+        self.casp_identity_copy_btn.setFixedWidth(66)
+        self.casp_identity_copy_btn.clicked.connect(self._copy_current_casp_ids)
+        casp_identity_layout.addWidget(self.casp_identity_label)
+        casp_identity_layout.addWidget(self.casp_identity_value, 1)
+        casp_identity_layout.addWidget(self.casp_identity_copy_btn)
+        self.casp_identity_row.setVisible(False)
+        casp_layout.addWidget(self.casp_identity_row)
+
         self.casp_observations_browser = QTextBrowser()
         self.casp_observations_browser.setObjectName("CASPObservationsBrowser")
         self.casp_observations_browser.setOpenExternalLinks(False)
@@ -4459,7 +5271,7 @@ class MainWindow(QMainWindow):
         self.cc_magic_profile_remove_quick.setEditable(False)
         self.cc_magic_profile_remove_quick.setToolTip(
             "Choose one of this package's existing Profile memberships to remove. "
-            "The change stays staged until Save Changes."
+            "The change is not saved until you choose Save Changes."
         )
         form.addRow("Remove from:", self.cc_magic_profile_remove_quick)
 
@@ -4530,16 +5342,23 @@ class MainWindow(QMainWindow):
         self.all_fields_tab_index = self.tabs.addTab(all_fields_page, "All fields")
         self.tabs.setTabVisible(self.all_fields_tab_index, bool(IS_DEV_BUILD or self.advanced_features))
         self.splitter.addWidget(right)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 0)
+        if self.detail_panel_on_left:
+            self.splitter.insertWidget(0, right)
+        detail_index = 0 if self.detail_panel_on_left else 1
+        content_index = 1 - detail_index
+        self.splitter.setStretchFactor(content_index, 1)
+        self.splitter.setStretchFactor(detail_index, 0)
         self.splitter.setChildrenCollapsible(False)
-        self.splitter.setCollapsible(0, False)
-        self.splitter.setCollapsible(1, True)
+        self.splitter.setCollapsible(content_index, False)
+        self.splitter.setCollapsible(detail_index, True)
         # Keep only a slim draggable divider. The hide/show controls live inside
         # the existing Table/Gallery top rows, so the divider itself never looks
         # like an extra UI column.
         self.splitter.setHandleWidth(4)
-        self.splitter.setSizes([1192, self.detail_panel_width])
+        if self.detail_panel_on_left:
+            self.splitter.setSizes([self.detail_panel_width, 1192])
+        else:
+            self.splitter.setSizes([1192, self.detail_panel_width])
         # Do not overlay a hide/show chevron on the splitter.  Even a tiny
         # floating control can affect/obscure the narrow Table/Gallery edge at
         # some DPI scales.  The top-row Details toggle owns collapse/restore.
@@ -4894,6 +5713,20 @@ class MainWindow(QMainWindow):
         self.theme = self.themes[name]
         self.settings.setValue("theme", name)
         t = self.theme
+        adaptive_text_enabled = bool(t.get("_custom"))
+
+        def main_text_on(background: str) -> str:
+            if adaptive_text_enabled:
+                return _automatic_theme_text_for(background, muted=False)
+            return _button_text_for(background, dark=t["text"], light="#FFFFFF")
+
+        def muted_text_on(background: str) -> str:
+            if adaptive_text_enabled:
+                return _automatic_theme_text_for(background, muted=True)
+            return _button_text_for(background, dark=t["muted"], light="#FFFFFF")
+
+        theme_text = main_text_on("#FFFFFF") if adaptive_text_enabled else t["text"]
+        theme_muted = muted_text_on("#FFFFFF") if adaptive_text_enabled else t["muted"]
 
         # General light-theme roles.
         top_fill = _mix_hex(t["accent_soft"], t["accent"], 0.10)
@@ -4913,6 +5746,10 @@ class MainWindow(QMainWindow):
         guide_card_fill = _mix_hex(t["accent_soft"], "#FFFFFF", 0.48)
         guide_browser_fill = _mix_hex(t["accent_soft"], "#FFFFFF", 0.78)
         guide_border = _mix_hex(t["accent"], "#B8B8B8", 0.48)
+        guide_section_fill = guide_section_tint(t["accent"])
+        guide_highlight_1 = guide_highlight_tint(t["accent_soft"])
+        guide_highlight_2 = guide_highlight_tint(t["selection"])
+        guide_highlight_3 = guide_highlight_tint(t["accent"])
 
         # Slightly darker neutral table body across all themes.
         main_fill = "#FAFAFA"
@@ -5219,6 +6056,7 @@ class MainWindow(QMainWindow):
 
         filter_panel_fill = top_fill
         table_header_fill = header_fill
+        custom_mdb_path_border = "#C4C4C4"
         # Downloaded private palettes can provide direct surface roles. This keeps
         # their original colour relationships instead of forcing them through the
         # built-in-theme formula above.
@@ -5231,14 +6069,63 @@ class MainWindow(QMainWindow):
             scrollbar_color = str(t.get("ui_scrollbar_color", scrollbar_color))
             scrollbar_hover = str(t.get("ui_scrollbar_hover", scrollbar_hover))
             thumb_fill = str(t.get("ui_thumb_fill", thumb_fill))
-            filter_panel_fill = str(t.get("ui_filter_panel_fill", top_fill))
+            # Custom themes use one shared surface for the Toolbar panel and
+            # Search/filter panel. Legacy ui_filter_panel_fill values are ignored.
+            filter_panel_fill = top_fill
             table_header_fill = str(t.get("ui_table_header_fill", header_fill))
             main_fill = str(t.get("ui_main_fill", main_fill))
             row_alt = str(t.get("ui_row_alt", row_alt))
-        table_header_text = _button_text_for(table_header_fill, dark=t["text"], light="#FFFFFF")
-        surface_text = _button_text_for(top_fill, dark=t["text"], light="#FFFFFF")
-        header_text = _button_text_for(header_fill, dark=t["text"], light="#FFFFFF")
-        info_text = _button_text_for(info_fill, dark=t["text"], light="#FFFFFF")
+            custom_mdb_path_border = _normalize_hex(str(t.get("ui_mdb_path_border", "#C4C4C4"))) or "#C4C4C4"
+        table_header_text = main_text_on(table_header_fill)
+        surface_text = main_text_on(top_fill)
+        header_text = main_text_on(header_fill)
+        info_text = main_text_on(info_fill)
+
+        # The Opened Master Database path keeps its authored built-in surface.
+        # In custom themes the path field itself is intentionally unfilled: it
+        # uses the surrounding MDB bar colour, while ui_mdb_path_border controls
+        # only the thin outline around it.
+        if t.get("_custom"):
+            mdb_path_fill = top_fill
+        else:
+            mdb_path_fill = side_fill
+            if _colour_distance(mdb_path_fill, top_fill) < 34.0:
+                candidates = (header_fill, info_fill, filter_button)
+                mdb_path_fill = max(candidates, key=lambda colour: _colour_distance(colour, top_fill))
+            if _colour_distance(mdb_path_fill, top_fill) < 34.0:
+                mdb_path_fill = _mix_hex(
+                    top_fill,
+                    '#FFFFFF' if _luma_hex(top_fill) < 145 else '#000000',
+                    0.18,
+                )
+        mdb_path_text = main_text_on(mdb_path_fill)
+        # Restore the softer greyish-white MDB path outline used by the older
+        # release styling for the classic darker built-in themes.  Keep the
+        # current path fill behaviour; this only restores the legacy border.
+        legacy_mdb_border_themes = {
+            "Berry Cloud",
+            "Aqua Depth",
+            "Navy Bloom",
+            "Blue Grey Rose",
+            "Midnight Steel",
+            "Carbon Blue",
+            "Deep Ocean",
+            "Storm Purple",
+            "Retro Terminal",
+            "Black Cherry",
+            "Dark Teal",
+            "Night Plum",
+        }
+        if t.get("_custom"):
+            mdb_path_border = custom_mdb_path_border
+        elif self.theme_name == "Aqua Depth":
+            # Aqua Depth uses a green-blue outline rather than the neutral
+            # grey used by the other classic built-in themes.
+            mdb_path_border = "#63C7CD"
+        elif self.theme_name in legacy_mdb_border_themes:
+            mdb_path_border = "#C4C4C4"
+        else:
+            mdb_path_border = _mix_hex(scrollbar_color, mdb_path_fill, 0.22)
         # Detail-card roles can differ from the general info surface. Shades of
         # Grey benefits from a lighter Overview card while keeping the rest of
         # its neutral chrome intact.
@@ -5251,8 +6138,12 @@ class MainWindow(QMainWindow):
             detail_title_text = "#171717"
         if t.get("_custom"):
             detail_info_fill = str(t.get("ui_info_card_fill", detail_info_fill))
-            detail_info_text = _button_text_for(detail_info_fill, dark=t["text"], light="#FFFFFF")
-        button_text = _button_text_for(filter_button, dark=t["text"], light="#FFFFFF")
+            detail_info_text = main_text_on(detail_info_fill)
+        # Overview helper/experimental notes used to be hard-coded #666666,
+        # which becomes too faint on dark built-in and custom detail cards.
+        # Always derive a secondary colour from the actual card surface.
+        self._detail_secondary_text = _secondary_text_for_surface(detail_info_fill, target_ratio=4.5)
+        button_text = main_text_on(filter_button)
         arrow_color = _button_text_for(filter_button, dark="#3F3F3F", light="#FFFFFF")
         # Hidden Details restore control: stay very close to the normal themed
         # view-button colour, with only a subtle tone shift so it reads as a
@@ -5293,6 +6184,8 @@ class MainWindow(QMainWindow):
         # rather than the darker general theme text colour.
         if self.theme_name in {"Aqua Depth", "Black Cherry"}:
             detail_restore_text = "#FFFFFF"
+        if adaptive_text_enabled:
+            detail_restore_text = main_text_on(detail_restore_fill)
 
         # Column-shortcut micro-tab: keep the control compact and easy to find
         # without letting the arrow dominate the header. Borders are a little
@@ -5302,7 +6195,7 @@ class MainWindow(QMainWindow):
             column_collapse_fill = _mix_hex(top_fill, filter_button, 0.20)
             column_collapse_border = _mix_hex(top_fill, scrollbar_color, 0.45)
             column_collapse_hover = _mix_hex(top_fill, filter_button, 0.30)
-            column_collapse_text = _button_text_for(top_fill, dark=t["text"], light="#FFFFFF")
+            column_collapse_text = main_text_on(top_fill)
         else:
             column_collapse_fill = "transparent"
             column_collapse_border = _mix_hex(top_fill, t["text"], 0.18)
@@ -5310,6 +6203,9 @@ class MainWindow(QMainWindow):
             column_collapse_text = t["text"]
             if _luma_hex(column_collapse_text) < 90:
                 column_collapse_text = "#5A5A5A"
+        if adaptive_text_enabled:
+            column_collapse_text = main_text_on(top_fill)
+
         # Very light/white glyphs read optically larger than dark glyphs at the
         # same nominal size, so trim them by one pixel for visual balance.
         column_collapse_font_size = 6 if _luma_hex(column_collapse_text) > 220 else 7
@@ -5347,11 +6243,11 @@ class MainWindow(QMainWindow):
             column_restore_hover_border = column_restore_border
 
         badge_fill = "#FFFFFF"
-        badge_text = t["text"]
+        badge_text = theme_text
         tab_fill = header_fill
         tab_text = header_text
         tab_selected_fill = "#FFFFFF"
-        tab_selected_text = t["text"]
+        tab_selected_text = theme_text
         info_card_border = "#D2D2D2"
         thumb_card_border = "#D5D5D5"
         preview_mat_fill = "#FCFCFC"
@@ -5369,13 +6265,13 @@ class MainWindow(QMainWindow):
 
         if self.theme_name in {"Rose Grey", "Strawberry Milk", "Jellyfish Glow", "Lotus Pond"}:
             badge_fill = filter_button
-            badge_text = _button_text_for(badge_fill, dark=t["text"], light="#FFFFFF")
+            badge_text = main_text_on(badge_fill)
 
         if self.theme_name == "Lotus Pond":
             tab_fill = filter_button
-            tab_text = _button_text_for(tab_fill, dark=t["text"], light="#FFFFFF")
+            tab_text = main_text_on(tab_fill)
             tab_selected_fill = info_fill
-            tab_selected_text = _button_text_for(tab_selected_fill, dark=t["text"], light="#FFFFFF")
+            tab_selected_text = main_text_on(tab_selected_fill)
 
         if self.theme_name in {"Rose Grey", "Strawberry Milk", "Jellyfish Glow", "Lotus Pond", "Cherry Blossom Pink", "Berry Cloud", "Sakura Tea", "Cafe Rose", "Soft Blush Slate", "Lavender Cream", "Sunset Palace", "Celestial Lilac", "Wisteria Aqua", "Sea Glass", "Blue Coral", "Aqua Depth", "Periwinkle Mist", "Atlantic", "Ice Lagoon", "Jelly Blue Pink", "Seafoam Pearl", "Blue Grey Rose", "Blue Porcelain"}:
             info_card_border = "#FFFFFF"
@@ -5386,8 +6282,8 @@ class MainWindow(QMainWindow):
         if t.get("_custom"):
             tab_fill = str(t.get("ui_tab_fill", tab_fill))
             tab_selected_fill = str(t.get("ui_tab_selected_fill", tab_selected_fill))
-            tab_text = _button_text_for(tab_fill, dark=t["text"], light="#FFFFFF")
-            tab_selected_text = _button_text_for(tab_selected_fill, dark=t["text"], light="#FFFFFF")
+            tab_text = main_text_on(tab_fill)
+            tab_selected_text = main_text_on(tab_selected_fill)
             info_card_border = str(t.get("ui_info_card_border", info_card_border))
 
         # Border policy shared by Guide + Scan. These families looked best
@@ -5594,6 +6490,10 @@ class MainWindow(QMainWindow):
             guide_card_fill = str(t.get("ui_guide_card_fill", guide_card_fill))
             guide_browser_fill = str(t.get("ui_guide_browser_fill", guide_browser_fill))
             guide_border = str(t.get("ui_guide_border", guide_border))
+            guide_section_fill = guide_section_tint(str(t.get("ui_guide_section_fill", t.get("accent", guide_section_fill))))
+            guide_highlight_1 = guide_highlight_tint(str(t.get("ui_guide_highlight_1", t.get("accent_soft", guide_highlight_1))))
+            guide_highlight_2 = guide_highlight_tint(str(t.get("ui_guide_highlight_2", t.get("selection", guide_highlight_2))))
+            guide_highlight_3 = guide_highlight_tint(str(t.get("ui_guide_highlight_3", t.get("accent", guide_highlight_3))))
             scan_page_fill = str(t.get("ui_scan_page_fill", scan_page_fill))
             scan_card_fill = str(t.get("ui_scan_card_fill", scan_card_fill))
             scan_row_fill = str(t.get("ui_scan_row_fill", scan_row_fill))
@@ -5601,15 +6501,26 @@ class MainWindow(QMainWindow):
             scan_button_fill = str(t.get("ui_scan_button_fill", scan_button_fill))
             scan_log_fill = str(t.get("ui_scan_log_fill", scan_log_fill))
             scan_progress_fill = str(t.get("ui_scan_progress_fill", scan_progress_fill))
-        scan_card_text = _button_text_for(scan_card_fill, dark=t["text"], light="#FFFFFF")
-        scan_input_text = _button_text_for(scan_input_fill, dark="#171717", light="#F7F7F7")
+
+        # A readable foreground is not enough: Guide callout fills must also be
+        # visibly distinct from the surrounding Guide reading surface. This is
+        # enforced for every built-in and custom theme after all theme overrides.
+        guide_highlight_1 = ensure_guide_highlight_separation(guide_highlight_1, guide_browser_fill)
+        guide_highlight_2 = ensure_guide_highlight_separation(guide_highlight_2, guide_browser_fill)
+        guide_highlight_3 = ensure_guide_highlight_separation(guide_highlight_3, guide_browser_fill)
+        guide_highlight_1_border = guide_highlight_border(guide_highlight_1)
+        guide_highlight_2_border = guide_highlight_border(guide_highlight_2)
+        guide_highlight_3_border = guide_highlight_border(guide_highlight_3)
+
+        scan_card_text = main_text_on(scan_card_fill)
+        scan_input_text = main_text_on(scan_input_fill) if adaptive_text_enabled else _button_text_for(scan_input_fill, dark="#171717", light="#F7F7F7")
         # Scanner logs are diagnostic text, so use a neutral high-contrast
         # foreground rather than a decorative theme foreground. This protects
         # readability across dark/strong themes and future imported themes too.
-        scan_log_text = "#F2F2F2" if _luma_hex(scan_log_fill) < 160 else "#202020"
-        scan_progress_text = _button_text_for(scan_progress_fill, dark="#171717", light="#F7F7F7")
-        scan_button_text = _button_text_for(scan_button_fill, dark="#171717", light="#F7F7F7")
-        scan_placeholder_text = _button_text_for(scan_input_fill, dark="#404040", light="#E1E1E1")
+        scan_log_text = main_text_on(scan_log_fill) if adaptive_text_enabled else ("#F2F2F2" if _luma_hex(scan_log_fill) < 160 else "#202020")
+        scan_progress_text = main_text_on(scan_progress_fill) if adaptive_text_enabled else _button_text_for(scan_progress_fill, dark="#171717", light="#F7F7F7")
+        scan_button_text = main_text_on(scan_button_fill) if adaptive_text_enabled else _button_text_for(scan_button_fill, dark="#171717", light="#F7F7F7")
+        scan_placeholder_text = muted_text_on(scan_input_fill) if adaptive_text_enabled else _button_text_for(scan_input_fill, dark="#404040", light="#E1E1E1")
         if self.theme_name == "Blue Grey Rose":
             # Slightly stronger near-black text on the muted rose Scan controls.
             scan_input_text = "#121212"
@@ -5634,10 +6545,11 @@ class MainWindow(QMainWindow):
         # but ordinary Library buttons stay flat. Their outline now follows the
         # same theme-aware border role used by Scan controls instead of the old
         # generic grey edge.
-        nav_button_top = _mix_hex(info_fill, "#FFFFFF", 0.12 if _luma_hex(info_fill) >= 145 else 0.07)
-        nav_button_bottom = _mix_hex(info_fill, "#000000", 0.045 if _luma_hex(info_fill) >= 145 else 0.11)
-        nav_edge_light = _mix_hex(info_card_border, "#FFFFFF", 0.16 if _luma_hex(info_fill) >= 145 else 0.08)
-        nav_edge_dark = _mix_hex(info_card_border, "#000000", 0.08 if _luma_hex(info_fill) >= 145 else 0.16)
+        nav_button_base = filter_button if t.get("_custom") else info_fill
+        nav_button_top = _mix_hex(nav_button_base, "#FFFFFF", 0.12 if _luma_hex(nav_button_base) >= 145 else 0.07)
+        nav_button_bottom = _mix_hex(nav_button_base, "#000000", 0.045 if _luma_hex(nav_button_base) >= 145 else 0.11)
+        nav_edge_light = _mix_hex(info_card_border, "#FFFFFF", 0.16 if _luma_hex(nav_button_base) >= 145 else 0.08)
+        nav_edge_dark = _mix_hex(info_card_border, "#000000", 0.08 if _luma_hex(nav_button_base) >= 145 else 0.16)
         guide_jump_top = _mix_hex(guide_jump_fill, "#FFFFFF", 0.12 if _luma_hex(guide_jump_fill) >= 145 else 0.07)
         guide_jump_bottom = _mix_hex(guide_jump_fill, "#000000", 0.045 if _luma_hex(guide_jump_fill) >= 145 else 0.11)
         guide_edge_button_light = _mix_hex(guide_button_border, "#FFFFFF", 0.18 if _luma_hex(guide_jump_fill) >= 145 else 0.09)
@@ -5718,10 +6630,53 @@ class MainWindow(QMainWindow):
         scan_page_text = _button_text_for(scan_page_fill, dark=active_dark_text, light=active_light_text)
         scan_hint_text = _button_text_for(side_fill, dark=active_dark_text, light=active_light_text)
         guide_active_text = _button_text_for(guide_browser_fill, dark=active_dark_text, light=active_light_text)
+        guide_section_text = _automatic_theme_text_for(guide_section_fill, muted=False)
+        # Keep Guide hierarchy flat and obvious. H1/H2 use the same section fill;
+        # callouts use their dedicated highlight fills with one simple border.
+        guide_h2_fill = guide_section_fill
+        guide_h2_text = guide_section_text
+        guide_highlight_1_text = _automatic_theme_text_for(guide_highlight_1, muted=False)
+        guide_highlight_2_text = _automatic_theme_text_for(guide_highlight_2, muted=False)
+        guide_highlight_3_text = _automatic_theme_text_for(guide_highlight_3, muted=False)
         scan_status_text = surface_text
         scan_row_text = scan_card_text
         guide_page_text = guide_active_text
         guide_card_text = guide_active_text
+
+        # Store the active Guide callout palette so the Guide HTML renderer can
+        # apply reliable inline fills to non-heading highlights.
+        self._guide_highlight_1 = guide_highlight_1
+        self._guide_highlight_2 = guide_highlight_2
+        self._guide_highlight_3 = guide_highlight_3
+        self._guide_highlight_1_text = guide_highlight_1_text
+        self._guide_highlight_2_text = guide_highlight_2_text
+        self._guide_highlight_3_text = guide_highlight_3_text
+        self._guide_callout_border = guide_border
+        self._guide_highlight_1_border = guide_highlight_1_border
+        self._guide_highlight_2_border = guide_highlight_2_border
+        self._guide_highlight_3_border = guide_highlight_3_border
+
+        if hasattr(self, "guide_browser"):
+            guide_doc_css = (
+                f"h1 {{ color: {guide_section_text}; background-color: {guide_section_fill}; margin-top: 18px; margin-bottom: 9px; padding: 8px; border: 1px solid {guide_border}; }} "
+                f"h2 {{ color: {guide_h2_text}; background-color: {guide_h2_fill}; margin-top: 15px; margin-bottom: 7px; padding: 6px; border: 1px solid {guide_border}; }} "
+                f"h3 {{ color: {guide_page_text}; margin-top: 12px; margin-bottom: 5px; }} "
+                f"p.where {{ background-color: {guide_highlight_1}; color: {guide_highlight_1_text}; padding: 6px; margin-top: 4px; margin-bottom: 7px; border: 1px solid {guide_highlight_1_border}; }} "
+                f"p.tip {{ background-color: {guide_highlight_2}; color: {guide_highlight_2_text}; padding: 6px; border: 1px solid {guide_highlight_2_border}; }} "
+                f"p.important {{ background-color: {guide_highlight_3}; color: {guide_highlight_3_text}; padding: 6px; border: 1px solid {guide_highlight_3_border}; }}"
+            )
+            self.guide_browser.document().setDefaultStyleSheet(guide_doc_css)
+            # QTextDocument applies a new default stylesheet to newly inserted HTML.
+            # Re-render the stored Guide source so a theme applied after page creation
+            # immediately updates section/highlight fills too.
+            if hasattr(self, "_guide_html"):
+                guide_scroll_value = self.guide_browser.verticalScrollBar().value()
+                self.guide_browser.setHtml(self._render_guide_html() if hasattr(self, "_render_guide_html") else self._guide_html)
+                self.guide_browser.verticalScrollBar().setValue(guide_scroll_value)
+                if hasattr(self, "guide_search_edit") and self.guide_search_edit.text().strip():
+                    query = self.guide_search_edit.text()
+                    self.guide_search_edit.setText("")
+                    self.guide_search_edit.setText(query)
         thumbnail_text = active_dark_text
         if t.get("_custom"):
             scan_hint_text = scan_card_text
@@ -5754,6 +6709,25 @@ class MainWindow(QMainWindow):
         edit_status_text = "#000000" if self.theme_name in black_edit_reading_themes else edit_page_text
         casp_reading_text = "#000000" if self.theme_name in black_edit_reading_themes else edit_help_text
         light_surface_text = active_dark_text
+        if adaptive_text_enabled:
+            scan_page_text = main_text_on(scan_page_fill)
+            scan_hint_text = muted_text_on(scan_card_fill)
+            scan_status_text = main_text_on(scan_card_fill)
+            scan_row_text = main_text_on(scan_row_fill)
+            guide_page_text = main_text_on(guide_page_fill)
+            guide_card_text = main_text_on(guide_card_fill)
+            guide_active_text = main_text_on(guide_browser_fill)
+            thumbnail_text = muted_text_on(preview_mat_fill)
+            edit_page_text = main_text_on(side_fill)
+            edit_help_text = muted_text_on(side_fill)
+            edit_reading_text = main_text_on("#FFFFFF")
+            edit_status_text = muted_text_on("#FFFFFF")
+            casp_reading_text = main_text_on("#FFFFFF")
+            light_surface_text = main_text_on("#F4F4F4")
+
+        detail_restore_hover_text = main_text_on(detail_restore_hover) if adaptive_text_enabled else (
+            "#000000" if detail_restore_uses_black else _button_text_for(detail_restore_hover, dark=t["text"], light="#FFFFFF")
+        )
 
         # Shared palette for top-level dialogs/message boxes and the expanded
         # Scanner Log. This is deliberately based on the Scan surfaces because
@@ -5763,6 +6737,7 @@ class MainWindow(QMainWindow):
             "panel": scan_row_fill,
             "input": scan_input_fill,
             "text": scan_card_text,
+            "muted": muted_text_on(scan_card_fill) if adaptive_text_enabled else theme_muted,
             "input_text": scan_input_text,
             "button": scan_button_fill,
             "button_text": scan_button_text,
@@ -5776,7 +6751,7 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(f"""
             QMainWindow, QWidget {{
                 background: #FFFFFF;
-                color: {t['text']};
+                color: {theme_text};
                 font-family: 'Segoe UI';
                 font-size: 10pt;
             }}
@@ -5815,7 +6790,7 @@ class MainWindow(QMainWindow):
                 border: none;
                 border-radius: 5px;
             }}
-            QFrame#LibraryTopRow QLabel {{ background: transparent; color: {surface_text}; }}
+            QFrame#LibraryMdbRow {{ background: transparent; border: none; }}
             QFrame#LibraryFiltersRow {{ background: transparent; border: none; }}
             QWidget#LibraryActionSlot {{ background: transparent; border: none; }}
             QWidget#LibraryActionGroup {{ background: transparent; border: none; }}
@@ -5855,6 +6830,11 @@ class MainWindow(QMainWindow):
             QLabel#ScanSectionTitle {{ font-size: 11pt; font-weight: 700; color: {surface_text}; }}
             QLabel#ScanStatus, QLabel#ScanProgressLabel, QLabel#ScanCurrentFile {{ color: {scan_status_text}; }}
             QLabel#ScanHint {{ color: {scan_hint_text}; font-size: 9pt; }}
+            QLabel#ScanWorkflowHint {{
+                background: transparent;
+                color: {scan_page_text};
+                font-size: 9pt;
+            }}
             QFrame#ScanCard QPushButton {{
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {scan_button_top}, stop:1 {scan_button_bottom});
                 color: {scan_button_text};
@@ -5941,6 +6921,9 @@ class MainWindow(QMainWindow):
             QLabel#GuideSubtitle {{ color: {guide_page_text}; background: transparent; }}
             QLabel#GuideGroupTitle {{ color: {guide_page_text}; background: transparent; font-size: 11pt; font-weight: 700; margin-top: 3px; }}
             QFrame#GuideJumpCard QLabel {{ color: {guide_card_text}; background: transparent; }}
+            QFrame#GuideSearchCard {{ background: {guide_card_fill}; border: 1px solid {guide_border}; border-radius: 8px; }}
+            QFrame#GuideSearchCard QLabel {{ color: {guide_card_text}; background: transparent; }}
+            QLabel#GuideSearchCount {{ font-weight: 600; min-width: 70px; }}
             QFrame#GuideJumpCard {{
                 background: {guide_card_fill}; border: {guide_border_width}px solid {guide_border};
                 border-top-color: {guide_edge_light}; border-left-color: {guide_edge_light};
@@ -5972,7 +6955,7 @@ class MainWindow(QMainWindow):
                 border: 1px solid {scrollbar_color};
                 border-radius: 9px;
             }}
-            QFrame#FilterCard QLabel {{ background: transparent; color: {_button_text_for(filter_panel_fill, dark=t["text"], light="#FFFFFF")}; }}
+            QFrame#FilterCard QLabel {{ background: transparent; color: {main_text_on(filter_panel_fill)}; }}
             QFrame#ActiveFilterBar {{ background: transparent; border: none; }}
             QScrollArea#ActiveFilterScroll {{ background: transparent; border: none; }}
             QWidget#ActiveFilterChipHost {{ background: transparent; }}
@@ -5987,7 +6970,13 @@ class MainWindow(QMainWindow):
             QLabel#StatsStrong {{ font-weight: 700; font-size: 11pt; }}
             QLabel#UnsavedLabel {{ font-weight: 650; }}
             QLabel#MDBPathCaption {{ font-weight: 700; background: transparent; color: {surface_text}; }}
-            QLabel#MDBPathLabel {{ background: #FFFFFF; color: {t['text']}; border: 1px solid #C4C4C4; border-radius: 6px; padding: 3px 7px; }}
+            QLabel#MDBPathLabel {{
+                background-color: {mdb_path_fill};
+                color: {mdb_path_text};
+                border: 1px solid {mdb_path_border};
+                border-radius: 6px;
+                padding: 3px 7px;
+            }}
             QPushButton#OpenMDBButton {{ background: {filter_button}; color: {button_text}; border: 1px solid {strong_button_border}; border-radius: 8px; padding: 6px 12px; }}
             QWidget#EditPage {{ background: {side_fill}; }}
             QScrollArea#EditScroll {{ background: {side_fill}; border: none; }}
@@ -6000,8 +6989,29 @@ class MainWindow(QMainWindow):
             QFrame#EditCard {{ background: #FFFFFF; border: 1px solid #CFCFCF; border-radius: 8px; }}
             QFrame#EditCard QLabel {{ background: transparent; color: {active_dark_text}; }}
             QLabel#DirtyLabel {{ color: {edit_status_text}; font-weight: 600; }}
-            QWidget#CASPObservationsPage QLabel#EditHelp {{ color: {casp_reading_text}; }}
-            QTextBrowser#CASPObservationsBrowser {{ color: {casp_reading_text}; }}
+            QWidget#IdentifiersPage {{ background: {side_fill}; }}
+            QWidget#IdentifiersPage QLabel#EditHelp {{
+                background: #FFFFFF; color: {active_dark_text};
+                border: 1px solid #D8D8D8; border-radius: 7px; padding: 6px;
+            }}
+            QWidget#IdentifiersPage QLabel#IdentifierSearchLabel {{ color: {edit_page_text}; }}
+            QLabel#IdentifierSearchResult {{ color: {edit_page_text}; font-weight: 600; }}
+            QTextBrowser#IdentifiersBrowser {{
+                background: #FFFFFF; color: {active_dark_text};
+                border: 1px solid #CFCFCF; border-radius: 8px; padding: 8px;
+            }}
+            QPushButton#IdentifierSearchButton {{
+                background: {filter_button}; color: {button_text}; border: 1px solid {strong_button_border};
+                border-radius: 8px; padding: 5px 12px; min-height: 20px;
+            }}
+            QWidget#CASPObservationsPage QLabel#EditHelp {{
+                background: #FFFFFF; color: {active_dark_text};
+                border: 1px solid #D8D8D8; border-radius: 7px; padding: 6px;
+            }}
+            QTextBrowser#CASPObservationsBrowser {{
+                background: #FFFFFF; color: {active_dark_text};
+                border: 1px solid #CFCFCF; border-radius: 8px; padding: 8px;
+            }}
             QPushButton#SaveButton {{ background: {filter_button}; color: {button_text}; border: 1px solid {strong_button_border}; border-radius: 8px; padding: 7px 13px; }}
 
             QLineEdit, QComboBox {{
@@ -6014,6 +7024,20 @@ class MainWindow(QMainWindow):
                 min-height: 18px;
             }}
             QLineEdit:focus, QComboBox:focus {{ border: 2px solid {scrollbar_color}; }}
+
+            /* Random Sim table editors deliberately sit smaller than their
+               table cells.  Let Qt draw the native combo arrow instead of
+               forcing a wide custom drop-down sub-control at scaled DPI. */
+            QComboBox#RandomSimCountCombo, QComboBox#RandomSimModeCombo {{
+                background: #FFFFFF; color: {active_dark_text};
+                border: 1px solid #C4C4C4; border-radius: 7px;
+                padding: 2px 6px; min-height: 14px;
+            }}
+            QDoubleSpinBox#RandomSimChanceSpin, QDoubleSpinBox#RandomSimValueSpin {{
+                background: #FFFFFF; color: {active_dark_text};
+                border: 1px solid #C4C4C4; border-radius: 5px;
+                padding: 1px 3px; min-height: 14px;
+            }}
             QPlainTextEdit#CCMagicProfilesEdit {{
                 background: #F1F1F1; color: {active_dark_text}; placeholder-text-color: #5C5C5C; border: 1px solid #C4C4C4;
                 border-radius: 8px; padding: 4px 6px;
@@ -6050,7 +7074,7 @@ class MainWindow(QMainWindow):
             }}
             QPushButton {{
                 background: #F6F6F6;
-                color: {t['text']};
+                color: {theme_text};
                 border: 1px solid {button_border};
                 border-radius: 5px;
                 padding: 5px 12px;
@@ -6066,7 +7090,8 @@ class MainWindow(QMainWindow):
             QFrame#FilterCard QPushButton:pressed {{ background: {_mix_hex(filter_button, '#000000', 0.045)}; }}
 
             QFrame#PinnedBar {{ background: transparent; border: none; }}
-            QLabel#PinnedLabel {{ font-weight: 700; color: {t['text']}; background: transparent; }}
+            QLabel#PinnedIcon {{ background: transparent; border: none; }}
+            QLabel#PinnedLabel {{ font-weight: 700; color: {theme_text}; background: transparent; }}
             QScrollArea#PinnedScroll {{ background: transparent; border: none; }}
             QScrollArea#PinnedScroll > QWidget > QWidget {{ background: transparent; }}
             QFrame#PinChip {{ background: transparent; border: none; }}
@@ -6074,19 +7099,19 @@ class MainWindow(QMainWindow):
                 background: {header_fill}; color: {header_text}; border: 1px solid {button_border};
                 border-top-left-radius: 6px; border-bottom-left-radius: 6px;
                 border-top-right-radius: 0px; border-bottom-right-radius: 0px;
-                padding: 4px 8px; font-weight: 600;
+                padding: 1px 6px; font-weight: 600; text-align: left;
             }}
             QPushButton#PinnedTab:checked {{ background: {filter_button}; color: {button_text}; border-color: {strong_button_border if self.theme_name == "Cherry Blossom Pink" else scrollbar_color}; }}
             QPushButton#PinnedRemove {{
-                background: #F7F7F7; color: {t['text']}; border: 1px solid {button_border}; border-left: none;
+                background: #F7F7F7; color: {theme_text}; border: 1px solid {button_border}; border-left: none;
                 border-top-right-radius: 6px; border-bottom-right-radius: 6px;
-                border-top-left-radius: 0px; border-bottom-left-radius: 0px; padding: 4px 2px; font-weight: 700;
+                border-top-left-radius: 0px; border-bottom-left-radius: 0px; padding: 1px 2px; font-weight: 700;
             }}
             QPushButton#PinnedRemove:hover {{ background: {info_fill}; }}
 
             QPushButton#ViewToggle {{
                 background: #FFFFFF;
-                color: {t['text']};
+                color: {theme_text};
                 border: 1px solid {guide_button_border};
                 border-radius: 7px;
                 padding: 4px 10px;
@@ -6106,7 +7131,7 @@ class MainWindow(QMainWindow):
             }}
             QPushButton#ViewToggle[detailsRestore="true"]:hover {{
                 background: {detail_restore_hover};
-                color: {"#000000" if detail_restore_uses_black else _button_text_for(detail_restore_hover, dark=t["text"], light="#FFFFFF")};
+                color: {detail_restore_hover_text};
             }}
             QPushButton#ColumnFoldCollapseButton {{
                 background: {column_collapse_fill};
@@ -6161,7 +7186,7 @@ class MainWindow(QMainWindow):
             QComboBox#GalleryQuickCombo::down-arrow {{ image: none; width: 0px; height: 0px; }}
             QPushButton#GalleryQuickButton {{
                 background: #FFFFFF;
-                color: {t['text']};
+                color: {theme_text};
                 border: 1px solid {button_border};
                 border-radius: 7px;
                 padding: 1px 7px;
@@ -6202,7 +7227,7 @@ class MainWindow(QMainWindow):
             QScrollBar#TableExternalHorizontalScrollBar::sub-page:horizontal {{ background: transparent; }}
             QPushButton#TableScrollNudgeButton {{
                 padding: 0px; font-size: 10pt; font-weight: 700;
-                background: #FFFFFF; color: {t['text']};
+                background: #FFFFFF; color: {theme_text};
                 border: 1px solid {button_border}; border-radius: 3px;
             }}
             QPushButton#TableScrollNudgeButton:hover {{ border-color: {scrollbar_color}; }}
@@ -6224,10 +7249,10 @@ class MainWindow(QMainWindow):
             QListView#GalleryView::item {{ background: transparent; border: none; }}
             QTableView {{
                 background: {main_fill};
-                color: {t['text']};
+                color: {theme_text};
                 border: none;
                 selection-background-color: transparent;
-                selection-color: {t['text']};
+                selection-color: {theme_text};
                 outline: none;
             }}
             QTableView::item {{ padding: 4px 6px; border: none; }}
@@ -6284,13 +7309,13 @@ class MainWindow(QMainWindow):
             }}
             QSplitter#OverviewVerticalSplitter::handle:vertical:hover {{ background: {scrollbar_color}; }}
             QTextBrowser#InfoBrowser {{ background: {detail_info_fill}; color: {detail_info_text}; border: none; padding: 4px; }}
-            QTableWidget {{ background: #FFFFFF; color: {t['text']}; border: 1px solid #C9C9C9; gridline-color: {row_line}; }}
+            QTableWidget {{ background: #FFFFFF; color: {theme_text}; border: 1px solid #C9C9C9; gridline-color: {row_line}; }}
             QDialog {{ background: #FFFFFF; }}
             QScrollArea {{ background: #FFFFFF; border: 1px solid #D6D6D6; }}
             QCheckBox {{ spacing: 6px; }}
             QPushButton#RoutingAckButton {{
                 background: #FFFFFF;
-                color: {t['text']};
+                color: {theme_text};
                 border: 1px solid {strong_button_border};
                 border-radius: 6px;
                 padding: 5px 10px;
@@ -6339,6 +7364,24 @@ class MainWindow(QMainWindow):
             QStatusBar {{ background: #F4F4F4; color: {light_surface_text}; border-top: 1px solid #DDDDDD; }}
         """)
 
+        # Custom themes: ui_mdb_path_border controls ONLY the outline. The
+        # interior stays transparent so the surrounding MDB bar colour shows
+        # through, matching the outlined built-in treatment.
+        is_custom_theme = bool(t.get("_custom")) or self.theme_name in self.custom_theme_files
+        if hasattr(self, "pinned_icon_label"):
+            self.pinned_icon_label.setPixmap(self._pin_icon().pixmap(16, 16))
+        if hasattr(self, "pin_button"):
+            self.pin_button.setIcon(self._pin_icon())
+
+        if hasattr(self, "mdb_path_label"):
+            if is_custom_theme:
+                self.mdb_path_label.setStyleSheet(
+                    f"background-color: transparent; color: {surface_text}; "
+                    f"border: 1px solid {custom_mdb_path_border}; border-radius: 6px; padding: 3px 7px;"
+                )
+            else:
+                self.mdb_path_label.setStyleSheet("")
+
         for box in self.filter_boxes.values():
             if isinstance(box, ArrowComboBox):
                 box.set_arrow_color(arrow_color)
@@ -6356,8 +7399,16 @@ class MainWindow(QMainWindow):
 
         delegate = self.table.itemDelegate()
         theme_for_rows = dict(self.theme)
-        theme_for_rows["row_main"] = main_fill if t.get("_custom") else "#FFFFFF"
-        theme_for_rows["line_alt"] = row_alt
+        custom_coloured_rows = bool(t.get("_colour_library_rows", True)) if t.get("_custom") else False
+        if t.get("_custom") and custom_coloured_rows:
+            theme_for_rows["row_main"] = main_fill
+            theme_for_rows["line_alt"] = row_alt
+        else:
+            # Match the normal built-in Library treatment: neutral rows stay
+            # easy to read even while the rest of a custom theme remains colourful.
+            theme_for_rows["row_main"] = "#FFFFFF"
+            theme_for_rows["line_alt"] = "#EEEEEE"
+        theme_for_rows["_custom_coloured_rows"] = custom_coloured_rows
         theme_for_rows["line"] = row_line
         theme_for_rows["dirty_marker"] = "#E09A32"
         if not isinstance(delegate, RowOutlineDelegate):
@@ -6387,13 +7438,23 @@ class MainWindow(QMainWindow):
                 "card": "#FFFFFF",
                 "border": "#CFCFCF",
                 "image": "#F7F7F7",
-                "text": t["text"],
-                "muted": t["muted"],
+                "text": main_text_on("#FFFFFF") if adaptive_text_enabled else t["text"],
+                "muted": muted_text_on("#F7F7F7") if adaptive_text_enabled else t["muted"],
                 "selection": scrollbar_color,
                 "badge": info_fill,
                 "badge_text": info_text,
                 "dirty": "#E09A32",
             })
+
+        # Overview helper/experimental notes are embedded as inline HTML colours.
+        # Rebuild the currently selected package after every theme change so
+        # those colours are recalculated against the new detail-card surface.
+        # Without this refresh, switching from a light theme to a dark/custom
+        # theme can leave stale dark helper text on the new dark card.
+        if self.current_source_row is not None:
+            current_record = self.model.record(self.current_source_row)
+            if current_record:
+                self.show_record(current_record)
 
     def _init_frozen_package_view(self):
         """Overlay a read-only frozen #/Package strip on the Library table."""
@@ -6404,6 +7465,12 @@ class MainWindow(QMainWindow):
         frozen.setSelectionModel(self.table.selectionModel())
         frozen.setSelectionBehavior(QTableView.SelectRows)
         frozen.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        # Share one hovered-row state across the frozen Package strip and the
+        # scrollable table so hover reads as one continuous row.
+        self.table._hover_sync_views = [frozen]
+        frozen._hover_sync_views = [self.table]
+        self.table._hover_row = -1
+        frozen._hover_row = -1
         frozen.setEditTriggers(QAbstractItemView.NoEditTriggers)
         frozen.setFocusPolicy(Qt.NoFocus)
         frozen.setAlternatingRowColors(False)
@@ -6557,6 +7624,40 @@ class MainWindow(QMainWindow):
         if hasattr(self, "table_scroll_right_btn"):
             self.table_scroll_right_btn.setEnabled(active and bar.value() < bar.maximum())
 
+    def _set_detail_panel_on_left(self, checked: bool):
+        """Move the existing Library details panel without rebuilding its contents."""
+        old_on_left = bool(getattr(self, "detail_panel_on_left", False))
+        self.detail_panel_on_left = bool(checked)
+        self.settings.setValue("detail_panel_on_left", self.detail_panel_on_left)
+        self.settings.sync()
+        if not hasattr(self, "splitter") or not hasattr(self, "detail_panel"):
+            return
+
+        # Preserve the user's current pane width/collapse state while moving it.
+        sizes = self.splitter.sizes()
+        old_detail_index = 0 if old_on_left else 1
+        if len(sizes) >= 2 and sizes[old_detail_index] > 0:
+            self.detail_panel_width = max(300, min(720, int(sizes[old_detail_index])))
+            self.splitter.last_detail_panel_width = self.detail_panel_width
+
+        target_index = 0 if self.detail_panel_on_left else 1
+        self.splitter.insertWidget(target_index, self.detail_panel)
+        self.splitter.detail_panel_on_left = self.detail_panel_on_left
+        detail_index = target_index
+        content_index = 1 - detail_index
+        self.splitter.setStretchFactor(content_index, 1)
+        self.splitter.setStretchFactor(detail_index, 0)
+        self.splitter.setCollapsible(content_index, False)
+        self.splitter.setCollapsible(detail_index, True)
+        self.splitter.last_detail_panel_width = self.detail_panel_width
+        self.splitter.set_detail_panel_collapsed(self.detail_panel_collapsed)
+        self._update_detail_panel_toggle_buttons()
+        self._fit_detail_title()
+        self._update_frozen_package_geometry()
+        QTimer.singleShot(0, self._sync_table_external_scrollbar)
+        side = "left" if self.detail_panel_on_left else "right"
+        self.statusBar().showMessage(f"Library details panel moved to the {side}.", 5000)
+
     def _header_detail_panel_toggled(self, checked=False):
         if not hasattr(self, "splitter"):
             return
@@ -6575,10 +7676,10 @@ class MainWindow(QMainWindow):
             button.setChecked(not collapsed)
             button.blockSignals(False)
             button.setToolTip("Show details panel" if collapsed else "Hide details panel")
-            # Keep the normal Details label while visible.  When the right-side
-            # panel is hidden, switch this top-row control to a compact restore
-            # chevron instead of showing a disabled-looking Details button.
-            button.setText("◀" if collapsed else "Details")
+            # Keep the normal Details label while visible. When hidden, point
+            # the restore chevron toward whichever side the details panel uses.
+            restore_arrow = "▶" if bool(getattr(self, "detail_panel_on_left", False)) else "◀"
+            button.setText(restore_arrow if collapsed else "Details")
             button.setToolTip("Show details panel" if collapsed else "Hide details panel")
             button.setProperty("detailsRestore", collapsed)
             button.setProperty("detailsOff", False)
@@ -6590,6 +7691,7 @@ class MainWindow(QMainWindow):
     def _restore_detail_panel_state(self):
         if not hasattr(self, "splitter"):
             return
+        self.splitter.detail_panel_on_left = bool(self.detail_panel_on_left)
         self.splitter.last_detail_panel_width = self.detail_panel_width
         self.splitter.set_detail_panel_collapsed(self.detail_panel_collapsed)
         self._update_detail_panel_toggle_buttons()
@@ -6610,11 +7712,13 @@ class MainWindow(QMainWindow):
     def _main_library_splitter_moved(self, *_):
         sizes = self.splitter.sizes() if hasattr(self, "splitter") else []
         if len(sizes) >= 2:
-            collapsed = sizes[1] <= 0
+            detail_index = 0 if bool(getattr(self, "detail_panel_on_left", False)) else 1
+            detail_size = sizes[detail_index]
+            collapsed = detail_size <= 0
             self.splitter.detail_panel_collapsed = collapsed
             self.detail_panel_collapsed = collapsed
-            if sizes[1] > 0:
-                self.detail_panel_width = max(300, min(720, int(sizes[1])))
+            if detail_size > 0:
+                self.detail_panel_width = max(300, min(720, int(detail_size)))
                 self.splitter.last_detail_panel_width = self.detail_panel_width
                 self.settings.setValue("detail_panel_width", self.detail_panel_width)
             self.settings.setValue("detail_panel_collapsed", collapsed)
@@ -6759,6 +7863,9 @@ class MainWindow(QMainWindow):
                 continue
             seen.add(pin_id)
             self.pinned_packages.append({"id": pin_id, "label": label or "Pinned package"})
+        if len(self.pinned_packages) > MAX_PINNED_PACKAGES:
+            self.pinned_packages = self.pinned_packages[:MAX_PINNED_PACKAGES]
+            self._save_pins_for_current_mdb()
 
     def _save_pins_for_current_mdb(self):
         key = self._pin_settings_key()
@@ -6794,15 +7901,25 @@ class MainWindow(QMainWindow):
             if pinned else "Keep this package in the persistent Pinned strip"
         )
 
-    def _toggle_current_pin(self):
-        if self.current_source_row is None:
-            return
-        rec = self.model.record(self.current_source_row)
+    def _source_row_is_pinned(self, source_row: int) -> bool:
+        rec = self.model.record(source_row)
+        if not rec:
+            return False
+        pin_id = self._record_pin_id(rec)
+        return any(item.get("id") == pin_id for item in self.pinned_packages)
+
+    def _toggle_pin_for_source_row(self, source_row: int):
+        rec = self.model.record(source_row)
         if not rec:
             return
         pin_id = self._record_pin_id(rec)
         existing = next((i for i, item in enumerate(self.pinned_packages) if item.get("id") == pin_id), None)
         if existing is None:
+            if len(self.pinned_packages) >= MAX_PINNED_PACKAGES:
+                self.statusBar().showMessage(
+                    f"You can pin up to {MAX_PINNED_PACKAGES} packages. Unpin one first.", 5000
+                )
+                return
             self.pinned_packages.append({"id": pin_id, "label": rec.get("Package", "Package")})
             self.statusBar().showMessage(f"Pinned: {rec.get('Package', 'Package')}", 4000)
         else:
@@ -6813,6 +7930,11 @@ class MainWindow(QMainWindow):
         self._refresh_pinned_bar()
         self._apply_gallery_quick_filters()
 
+    def _toggle_current_pin(self):
+        if self.current_source_row is None:
+            return
+        self._toggle_pin_for_source_row(self.current_source_row)
+
     def _remove_pin(self, pin_id: str):
         before = len(self.pinned_packages)
         self.pinned_packages = [item for item in self.pinned_packages if item.get("id") != pin_id]
@@ -6821,6 +7943,13 @@ class MainWindow(QMainWindow):
             self._update_pin_button()
             self._refresh_pinned_bar()
             self._apply_gallery_quick_filters()
+
+    def _compact_pin_label(self, label: str, max_chars: int = 18) -> str:
+        """Return a tiny one-line label for the persistent Pinned strip."""
+        text = str(label or "Pinned package").strip()
+        if len(text) <= max_chars:
+            return text
+        return text[: max_chars - 1].rstrip(" _-") + "…"
 
     def _refresh_pinned_bar(self):
         if not hasattr(self, "pinned_tabs_layout"):
@@ -6847,13 +7976,16 @@ class MainWindow(QMainWindow):
             chip_layout.setContentsMargins(0, 0, 0, 0)
             chip_layout.setSpacing(0)
 
-            short = label if len(label) <= 34 else label[:31] + "…"
-            tab = QPushButton(short if row is not None else "Missing: " + short)
+            short = self._compact_pin_label(label)
+            tab = QPushButton(short if row is not None else "Missing…")
             tab.setObjectName("PinnedTab")
             tab.setCheckable(True)
             tab.setChecked(pin_id == current_id)
             tab.setEnabled(row is not None)
-            tab.setToolTip(label if row is not None else f"This pinned package is no longer present in this MDB: {label}")
+            tab.setFixedHeight(24)
+            tab.setMaximumWidth(145)
+            tab.setMinimumWidth(72)
+            tab.setToolTip(label if row is not None else f"This pinned package is no longer present in this Master Database: {label}")
             if row is not None:
                 tab.clicked.connect(lambda checked=False, pid=pin_id: self._select_pinned_package(pid))
             chip_layout.addWidget(tab)
@@ -6861,18 +7993,20 @@ class MainWindow(QMainWindow):
             remove_btn = QPushButton("×")
             remove_btn.setObjectName("PinnedRemove")
             remove_btn.setToolTip("Unpin")
-            remove_btn.setFixedWidth(24)
+            remove_btn.setFixedSize(20, 24)
             remove_btn.clicked.connect(lambda checked=False, pid=pin_id: self._remove_pin(pid))
             chip_layout.addWidget(remove_btn)
             self.pinned_tabs_layout.addWidget(chip)
 
         self.pinned_tabs_layout.addStretch(1)
         self.pinned_bar.setVisible(bool(self.pinned_packages))
+        if hasattr(self, "model"):
+            self.model.refresh_pin_decorations()
 
     def _select_pinned_package(self, pin_id: str):
         row = self._source_row_for_pin(pin_id)
         if row is None:
-            self.statusBar().showMessage("That pinned package is no longer present in this MDB", 5000)
+            self.statusBar().showMessage("That pinned package is no longer present in this Master Database", 5000)
             return
         source_index = self.model.index(row, 0)
         proxy_index = self.proxy.mapFromSource(source_index)
@@ -6910,7 +8044,7 @@ class MainWindow(QMainWindow):
         if path.is_file():
             self.load_file(path)
         else:
-            self.statusBar().showMessage("Last used Master Database was not found — open it from its new location or create a new MDB")
+            self.statusBar().showMessage("Last used Master Database was not found — open it from its new location or create a new Master Database")
 
     def create_new_mdb(self):
         """Create a fresh Master Database from the bundled blank template."""
@@ -6931,13 +8065,13 @@ class MainWindow(QMainWindow):
             target = target.with_suffix(".xlsx")
         template = _asset_path("blank_master_database.xlsx")
         if not template.is_file():
-            QMessageBox.critical(self, "Create MDB", "The bundled blank Master Database template is missing.")
+            QMessageBox.critical(self, "Create Master Database", "The bundled blank Master Database template is missing.")
             return
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(template, target)
         except Exception as exc:
-            QMessageBox.critical(self, "Create MDB", f"Could not create the Master Database:\n{exc}")
+            QMessageBox.critical(self, "Create Master Database", f"Could not create the Master Database:\n{exc}")
             return
         self.settings.setValue("last_dir", str(target.parent))
         self.scan_mdb_override = False
@@ -6985,11 +8119,11 @@ class MainWindow(QMainWindow):
         self.guide_library_combo.setMinimumWidth(225)
         library_topics = [
             ("Choose a Library topic…", ""),
-            ("Getting started / MDB", "start"), ("Table & Gallery", "views"),
-            ("Search & filters", "filters"), ("Select packages", "selection"),
+            ("What can I do?", "workflows"), ("Getting started / MDB", "start"),
+            ("Table & Gallery", "views"), ("Search & filters", "filters"), ("Select packages", "selection"),
             ("Pins", "pins"), ("Details", "details"),
+            ("Theme Colour Studio", "themes"),
             ("Edit & save", "edit"), ("Profiles", "profiles"),
-            ("What can I do?", "workflows"),
             ("Advanced & experimental", "advanced"),
         ]
         for label, anchor in library_topics:
@@ -7030,49 +8164,135 @@ class MainWindow(QMainWindow):
         nav_layout.addWidget(back_top)
         layout.addWidget(nav)
 
+        guide_search_card = QFrame()
+        guide_search_card.setObjectName("GuideSearchCard")
+        guide_search_layout = QHBoxLayout(guide_search_card)
+        guide_search_layout.setContentsMargins(9, 6, 9, 6)
+        guide_search_layout.setSpacing(6)
+        guide_search_label = QLabel("Search Guide:")
+        guide_search_label.setObjectName("GuideGroupTitle")
+        self.guide_search_edit = QLineEdit()
+        self.guide_search_edit.setObjectName("GuideSearchEdit")
+        self.guide_search_edit.setPlaceholderText("Type a feature, term or menu name…")
+        self.guide_search_prev = QPushButton("Previous")
+        self.guide_search_next = QPushButton("Next")
+        self.guide_search_count = QLabel("No search")
+        self.guide_search_count.setObjectName("GuideSearchCount")
+        guide_search_layout.addWidget(guide_search_label)
+        guide_search_layout.addWidget(self.guide_search_edit, 1)
+        guide_search_layout.addWidget(self.guide_search_prev)
+        guide_search_layout.addWidget(self.guide_search_next)
+        guide_search_layout.addWidget(self.guide_search_count)
+        layout.addWidget(guide_search_card)
+
         self.guide_browser = QTextBrowser()
         self.guide_browser.setObjectName("GuideBrowser")
         self.guide_browser.setOpenExternalLinks(False)
-        # Keep literal filenames/extensions readable in every Guide theme.
-        # QTextBrowser's default <code> colour can otherwise become too faint
-        # when a palette/theme is applied.
+        # Keep literal filenames/extensions readable without drawing grey
+        # inline-code boxes around examples such as .package, __1 and __2.
         self.guide_browser.document().setDefaultStyleSheet(
-            "code { color: #202020; background-color: #F1F1F1; "
-            "font-family: 'Consolas'; font-weight: 600; }"
+            "h1, h2 { color: #202020; background-color: #E7EEF3; padding: 6px; border: 1px solid #AAB7C0; } "
+            "h3 { color: #334C5E; margin-top: 12px; margin-bottom: 5px; } "
+            "p.where, p.tip, p.important { color: #202020; padding: 6px; border: 1px solid #C3C3C3; }"
         )
-        self.guide_browser.setHtml(r'''
+        self._guide_html = r'''
 <h1><a name="start"></a>CAS Curator — Step-by-step Guide</h1>
-<p>CAS Curator helps you browse, organise, scan and safely sort Sims 3 CAS custom content. Use the two compact topic menus below to jump straight to the instructions you need.</p><p><b>Guide style:</b> action features use direct step-by-step instructions that tell you where to click, what to select, what to save, and what should happen next. Explanations are kept alongside the steps rather than replacing them.</p>
-<p><b>New user?</b> You do not need to make a spreadsheet yourself. If you do not already have a Master Database, click <b>Create new MDB…</b>, choose where to save it, then run your first Scan. CAS Curator will add the scanned packages to the new database.</p>
-<p><b>Important:</b> Run Scan generates direct CASP IDs, supported CC Type values and Highest Polys from readable GEOM resources, extracts a dedicated THUM preview when one is available, and records the exact package hash and scan time. Whether a package contains or overlaps with EA resources is not assessed. Skin type, script/gameplay status, general IMG texture purpose and performance-risk ratings are also not supported scan results. Filenames are never used as evidence for the supported classifications.</p>
+<p>CAS Curator helps you browse, identify, organise, scan and safely sort Sims 3 CAS custom content. Use the topic menus or the <b>Search Guide</b> box above to jump to what you need.</p>
+<p><b>New user?</b> You do not need to make a spreadsheet yourself. If you do not already have a Master Database, click <b>Create new Master Database…</b>, choose where to save it, then run your first Scan. CAS Curator will add the scanned packages to the new database.</p>
+<h2><a name="workflows"></a>What CAS Curator Can Do</h2>
+<p class="where"><b>Where to find it:</b> most everyday tools are in <b>Library</b>; scanning and automatic sorting are in <b>Scan</b>; additional actions are under <b>Tools</b>.</p>
+<p>CAS Curator can help you:</p>
+<ul>
+<li><b>Check CC health</b> and review structural package problems separately from performance information.</li>
+<li><b>Estimate performance impact</b> with the advisory Performance Risk Score, Highest Polys, texture measurements and related scan data.</li>
+<li><b>Identify mystery CC</b> using package names, <b>CASP (Create-a-Sim Part)</b>/resource IDs, package hashes and stored paths. CASP IDs can also help match a package back to an item in other Sims 3 tools that display the same IDs.</li>
+<li><b>Browse visually</b> in Gallery, use extracted thumbnails, or add your own preview image.</li>
+<li><b>Search and filter large Libraries</b> by Creator, CC Type, Status, <b>Profile Membership</b> (the Profiles a package belongs to), location and other stored information.</li>
+<li><b>Edit many rows quickly</b> by using the Table fill handle to copy an editable value down several displayed rows, or select several rows to clear the same editable field in one action.</li>
+<li><b>Plan organisation before moving files</b> with Status, Profiles, Profile Rules and Planned Locations.</li>
+<li><b>Move or copy packages safely</b> with previews and verification instead of blindly changing files.</li>
+<li><b>Bring in downloads</b> from folders, ZIPs and supported CAS content inside Sims3Packs.</li>
+<li><b>Track CC Magic deployment copies</b> while keeping the organised master package in its normal location.</li>
+<li><b>Customise CAS Curator</b> with built-in themes and Theme Colour Studio.</li>
+</ul>
+<p class="tip"><b>How Scan identifies CC:</b> CAS Curator reads supported information directly from package resources and other supported scan evidence. Filenames are not used as evidence for supported classifications.</p>
+<h3>Remembered Creator / Converter names — step by step</h3>
+<p class="where"><b>Where to find it:</b> <b>Library</b> editable Creator/Converter fields; reopen suggestions from <b>Tools &gt; Profiles &amp; Locations &gt; Review Remembered Creator / Converter Suggestions…</b>.</p>
+<ol>
+<li>Enter a confirmed name in the <b>Creator</b> or <b>Converter</b> column and click <b>Save Changes</b>. CAS Curator remembers the saved name locally.</li>
+<li>When another package has a blank Creator/Converter field and its filename contains that remembered name, CAS Curator shows a review table. Filename matching is case-insensitive and uses careful word, phrase or distinctive-prefix matching to reduce false matches.</li>
+<li>Untick any suggestion you do not want, then click <b>Use Checked Suggestions</b> and confirm. The changes remain unsaved until you choose <b>Save Changes</b>.</li>
+<li>Review the Library and click <b>Save Changes</b> when satisfied.</li>
+<li>If you dismissed the automatic review, use <b>Tools → Profiles & Locations → Review Remembered Creator / Converter Suggestions…</b> to open it again.</li>
+</ol>
+<p>Existing nonblank Creator/Converter fields are never replaced by this helper. Remembered names do not come from web search and are not treated as proof of authorship; they are suggestions based on names you previously confirmed.</p>
+<h3>Find Creator / Converter online — step by step</h3>
+<p class="where"><b>Where to find it:</b> right-click a package in <b>Library</b>, or use <b>Tools &gt; Online / Attribution</b>.</p>
+<ol>
+<li>Right-click the package in the Library and choose <b>Find Creator / Converter Online…</b>. (The same command is also available under Tools → Online / Attribution.)</li>
+<li>CAS Curator opens Google immediately with a focused search such as <b>Sims 3 CC &quot;package name&quot; creator converter</b>. The package/item name stays quoted, and Creator/Converter are added at the end to steer Google toward attribution.</li>
+<li>Review the Google results. When you can confirm the attribution, return to CAS Curator and type the name directly into the <b>Creator</b> and/or <b>Converter</b> column (or the Edit tab).</li>
+<li>Click <b>Save Changes</b> when you are satisfied.</li>
+</ol>
+<p>CAS Curator does not scrape Google or automatically guess attribution from the search results. <b>Creator</b> is for the original creator/mesh author; <b>Converter</b> is for the person who converted the item between Sims games/versions.</p>
+<h3>Group one creator's CC into a folder</h3>
+<ol>
+<li>Select the matching packages and use <b>Set Creator for Selected…</b> to assign the creator once. The Table fill handle remains available when a contiguous fill-down is more convenient.</li>
+<li>Use the permanent <b>Creator</b> filter so only that creator's packages are shown.</li>
+<li>Select the shown packages.</li>
+<li>Use <b>Move Selected to Location…</b>, review the source/destination preview, then confirm.</li>
+</ol>
+<p>Routing can automatically sort packages using supported scan information. Managed Locations are most useful for deliberate organisation such as creator folders, Testing, Archive or another collection structure that you choose yourself.</p>
+<h3>Move a filtered group together</h3>
+<p>Filter directly with <b>CC Type</b>, <b>Status</b> or <b>Creator</b>, or use <b>+ Add Quick Filter…</b> for Profile membership, <b>File Location</b>, Age, Gender or any other currently available field. Select the rows you want, then use <b>Move Selected to Location…</b>. CAS Curator checks that it has the correct package and verifies the copy before finishing the move.</p>
+<h3>Prepare several folder layouts and apply one later</h3>
+<p>Enable Experimental features and use <b>Experimental Profile Layouts</b> when you want a Profile to remember different desired managed locations for many packages. Save the Planned Locations first; switching the Current Profile or filtering by Profile membership does not move anything. When you are ready, open <b>Tools &gt; Routing &gt; Experimental Profile Layouts…</b> and use <b>Apply Profile Locations…</b> to preview and perform only the moves needed for that Profile.</p>
+<h3>Prepare a group for CC Magic</h3>
+<p class="where"><b>Where to find it:</b> <b>Tools &gt; Profiles &amp; Locations &gt; Set CC Magic Import Folder…</b>, then select packages in Library and use <b>Copy Selected to CC Magic Import…</b>.</p>
+<p>Click <b>+ Add Quick Filter…</b> and choose <b>CC Magic Import is Not in Import</b>, then select the packages you want and use <b>Copy Selected to CC Magic Import…</b>. The Import folder is only a deployment/tracking location for the copy; it is not CAS Curator's organised master location for that CC. Once CC Magic processes those files, use CC Magic itself to manage or remove them. CAS Curator does not delete files from CC Magic-managed storage.</p>
+<h3>Bring in a folder of new downloads</h3>
+<p class="where"><b>Where to find it:</b> <b>Scan</b> &gt; choose the CC source folder.</p>
+<p>Use the recommended sequence <b>Run Scan → Preview Routing → Run Routing</b>. Scan adds or refreshes MDB knowledge; Preview Routing shows exactly where files would go; Run Routing performs the physical move. When ZIPs are present, Scan can extract them beside the original archives first so newly extracted packages join the same scan. When Sims3Packs are present, CAS Curator can analyse their manifests, avoid extracting a CAS package when an identical standalone <b>.package</b> is already present, and optionally extract missing CAS package copies while leaving the original Sims3Pack untouched.</p>
+<h3>Find an item again later</h3>
+<p class="where"><b>Where to find it:</b> <b>Library</b> Search/Quick Filters; for technical IDs use <b>Advanced features</b> and <b>Find ID…</b>.</p>
+<p>Use Creator, package-name search, Profiles, Status and File Location to narrow the Library. When you know a CASP/resource ID, Package Hash or stored source path, enable <b>Advanced features</b>, then use <b>Find ID…</b> in the top bar. It searches hidden technical identifier fields too and selects the matching package for you.</p>
+<p><b>Useful package shortcuts:</b> right-click a Table row for <b>Pin This Item / Unpin This Item</b>, <b>Copy file name</b>, <b>Search Web for Package</b>, <b>Find Creator / Converter Online…</b>, <b>Open File Location</b> when a physical folder is tracked, and the available managed Move/CC Magic actions.</p>
+<h3>Review provisional metadata without letting it organise files</h3>
+<p>Enable <b>Experimental features</b> to inspect Subtype, Skin Type, Outfit Category and EA Resource Status. These metadata fields are review information only and never control Routing automatically. Experimental Profile Layouts are separate and move files only when you explicitly run <b>Apply Profile Locations…</b>.</p>
+
 
 <h1>Library &amp; organisation</h1>
 <h2><a name="library"></a>Library — open, create and browse your Master Database</h2>
-<p>The Master Database (MDB) is CAS Curator's searchable index of your CC. Opening it does not move package files.</p>
+<p class="where"><b>Where to find it:</b> <b>Library</b> tab.</p>
+<p>The Master Database (MDB) is CAS Curator's searchable index of all CC you've ever scanned.</p>
 <h3>If you are using CAS Curator for the first time</h3>
 <ol>
-<li>Stay on <b>Library</b> and click <b>Create new MDB…</b>.</li>
+<li>Stay on <b>Library</b> and click <b>Create new Master Database…</b>.</li>
 <li>Choose where you want to save <b>Sims3_CC_Master_Database.xlsx</b>.</li>
 <li>CAS Curator opens the new blank MDB automatically and also uses it on the Scan page.</li>
 <li>Open <b>Scan</b>, choose your CAS CC folder and click <b>Run Scan</b>. New package rows are added automatically.</li>
 </ol>
 <h3>If you already have an MDB</h3>
 <ol>
-<li>Click <b>Open MDB…</b>, or use <b>File &gt; Open Master Database…</b>.</li>
+<li>Click <b>Open Master Database…</b>, or use <b>File &gt; Open Master Database…</b>.</li>
 <li>Choose the <b>.xlsx</b> Master Database you want to use.</li>
 <li>Wait until the package and thumbnail counts finish loading.</li>
 </ol>
-<p>By default CAS Curator remembers the last MDB and opens it next time. To use another one, simply click <b>Open MDB…</b>. You can turn automatic reopening off or on with <b>File &gt; Open last used MDB on startup</b>.</p>
+<p>By default CAS Curator remembers the last MDB and opens it next time. To use another one, simply click <b>Open Master Database…</b>. You can turn automatic reopening off or on with <b>File &gt; Open last used Master Database on startup</b>.</p>
 <p>The Scan page always uses the Master Database currently open in Library. Scan shows that MDB path read-only; create, open, or change the Master Database from <b>Library</b>.</p>
 
 <h2><a name="views"></a>Table and Gallery views</h2>
+<p class="where"><b>Where to find it:</b> <b>Library</b> &gt; <b>Table</b> or <b>Gallery</b> at the top right.</p>
 <p>Table is best for detailed information and bulk work. Gallery is best when you recognise CC visually.</p>
 <h3>Table</h3>
 <ol>
 <li>Click <b>Table</b> at the top right of the Library.</li>
 <li>Click a column heading to sort by that column.</li>
 <li>Drag column headings left or right if you prefer a different order.</li>
-<li>The <b>Columns</b> menu can hide or show individual columns whenever you want; it does not change the data. In Table view, the compact <b>CAS + / −</b>, <b>Health + / −</b> and <b>Organise + / −</b> buttons quickly show or fold related column groups. Hide that shortcut row with its small ▲ tab and restore it with the ▼ tab over the # header; the choice is remembered. Your visible-column choices are remembered. Use <b>Columns &gt; Freeze Package column</b> to keep the Package name visible while scrolling horizontally; the # column stays beside it when visible. In <b>Columns &gt; Choose visible columns…</b>, use <b>Select all</b>, <b>Deselect all</b> or <b>Default</b> to prepare the ticks before pressing OK. Advanced and Experimental columns are offered only while those options are enabled.</li>
+<li>Use <b>Columns</b> to choose which information is visible. Hiding a column never deletes its data.</li>
+<li>Use <b>CAS + / −</b>, <b>Health + / −</b> and <b>Organise + / −</b> to quickly open or fold related column groups. The small ▲/▼ tab hides or restores this shortcut row.</li>
+<li>Use <b>Columns &gt; Freeze Package column</b> to keep the Package name visible while scrolling sideways.</li>
+<li>Use <b>Columns &gt; Choose visible columns…</b> for the full list. Your choices are remembered. Advanced/Experimental columns appear only while those options are enabled.</li>
 </ol>
 <h3>Gallery</h3>
 <ol>
@@ -7084,12 +8304,13 @@ class MainWindow(QMainWindow):
 </ol>
 
 <h2><a name="filters"></a>Search and filters</h2>
+<p class="where"><b>Where to find it:</b> filter bar at the top of <b>Library</b>.</p>
 <p>Narrow a large Library to the packages you actually want to work with without filling the top panel with dozens of permanent controls.</p>
 <ol>
-<li>Type in <b>Search</b> to look through package names and indexed text such as CASP IDs, types and notes.</li>
+<li>Type in <b>Search</b> to look through normal Library information such as package names, creators, types, status, Profiles and notes. For CASP/resource IDs, hashes and stored paths, use <b>Find ID…</b>.</li>
 <li>Use the permanent <b>Status</b>, <b>CC Type</b> and <b>Creator</b> boxes as quick filters for common everyday browsing. Those same fields also remain available under <b>Add custom filter…</b> for conditions such as <b>is not</b>, <b>contains</b> or <b>is blank</b>, and for saved multi-filter combinations.</li>
 <li>Click <b>+ Add Quick Filter…</b> for one-click <b>Suggested</b> choices, reusable <b>Saved Quick Filters</b>, or <b>Add custom Quick Filter…</b> for any other available field.</li>
-<li>Profile membership is a normal custom Quick Filter under <b>+ Add Quick Filter… &gt; Add custom Quick Filter… &gt; Profiles</b>. This is separate from the <b>Current Profile</b> selector, which changes Profile context rather than filtering package membership.</li>
+<li><b>Profile Membership</b> means the Profiles a package belongs to. Filter it under <b>+ Add Quick Filter… &gt; Add custom Quick Filter… &gt; Profiles</b>. This is separate from <b>Current Profile</b>, which changes which Profile's rules/plans you are viewing.</li>
 <li>Added filters appear as removable chips below the filter bar. Several filters can be stacked together with Search and the permanent filters; a package must match all active filters to remain shown.</li>
 <li>Use <b>+ Add Quick Filter… &gt; Save current Quick Filters…</b> to save a reusable Quick Filter preset. Saved presets can be reused regardless of the Current Profile. Search text is intentionally not included.</li>
 <li>A Current Profile can also remember its own Library filter view and preferred visible Table columns with <b>Manage Profiles… &gt; Profile Rules &gt; Save Current View</b>. Returning to that Current Profile restores its saved view without moving any package files.</li>
@@ -7100,39 +8321,45 @@ class MainWindow(QMainWindow):
 <p><b>How the conditions work:</b> <b>is</b> means an exact match; <b>contains</b> means the typed value appears anywhere inside the field. <b>is not</b> and <b>does not contain</b> are their opposites. <b>is blank</b> and <b>is not blank</b> do not need a Value. Text matching is not case-sensitive.</p>
 <p>Examples: <b>Creator is Nightcrawler</b>, <b>Package contains lipstick</b>, <b>Age contains Teen</b>, <b>Outfit Category contains Formal</b>, or <b>CC Magic Import is Not in Import</b>. The value box suggests existing values when practical, but you can also type your own text.</p>
 <p>If you turn Advanced or Experimental features off, added filters that depend on those hidden fields are removed automatically.</p>
-<p>Older MDBs may still physically contain legacy analysis/internal columns. CAS Curator preserves that data on disk but hides unsupported/internal fields from the normal Library views.</p>
+<p>Older Master Databases may contain columns that CAS Curator no longer shows. Their existing data is kept, but unsupported/internal columns are hidden from normal Library views.</p>
 
 <h2><a name="selection"></a>Select packages</h2>
+<p class="where"><b>Where to find it:</b> select rows/cards in <b>Library</b> Table or Gallery.</p>
 <p>Selection lets you work with one package or prepare a group for a repeated edit.</p>
 <ol>
 <li><b>Normal click:</b> select one package.</li>
 <li><b>Ctrl+click:</b> add or remove individual packages.</li>
 <li><b>Shift+click:</b> select a continuous range.</li>
-<li>The focused package is the one displayed in the right-side details panel.</li>
+<li>The focused package is the one displayed in the Library details panel.</li>
 <li>For repeated metadata changes, edit one source cell and use the table fill handle to copy that exact value down displayed rows.</li>
 </ol>
 
 <h2><a name="pins"></a>Pins</h2>
+<p class="where"><b>Where to find it:</b> select a package in <b>Library</b> and use <b>Pin</b>.</p>
 <p>Pin packages you want to compare or return to without searching again.</p>
 <ol>
-<li>Select a package and click <b>Pin</b> beside its name.</li>
-<li>A Pinned strip appears above the Library.</li>
-<li>Click a pinned package to jump back to it.</li>
-<li>Click its small <b>×</b>, or <b>Unpin</b>, to remove it.</li>
+<li>Select a package and click <b>Pin</b> beside its name, or right-click it and choose <b>Pin This Item</b>.</li>
+<li>A Pinned strip with a small pin icon appears above the Library.</li>
+<li>You can keep up to <b>5</b> packages pinned at once. Pin buttons stay one line and show only a short name; hover a pin to see the full package filename.</li>
+<li>Click a pinned package to jump back to it. Pinned Library rows also show a small pin icon beside the Package name.</li>
+<li>Click its small <b>×</b>, use <b>Unpin</b>, or right-click it and choose <b>Unpin This Item</b> to remove it.</li>
 </ol>
 <p>Pins are remembered separately for each Master Database.</p>
 
-<h2><a name="details"></a>Right-side details panel</h2>
+<h2><a name="details"></a>Library details panel</h2>
+<p class="where"><b>Where to find it:</b> on the right side of <b>Library</b> by default. Use <b>Options &gt; Details panel on left</b> if you prefer it on the left.</p>
 <p>Select a package in Table or Gallery to inspect it without losing your place.</p>
 <ul>
 <li><b>Overview:</b> thumbnail and compact package summary, including Age/Gender and Package Format when available. Advanced/Experimental details appear here too when their options are enabled.</li>
-<li><b>CASP observations:</b> direct CASP information from the latest validated scan when an exact identity link is available.</li>
+<li><b>Identifiers:</b> package identity, CAS/resource IDs and physical/source location. CASP/resource IDs can help match a package with the same item in other Sims 3 tools that display those IDs. With <b>Advanced features</b> enabled, use <b>Find ID…</b> to locate a package even when its identifier columns are hidden.</li>
+<li><b>CASP observations:</b> confirmed CASP information found during the latest scan.</li>
 <li><b>Edit:</b> manual fields you are allowed to change.</li>
 <li><b>All fields:</b> available when <b>Advanced features</b> are enabled; it shows the currently enabled user-facing stored fields in read-only form.</li>
 </ul>
-<p>Drag the vertical divider whenever you want more room for the Library or details panel. Click <b>Details</b> in the Library controls to hide the right-side panel; while it is hidden, use the compact ◀ restore button in the same top-control area to bring it back. CAS Curator remembers the hidden/shown state. In <b>Overview</b>, drag the horizontal divider between the thumbnail and the summary card to choose how much height each gets; CAS Curator remembers your choice.</p>
+<p>Drag the vertical divider whenever you want more room for the Library or details panel. Click <b>Details</b> in the Library controls to hide the panel; while it is hidden, use the compact restore arrow in the same top-control area to bring it back. CAS Curator remembers the hidden/shown state, panel width and whether you placed it on the left or right. In <b>Overview</b>, drag the horizontal divider between the thumbnail and the summary card to choose how much height each gets; CAS Curator remembers your choice.</p>
 
 <h2><a name="edit"></a>Edit and save manual information</h2>
+<p class="where"><b>Where to find it:</b> <b>Library</b> &gt; <b>Edit</b> tab in the details panel.</p>
 <p>Add your own organisation without changing the package itself.</p>
 <ol>
 <li>Select a package and open <b>Edit</b>.</li>
@@ -7163,17 +8390,17 @@ class MainWindow(QMainWindow):
 <li><b>Blank</b> — no Status is assigned yet.</li>
 </ul>
 <p>Status describes what you intend to do with the CC; it is not a folder location.</p>
-<p>If an older MDB still contains legacy Status labels, use <b>File &gt; Review legacy Status values…</b>. CAS Curator first shows a preview and stages the safe conversions rather than writing immediately: <b>Keep → To Keep</b>, <b>Review → To Review</b>, and old Favourite/Unreviewed/In Merge labels → blank. Legacy Delete/Deleted values are deliberately left unchanged. The normal backed-up <b>Save Changes</b> is still required.</p>
+
 <h3>Creator and Converter</h3>
 <p><b>Creator</b> is the original creator or mesh author when known. <b>Converter</b> is the person who converted the content between Sims games/versions, such as Sims 4 → Sims 3 or Sims 2 → Sims 3. A package can therefore have both names recorded separately. CAS Curator does not guess either value automatically.</p>
 <p>Type Creator and Converter in <b>Edit</b>, or edit their Table cells directly. Creator still has the permanent Library filter; Converter is available through <b>+ Add Quick Filter…</b> (including the suggested <b>Converter not assigned</b> filter). Both fields are searchable and can be used as levels in the Experimental Routing Structure Builder, for example <b>Converter → Creator → CC Type</b>. Changes remain pending until <b>Save Changes</b>.</p>
-<p><b>Remembered Creator / Converter names:</b> CAS Curator keeps a local user-level vocabulary of Creator and Converter values that are already saved in your MDBs. When a later package has a blank attribution field and its filename contains a remembered name, CAS Curator can offer that name as a suggestion. It never fills the field silently: review the suggestion first, then stage it and use <b>Save Changes</b>. The memory is stored in CAS Curator settings so it can help across different MDBs and future app updates.</p>
+<p><b>Remembered Creator / Converter names:</b> CAS Curator keeps a local user-level vocabulary of Creator and Converter values that are already saved in your MDBs. When a later package has a blank attribution field and its filename contains a remembered name, CAS Curator can offer that name as a suggestion. It never fills the field silently: review the suggestion first, choose <b>Use Checked Suggestions</b>, then use <b>Save Changes</b>. The memory is stored in CAS Curator settings so it can help across different MDBs and future app updates.</p>
 <p>When Creator is filled, <b>Search Web for Package</b> includes it in the search query. For attribution work, right-click <b>Find Creator / Converter Online…</b>. CAS Curator opens Google directly with a focused search such as <b>Sims 3 CC &quot;package name&quot; creator converter</b>. The package/item name is quoted so Google can focus on the exact CC, while the final Creator/Converter terms steer the results toward attribution. Game/version words already present in the filename (for example Sims 2, Sims 3, Sims 4, TS3, 4t3 or 2t3) are kept inside the quoted name.</p>
 <h3>File Location</h3>
 <p><b>Current File Location</b> records the physical managed folder containing the original, unmerged package now. Choosing or editing it records the association only; it does not move, copy or delete the file. Use the explicit managed Move actions when you want CAS Curator to move package files.</p>
 <p>Use the Library <b>Locations…</b> button beside <b>Manage Profiles…</b> (or <b>Tools &gt; Profiles &amp; Locations &gt; Manage File Locations…</b>) as the general place to manage shared File Locations. <b>Add Folder…</b> opens the Windows folder picker and automatically uses the selected folder's real name as the location name, so you do not have to type it; use <b>Rename…</b> only when you want a different display label. The Edit panel keeps a <b>Manage Locations…</b> shortcut for convenience. Current File Location and Experimental Planned Location are both drop-downs populated from this same managed list. Each saved location has its own <b>Open</b> button, and the dialog shows the currently selected location explicitly for rename/path/remove actions. <b>Open Folder</b> in Edit opens exactly the saved folder for the selected package. You can also right-click a package row with a File Location assigned and choose <b>Open File Location</b>. If that folder is unavailable, CAS Curator reports it as unavailable and does not guess or substitute another folder. Older Library Location categories are preserved separately and are never treated as physical paths.</p>
-<p><b>Controlled managed moves:</b> select one or more packages and use <b>Move Selected to Location…</b> from Tools or the Table right-click menu. CAS Curator resolves the original package conservatively, previews every destination, refuses overwrite/name conflicts, copies and verifies SHA-256 before deleting the original, then writes the new File Location to the MDB with the normal backup. If the MDB update fails, CAS Curator attempts to roll the physical move back.</p>
-<p><b>CC Magic Import is copy-only:</b> first set the destination with <b>Tools &gt; Set CC Magic Import Folder…</b>, then use <b>Copy Selected to CC Magic Import…</b>. The organised original stays in place and File Location does not change. The live <b>CC Magic Import</b> column is derived from the real Import folder and is not written into the MDB. When you want to filter by it, use <b>+ Add Quick Filter… &gt; CC Magic Import</b>.</p>
+<p><b>Controlled managed moves:</b> select one or more packages and use <b>Move Selected to Location…</b> from Tools or the Table right-click menu. CAS Curator checks that it has the correct package, previews every destination, refuses overwrite/name conflicts, verifies the copied file, and only then removes the original. It then saves the new File Location with the normal MDB backup. If saving the MDB fails, CAS Curator tries to move the package back.</p>
+<p><b>CC Magic Import is for deployment/tracking only:</b> first set the destination with <b>Tools &gt; Set CC Magic Import Folder…</b>, then use <b>Copy Selected to CC Magic Import…</b>. CAS Curator keeps the organised master package in place and copies a deployment version to CC Magic Import. The live <b>CC Magic Import</b> column simply tracks whether that copy is present; it is not the package's master storage location.</p>
 <p><b>CC Magic Import and File Location are different:</b> CC Magic Import is the destination for a deployment copy; <b>File Location</b> tells CAS Curator where the original/master package lives. Scanning records package metadata but does not guarantee that a managed File Location has been assigned. If Copy to CC Magic says the original has no valid File Location, either <b>route the package first</b> so CAS Curator records its routed folder, or select the package and assign <b>File Location</b> in <b>Edit</b> (use <b>Manage Locations…</b> there first if you need to add the folder).</p>
 <ul>
 <li><b>In Import</b> — a same-name Import copy is present and matches the package identity/hash CAS Curator can verify.</li>
@@ -7183,7 +8410,7 @@ class MainWindow(QMainWindow):
 <li><b>Unavailable</b> — the Import folder is not configured or cannot currently be accessed.</li>
 </ul>
 <p><b>After CC Magic processes the Import folder:</b> manage or remove that content from inside CC Magic itself. CAS Curator does not delete or move files from CC Magic-managed storage. If you use CAS Curator Status or Profiles to track your own workflow, update those manually after making changes in CC Magic.</p>
-<p>To look for a package online, right-click its row and choose <b>Search Web for Package</b>. CAS Curator opens a Google search in your default browser using the package name with the <code>.package</code> ending removed and common separators cleaned up. If Creator is filled in, it is included automatically to make the search more specific.</p>
+<p>To look for a package online, right-click its row and choose <b>Search Web for Package</b>. CAS Curator opens a Google search in your default browser using the package name with the <b>.package</b> ending removed and common separators cleaned up. If Creator is filled in, it is included automatically to make the search more specific.</p>
 <h3>Merge Profiles</h3>
 <p>Merge Profiles record which merged collections contain the package. A package can belong to several Merge Profiles at once. Merge membership is separate from Status and from general Profiles.</p>
 <p>Use <b>Set Merge Profiles…</b> to choose one or several Merge Profiles for the focused package. <b>Manage Merge Profiles…</b> lets you create, rename or remove names in the managed list. Assignment and list changes remain pending until <b>Save Changes</b>.</p>
@@ -7204,9 +8431,9 @@ class MainWindow(QMainWindow):
 <li>Read the confirmation, then confirm the clear.</li>
 <li>Click <b>Save Changes</b> to commit, or Revert to cancel.</li>
 </ol>
-<p><b>Current File Location</b> is intentionally read-only in the Table and cannot be bulk-cleared. <b>Planned Location</b> can be cleared only for selected rows that meet its Current Profile/membership conditions; ineligible rows are skipped. <b>Shift+Delete</b> stages deletion of the selected Library record(s). Physical <code>.package</code> files are never deleted by that record action.</p>
+<p><b>Current File Location</b> is intentionally read-only in the Table and cannot be bulk-cleared. <b>Planned Location</b> can be cleared only for selected rows that meet its Current Profile/membership conditions; ineligible rows are skipped. <b>Shift+Delete</b> marks the selected Library record(s) for deletion. Physical <b>.package</b> files are never deleted by that record action.</p>
 <h3>Delete Record(s)</h3>
-<p>Select one or several Table rows, then right-click and choose <b>Delete Record…</b> / <b>Delete Selected Records…</b>, or press <b>Shift+Delete</b>. This stages removal of the CAS Curator Library/MDB record(s) only. Saving creates the normal MDB backup. The actual <code>.package</code> files are never deleted or moved. <b>Revert All Unsaved Changes</b> cancels staged deletions before saving. If a physical package is scanned again later, CAS Curator can create a Library record for it again.</p>
+<p>Select one or several Table rows, then right-click and choose <b>Delete Record…</b> / <b>Delete Selected Records…</b>, or press <b>Shift+Delete</b>. This marks the selected Library record(s) for deletion when you save. Saving creates the normal MDB backup. The actual <b>.package</b> files are never deleted or moved. <b>Revert All Unsaved Changes</b> cancels those pending deletions before saving. If a physical package is scanned again later, CAS Curator can create a Library record for it again.</p>
 
 <h3>Add or replace a preview image</h3>
 <p>If a package has no automatic preview, or you prefer a different picture, you can add one manually.</p>
@@ -7219,6 +8446,7 @@ class MainWindow(QMainWindow):
 </ol>
 
 <h2><a name="profiles"></a>Profiles</h2>
+<p class="where"><b>Where to find it:</b> <b>Library</b> &gt; <b>Manage Profiles…</b> and the <b>Current Profile</b> selector.</p>
 <p>Profiles are optional groups for a playthrough, theme, CC Magic setup, testing set, merge plan, character style, or anything else you choose. A package can belong to more than one Profile.</p>
 
 <h3>Create and select a Profile — step by step</h3>
@@ -7229,7 +8457,7 @@ class MainWindow(QMainWindow):
 <li>Select the new Profile in the list.</li>
 <li>Click <b>Use Selected</b>. It now becomes the <b>Current Profile</b>.</li>
 <li>Close Manage Profiles. The same Profile is shown in the <b>Current Profile</b> box at the top of Library.</li>
-<li>Click the main <b>Save Changes</b> button when you are ready to write staged Profile changes to the MDB.</li>
+<li>Click the main <b>Save Changes</b> button when you are ready to save the Profile changes.</li>
 </ol>
 <p><b>Important:</b> changing the Current Profile changes context only. It never moves package files.</p>
 
@@ -7355,66 +8583,75 @@ class MainWindow(QMainWindow):
 <p>If a Planned Location cell is grey/read-only, check that Experimental features are enabled and a Current Profile is selected. Setting a non-blank Planned Location automatically adds that Profile to Profile Membership.</p>
 
 <p><b>What the two location fields mean:</b> <b>Current File Location</b> is the physical truth now and is shared across all Profiles. <b>Planned Location</b> is Profile-specific. Changing Current Profile, changing membership, or saving a planned location never moves files. <b>Apply Profile Locations…</b> is the only Profile Layout action that performs physical moves.</p>
-<p>CAS Curator preflights the whole batch first, blocks conflicts, missing locations and read-only source packages before any move begins, preserves subfolders below the current managed root where possible, copies and verifies SHA-256 before deleting each original, and never overwrites an existing different destination file. Packages with no saved Planned Location are left where they are. If an unexpected apply failure still occurs part-way through, CAS Curator attempts to roll back package moves already completed in that batch and cleans up incomplete destination copies where possible.</p>
+<p>Before moving anything, CAS Curator checks the whole batch for missing locations, conflicts and files it cannot safely move. It never overwrites a different existing file, verifies each copied package before removing the original, and leaves packages with no Planned Location where they are. If something fails part-way through, CAS Curator tries to undo moves already completed in that batch.</p>
 
-<h2><a name="workflows"></a>What can I do with CAS Curator?</h2>
-<p>CAS Curator's tools are designed to work together. You can use the Library to find a group, Profiles and Creator to describe it, File Location to track where the physical packages live, and controlled Move/Copy actions when you deliberately want to reorganise files.</p>
-<h3>Remembered Creator / Converter names — step by step</h3>
+
+
+<h2><a name="themes"></a>Theme Colour Studio</h2>
+<p class="where"><b>Where to find it:</b> <b>Theme &gt; Theme Colour Studio…</b>. Theme importing, backups and custom-theme management are under <b>Theme &gt; Manage Themes</b>.</p>
+<p>Theme Colour Studio lets you build and save your own CAS Curator colour themes without changing the protected built-in themes.</p>
+<h3>Quick start — begin with colours you already like</h3>
 <ol>
-<li>Enter a confirmed name in the <b>Creator</b> or <b>Converter</b> column and click <b>Save Changes</b>. CAS Curator remembers the saved name locally.</li>
-<li>When another package has a blank Creator/Converter field and its filename contains that remembered name, CAS Curator shows a review table. Filename matching is case-insensitive and uses conservative word/phrase or distinctive prefix matching.</li>
-<li>Untick any suggestion you do not want, then click <b>Stage Checked Suggestions</b> and confirm. Nothing is written yet.</li>
-<li>Review the Library and click <b>Save Changes</b> when satisfied.</li>
-<li>If you dismissed the automatic review, use <b>Tools → Profiles & Locations → Review Remembered Creator / Converter Suggestions…</b> to open it again.</li>
+<li>Find a colour palette you like from a palette website or another source that gives you HEX colours.</li>
+<li>Copy a compatible palette link, copy the HEX colour codes, or save a supported palette file.</li>
+<li>Open <b>Theme &gt; Theme Colour Studio…</b>.</li>
+<li>Choose <b>Paste Link / HEX Colours…</b> to import colours from a supported palette website link or paste HEX colour codes directly. You can also use <b>Import Palette File…</b>. Then give the new custom theme a name.</li>
+<li>Open <b>Theme Colour Studio…</b> and choose that custom theme.</li>
 </ol>
-<p>Existing nonblank Creator/Converter fields are never replaced by this helper. Remembered names do not come from web search and are not treated as proof of authorship; they are suggestions based on names you previously confirmed.</p>
-<h3>Find Creator / Converter online — step by step</h3>
+<h3>Edit the theme</h3>
 <ol>
-<li>Right-click the package in the Library and choose <b>Find Creator / Converter Online…</b>. (The same command is also available under Tools → Online / Attribution.)</li>
-<li>CAS Curator opens Google immediately with a focused search such as <b>Sims 3 CC &quot;package name&quot; creator converter</b>. The package/item name stays quoted, and Creator/Converter are added at the end to steer Google toward attribution.</li>
-<li>Review the Google results. When you can confirm the attribution, return to CAS Curator and type the name directly into the <b>Creator</b> and/or <b>Converter</b> column (or the Edit tab).</li>
-<li>Click <b>Save Changes</b> when you are satisfied.</li>
+<li>Click a coloured part of the live Library, Scan or Guide preview to jump directly to the colour section that controls it.</li>
+<li>Pick a colour from the dropdown, drag a palette swatch onto a section, or use the colour wheel to make a new colour.</li>
+<li>Text colours are chosen automatically by CAS Curator and are not editable in Theme Colour Studio. This keeps body text, headings, instructions and pop-out windows readable even when you use very light or very dark theme colours.</li>
+<li><b>Colour Library rows with this custom theme</b> controls the package-row style. Leave it on for themed row colours, or turn it off for the neutral white/grey rows used by built-in themes. This choice is saved with the custom theme.</li>
+<li><b>Master Database path border</b> controls only the outline around the opened database path. The path stays unfilled in custom themes, while the border colour can be edited, Auto-filled, shuffled and locked like the other Theme Colour Studio sections.</li>
+<li>The live preview and <b>Check Readability…</b> use the same automatic text colours as the app, so they reflect what CAS Curator will actually display.</li>
+<li>Use <b>My Colours…</b> for reusable colours you want to keep across different custom themes. Use <b>Remove Colour…</b> to remove one saved swatch or <b>Clear All…</b> to empty the reusable shelf; colours already used by saved themes are not changed.</li>
+<li>Use <b>Swap</b> to exchange two unlocked sections, <b>Auto-fill</b> to spread palette colours across unlocked sections, or <b>Shuffle Unlocked</b> to try another arrangement while leaving locked parts protected.</li>
+<li>Use the lock checkboxes when you want Shuffle Unlocked or other editing tools to leave part of the design alone. See <b>Understanding the two locks</b> below.</li>
+<li>Use <b>Undo</b> to step back through edits. <b>Revert Session</b> restores the theme to how it looked when you opened/switched to it; Revert itself can be undone.</li>
+<li>Use <b>Check Readability…</b> to review borderline or poor text/background combinations. The warnings are advisory only. Use a warning's <b>Jump</b> button to go straight to the affected colour section.</li>
 </ol>
-<p>CAS Curator does not scrape Google or automatically guess attribution from the search results. <b>Creator</b> is for the original creator/mesh author; <b>Converter</b> is for the person who converted the item between Sims games/versions.</p>
-<h3>Group one creator's CC into a folder</h3>
+<h3>Understanding the two locks</h3>
+<p>The two locks protect different things:</p>
+<ul>
+<li><b>Section Lock</b> protects the <b>section and its current colour together</b>. That section is left alone by editing tools such as Swap, Auto-fill and Shuffle Unlocked. Example: if you like the Library header exactly as it is, tick <b>Section Lock</b> on Library header strip and it stays there with that colour.</li>
+<li><b>Shuffle Lock</b> protects the <b>colour during Shuffle Unlocked</b>, not the section where it currently sits. The colour is guaranteed to remain in the shuffled theme, but it may move to another unlocked section. Example: if you want a gold accent to stay somewhere in the design, tick <b>Shuffle Lock</b> on the section currently using gold. After Shuffle Unlocked, gold is still present, but it may be used by a different unlocked section.</li>
+</ul>
+<p><b>Easy way to remember:</b> Section Lock = <b>keep it here</b>. Shuffle Lock = <b>keep this colour</b>. Choose only one lock type for a colour section; selecting one automatically switches off the other on that row. You can still use different lock types on different rows. A tick means that lock is active.</p>
+<h3>Save and manage themes</h3>
 <ol>
-<li>Select the matching packages and use <b>Set Creator for Selected…</b> to assign the creator once. The Table fill handle remains available when a contiguous fill-down is more convenient.</li>
-<li>Use the permanent <b>Creator</b> filter so only that creator's packages are shown.</li>
-<li>Select the shown packages.</li>
-<li>Use <b>Move Selected to Location…</b>, review the source/destination preview, then confirm.</li>
+<li>Choose <b>Update Theme…</b> to save changes to the current custom theme, or <b>Save as New Theme…</b> to keep the original and create a variation.</li>
+<li>Open <b>Theme &gt; Manage Themes &gt; Manage Custom Themes…</b> to apply, rename, delete, import or export custom themes. The same <b>Manage Themes…</b> actions are also available inside Theme Colour Studio.</li>
+<li><b>Export Theme…</b> creates a portable <b>.s3theme</b> file containing its palette, Theme Colour Studio locks and compatible metadata.</li>
+<li><b>Export Theme Backup…</b> copies every custom theme into one dated ZIP, keeps the theme names, includes Theme Colour Studio settings/locks, and also includes <b>My Colours</b> when available. It does not include built-in themes, program files or Library/Master Database data.</li>
+<li><b>Import Theme…</b> restores a compatible <b>.s3theme</b>. Built-in themes remain protected and are never overwritten.</li>
 </ol>
-<p>Routing already provides automatic evidence-based sorting by supported type. Managed Locations are most useful for deliberate organisation such as creator folders, Testing, Archive or another collection structure that you choose yourself.</p>
-<h3>Move a filtered group together</h3>
-<p>Filter directly with <b>CC Type</b>, <b>Status</b> or <b>Creator</b>, or use <b>+ Add Quick Filter…</b> for Profile membership, <b>File Location</b>, Age, Gender or any other currently available field. Select the rows you want, then use <b>Move Selected to Location…</b>. CAS Curator verifies package identity and SHA-256 before completing controlled moves.</p>
-<h3>Prepare several folder layouts and apply one later</h3>
-<p>Enable Experimental features and use <b>Experimental Profile Layouts</b> when you want a Profile to remember different desired managed locations for many packages. Save the Planned Locations first; switching the Current Profile or filtering by Profile membership does not move anything. When you are ready, open <b>Tools &gt; Routing &gt; Experimental Profile Layouts…</b> and use <b>Apply Profile Locations…</b> to preview and perform only the moves needed for that Profile.</p>
-<h3>Prepare a group for CC Magic</h3>
-<p>Click <b>+ Add Quick Filter…</b> and choose <b>CC Magic Import is Not in Import</b>, then select the packages you want and use <b>Copy Selected to CC Magic Import…</b>. The Import folder is only a deployment drop-in location. Once CC Magic processes those files, use CC Magic itself to manage or remove them. CAS Curator does not delete files from CC Magic-managed storage.</p>
-<h3>Bring in a folder of new downloads</h3>
-<p>Use the recommended sequence <b>Run Scan → Preview Routing → Run Routing</b>. Scan adds or refreshes MDB knowledge; Preview Routing shows exactly where files would go; Run Routing performs the physical move. When ZIPs are present, Scan can extract them beside the original archives first so newly extracted packages join the same scan. When Sims3Packs are present, CAS Curator can analyse their manifests, avoid extracting a CAS package when an identical standalone <code>.package</code> is already present, and optionally extract missing CAS package copies while leaving the original Sims3Pack untouched.</p>
-<h3>Find an item again later</h3>
-<p>Use Creator, package-name search, Profiles, Status and File Location to narrow the Library.</p>
-<p><b>Useful package shortcuts:</b> right-click a Table row for <b>Copy package name</b>, <b>Search Web for Package</b>, <b>Find Creator / Converter Online…</b>, <b>Open File Location</b> when a physical folder is tracked, Pin/Unpin and the available managed Move/CC Magic actions.</p>
-<h3>Review provisional metadata without letting it organise files</h3>
-<p>Enable <b>Experimental features</b> to inspect Subtype, Skin Type, Outfit Category and EA Resource Status. These metadata fields are review information only and never control Routing automatically. Experimental Profile Layouts are separate and move files only when you explicitly run <b>Apply Profile Locations…</b>.</p>
+<p><b>Tip:</b> You can reuse colours freely. A palette does not need one unique colour for every interface section; repeating a few colours often produces a cleaner theme.</p>
 
 <h2><a name="advanced"></a>Advanced and experimental features</h2>
+<p class="where"><b>Where to find it:</b> <b>Options &gt; Enable Advanced features</b> or <b>Options &gt; Enable Experimental features</b>.</p>
 <p>Advanced and Experimental are optional and are off by default. Turning them off hides the extra information; it does not delete anything from the Master Database. Age and Gender are normal metadata and do not require either option.</p>
 <ul>
-<li><b>Options &gt; Enable Advanced features</b> shows extra stored technical information such as CASP Instance IDs, Biggest Texture, HQ/Poly warnings, Health Issues, Duplicate Files, Last Scanned, Package Hash and the All fields tab. Some of these are legacy/technical fields and are not regenerated by the conservative scanner.</li>
+<li><b>Options &gt; Enable Advanced features</b> shows extra stored technical information such as CASP Instance IDs, Biggest Texture, HQ/Poly warnings, Health Issues, Duplicate Files, Last Scanned, Package Hash, <b>Performance Risk Score</b> and the All fields tab. Some are technical or historical fields and may not be recreated by every scan.</li>
+<li><b>Health Status and Performance Risk Score are separate:</b> Health Status tells you about package/structural problems. Performance Risk Score estimates how demanding the CC may be in game using measurements such as polycount, texture size and GEOM size. A high Performance Risk Score does <b>not</b> mean the package is broken or unsafe, and it never controls Routing.</li>
+<li><b>Refresh Performance Scores…:</b> if a CAS Curator update changes the Performance Risk Score model, older stored scores may need refreshing. Current scans store the measurements needed for future score updates directly in the MDB. Older MDBs may need a one-time refresh using an existing Health Scan Report or the matching package file; once recovered, those measurements are saved into the same MDB too. Refreshing Performance Scores does not change Health Status, classification, thumbnails or Routing. You see a preview before anything is saved, and CAS Curator creates the normal MDB backup first.</li>
+<li><b>Optional scan reports:</b> use <b>Options &gt; Create Health Scan Report after Scan</b> to choose whether Scan creates the separate Excel report. The option is on by default, but the report is no longer required for future Performance Score updates because the required measurements are stored in the MDB itself.</li>
+<li><b>Check for Updates…:</b> use <b>Tools &gt; Help &gt; Check for Updates…</b> to look for a newer public version. CAS Curator shows the changelog before installation and verifies the downloaded installer before running it. Use <b>Options &gt; Check for updates on startup</b> to turn quiet startup checks on or off.</li>
 <li><b>Age</b> and <b>Gender</b> are normal read-only package metadata derived from direct CASP observations.</li>
-<li><b>Options &gt; Enable Experimental features</b> shows provisional scanner-derived information such as Subtype, Skin Type, Outfit Category and EA Resource Status when available, and also enables the separate <b>Experimental Profile Layouts</b> workflow. Scanner-derived results may be incomplete or incorrect and never control Routing. Profile Layouts perform file movement only through their explicit previewed Apply action.</li>
-<li><b>Subtype</b> is still Experimental. Current Build/Buy subtype values such as Wall, Rug or Lighting are filename hints and can be wrong when a filename contains several descriptive words. Scripted Object subtypes use package/script evidence. The Overview identifies which kind of evidence produced the displayed subtype.</li>
-<li><b>Skin Type</b> is still Experimental. A TONE resource can directly identify a package as Skin, but the current Default Replacement / Non-Default Skin Type label is inferred from filename clues. If no direct Skin classification is present, the stored value may come from the broader possible-skin heuristic. The Overview identifies which evidence path applies.</li>
-<li><b>Outfit Category</b> is Experimental display metadata read directly from each CASP ClothingCategory observation and combined for the package. It currently shows the seven normal CAS filters: Everyday, Formal, Sleepwear, Swimwear, Athletic, Career and Outerwear. Technical/special-purpose CASP flags such as ValidForRandom are intentionally not included in this summary.</li>
-<li><b>EA Resource Status</b> is a plain-language view of the stored experimental EA-overlap result. It may show <b>No EA overlap detected</b>, <b>EA resource overlap — review</b>, <b>Likely EA override / default replacement</b>, or <b>Matches EA resources</b>. Older stored results may come from an earlier scanner pass, so treat them as review information rather than proof.</li>
+<li><b>Options &gt; Enable Experimental features</b> shows extra information still being tested, such as Subtype, Skin Type, Outfit Category and EA Resource Status. It also enables Experimental Profile Layouts. Experimental scan information never controls normal Routing; Profile Layouts move files only when you explicitly preview and apply the layout.</li>
+<li><b>Subtype</b> is Experimental. Some Build/Buy subtype values such as Wall, Rug or Lighting are based on filename hints and can be wrong. The Overview tells you what kind of evidence was used.</li>
+<li><b>Skin Type</b> is Experimental. CAS Curator can sometimes identify Skin directly from package data, but Default Replacement / Non-Default labels may still rely on filename clues. Check the Overview to see what evidence was used.</li>
+<li><b>Outfit Category</b> is Experimental. It combines the normal CAS clothing categories found in the package, such as Everyday, Formal, Sleepwear, Swimwear, Athletic, Career and Outerwear. Technical CASP flags are left out of this simple summary.</li>
+<li><b>EA Resource Status</b> is Experimental review information about possible overlap with EA resources. Treat it as a clue to review, not proof that a package is or is not an EA override/default replacement.</li>
 </ul>
 <h3>CASP observations</h3>
-<p><b>CASP</b> means <b>Create-a-Sim Part</b>. The CASP observations tab shows information read directly from CASP resources in the package rather than guessed from its filename. This can include CASP Instance IDs, CC Type, Age, Gender and, while Experimental features are enabled, Outfit Category. A package can contain more than one CASP, so CAS Curator may combine the observed values into a concise package summary. These observations describe the CASP resources that were found; they do not claim to describe every other resource in the package.</p>
+<p>The CASP observations tab shows confirmed information read from the package's CASP resources, such as CASP IDs, CC Type, Age and Gender. A package can contain more than one CASP, so CAS Curator may combine several observations into one package summary.</p>
 <p>Experimental scanner-derived information is for review and testing only and never changes Routing. Experimental Profile Layouts are a separate user-controlled workflow: they do not move files when you choose/filter a Profile or save a plan, but <b>Apply Profile Locations…</b> can perform the explicitly previewed managed moves.</p>
 
 <h1>Scan &amp; file sorting</h1>
 <h2><a name="scanner"></a>Scan</h2>
+<p class="where"><b>Where to find it:</b> <b>Scan</b> tab.</p>
 <p>Scan a folder of CAS package files and record direct identity/CASP evidence in the selected Master Database. The same Scan works for a small folder or a large batch.</p>
 <ol>
 <li>Open <b>Scan</b>.</li>
@@ -7424,25 +8661,27 @@ class MainWindow(QMainWindow):
 <li>Click <b>Run Scan</b>. A normal scan starts immediately after validation; CAS Curator only opens a choice box when something genuinely needs your decision, such as ZIP/Sims3Pack handling or MDB compatibility.</li>
 </ol>
 <p><b>Progress reaches 100% only when the whole Scan is finished.</b> After the last package is read, CAS Curator shows a finalising/refreshing stage while the MDB, result files and Library refresh complete.</p>
-<p><b>Run Scan does not move source package files.</b> If ZIP archives are found, CAS Curator first asks whether you want to extract them beside the original ZIPs; extraction happens only when you explicitly choose it, and the ZIPs themselves are kept. A full workbook backup is made before scanner writes. Supported rows can receive CASP IDs, CC Type from CASP metadata, Highest Polys from readable GEOM resources, the best validated dedicated Sims 3 preview/thumbnail resource when present, the exact package SHA-256 hash and Last Scanned. Existing/manual preview images are kept and are not overwritten.</p>
-<p><b>MDB compatibility:</b> some spreadsheet programs save extra workbook information that the scanner cannot safely read. If CAS Curator detects this, it offers to create and verify a separate <b>CAS Curator Compatible</b> copy. The original workbook is always left untouched. Use the compatible copy for scanning.</p>
-<p>Use CAS Curator's conservative scanner for CAS CC such as hair, clothing, shoes, accessories, makeup and CAS presets. Keep gameplay/script mods out of the scan batch because the scanner does not assess script/gameplay content.</p>
+<p><b>Run Scan does not move source package files.</b> If ZIP archives are found, CAS Curator first asks whether you want to extract them beside the original ZIPs; extraction happens only when you explicitly choose it, and the ZIPs themselves are kept. A full workbook backup is made before scanner writes. Supported rows can receive CASP IDs, CC Type from CASP metadata, Highest Polys from readable GEOM resources, the best validated dedicated Sims 3 preview/thumbnail resource when present, the package hash and Last Scanned. Existing/manual preview images are kept and are not overwritten.</p>
+<p><b>MDB compatibility:</b> some spreadsheet programs can save extra information in an Excel file that CAS Curator cannot safely use. If this is detected, CAS Curator offers to create a separate <b>CAS Curator Compatible</b> copy. Your original Master Database is left unchanged. Use the compatible copy for scanning.</p>
+<p>Scan CAS CC such as hair, clothing, shoes, accessories, makeup and CAS presets. Keep gameplay/script mods outside the folder you scan because CAS Curator is designed for CAS custom content.</p>
 
 <h2><a name="results"></a>Understand scan results</h2>
+<p class="where"><b>Where to find it:</b> run <b>Scan</b>, then review the updated package in <b>Library</b>.</p>
 <ul>
 <li><b>CASP IDs:</b> direct CASP resource identifiers observed in the package.</li>
 <li><b>CC Type:</b> generated from the CASP Clothing metadata when every observed CASP in that package can be mapped safely. Friendly clothing labels are shown as <b>Tops</b>, <b>Bottoms</b> and <b>Full Body</b> where applicable. Mixed valid types are shown as <b>Mixed CAS</b>.</li>
 <li><b>Highest Polys:</b> the highest GEOM <b>Faces.Count</b> found in the package. The value is withheld if any GEOM resource could not be read.</li>
 <li><b>Thumbnail:</b> extracted only from validated dedicated Sims 3 THUM / ICON / SNAP preview-resource families. CAS Curator chooses the best supported dedicated preview and does not use a random IMG texture. If there is no supported preview, you can add your own image later from Edit.</li>
-<li><b>Package Hash:</b> an exact SHA-256 fingerprint used for identity and safety checks.</li>
+<li><b>Package Hash:</b> a unique file fingerprint CAS Curator uses for identity and safety checks.</li>
 <li><b>Last Scanned:</b> when CAS Curator last completed its safe scan write for that row.</li>
 <li><b>CASP observations:</b> direct CASP metadata linked to the exact package identity after the current scan.</li>
 <li><b>Age / Gender:</b> friendly read-only summaries derived from the direct CASP Age/Gender observations for that package. They are display metadata and are not written back into CC Master Database.</li>
 <li><b>Held for review:</b> the package identity/evidence was not safe enough for the normal write path.</li>
 </ul>
-<p><b>Not part of the supported scan results:</b> Whether a package contains or overlaps with EA resources is not assessed. Script/gameplay status, general IMG texture purpose, poly-count performance risk, texture-size performance risk and new Health/Risk ratings are also not supported results. Experimental features may expose provisional classifications such as Skin Type, Outfit Category and EA Resource Status for testing, but they are not treated as supported scanner findings and never control Routing automatically. CC Type, Highest Polys and dedicated preview extraction are direct supported scanner results, not performance/safety ratings.</p>
+<p>CAS Curator uses package resources and other supported scan evidence for its classifications. Filenames are not used as evidence for supported classifications. Experimental fields are clearly marked and never control normal Routing automatically.</p>
 
 <h2>Experimental Routing Structure Builder</h2>
+<p class="where"><b>Where to find it:</b> enable Experimental features, then <b>Tools &gt; Routing &gt; Routing Structure Builder…</b>.</p>
 <p>The Routing Structure Builder creates a folder hierarchy from MDB fields you choose. It is useful when you want a structure such as <b>Creator → CC Type → Subtype</b> or <b>Converter → Creator → CC Type</b> instead of the standard evidence-routing folders.</p>
 <h3>Build and preview a structure — step by step</h3>
 <ol>
@@ -7450,22 +8689,24 @@ class MainWindow(QMainWindow):
 <li>Enable <b>Options &gt; Enable Experimental features</b>.</li>
 <li>Open <b>Tools &gt; Routing &gt; Routing Structure Builder…</b>.</li>
 <li>Choose the managed <b>Destination location</b>.</li>
-<li>Scope defaults to <b>Selected packages</b>; switch to <b>All packages in MDB</b> only when you intentionally want the wider scope.</li>
-<li>Drag fields from <b>Available folder levels</b> into <b>Folder structure</b>. Yellow fields are main-folder-only, green fields are subfolder-only, blue fields can be either, grey fields are unavailable in the current position, and purple marks validated custom folders. The order is literal.</li>
+<li>Scope defaults to <b>Selected packages</b>; switch to <b>All packages in Library</b> only when you intentionally want the wider scope.</li>
+<li>Drag fields from <b>Available folder levels</b> into <b>Folder structure</b>. Use <b>Colour Key</b> if you need a reminder of what the row colours mean. The order you choose becomes the folder order.</li>
 <li>Use <b>+ Custom fixed folder…</b> if you want a manually named folder level.</li>
 <li>Choose what to do when a field is blank: use <b>Unassigned</b>, skip that level, or block that package. Outfit Category has a separate multi-value rule because it can naturally contain several categories.</li>
 <li>The preview updates automatically. Use <b>Refresh Preview</b> only when you want to force a manual refresh, then inspect the destination paths.</li>
 <li>Use <b>Save Structure</b> if you want to reuse the hierarchy later. CAS Curator automatically names it from the folder structure.</li>
 <li>When the preview is correct, click <b>Route with Structure…</b> and confirm the full move preview.</li>
 </ol>
-<p>CAS Curator preflights the full batch, never overwrites an existing destination, copies first, verifies SHA-256, then removes the original. If a move or MDB save fails, completed moves are rolled back where possible. The frozen scanner core is not changed by this feature; the builder operates from the MDB information already available in CAS Curator.</p>
+<p>Before moving anything, CAS Curator checks the whole batch for problems. It never overwrites a different existing file, verifies each copy before removing the original, and tries to undo completed moves if something fails.</p>
 <h3>Save the routed result as a Profile</h3>
 <p>Tick <b>Save result as Profile</b> and enter a Profile name before routing. After a successful route, every mapped package becomes a member of that Profile and receives the chosen destination root as its Planned Location. The Creator/Type/etc folder structure remains physically underneath that managed root, so later Profile moves can preserve it.</p>
 <p>Setting a non-blank <b>Planned Location</b> manually also adds the Current Profile to <b>Profile Membership</b> automatically if needed. Clearing Planned Location does not remove membership; use <b>Remove from:</b> for that.</p>
 
 <h2><a name="routing"></a>Sort files — Preview Routing, then Run Routing</h2>
+<p class="where"><b>Where to find it:</b> <b>Scan</b> &gt; <b>Preview Routing</b> / <b>Run Routing</b>.</p>
 <p>Sort a reviewed folder into evidence-based subfolders while seeing every destination before anything moves.</p>
 <p><b>Recommended order: Run Scan → Preview Routing → Run Routing.</b> Scan adds or refreshes MDB records and scanner-derived metadata. Preview Routing reads that information and calculates destinations without moving files. Run Routing performs the physical move. Routing can still be continued deliberately without a fresh Scan, but CAS Curator warns when packages are not in the MDB or their current file hash no longer matches the stored scan identity.</p>
+<p><b>First Scan → Routing workflow:</b> CAS Curator creates a new results folder for that scan/routing session. By default it also saves a separate scan summary report there. If you do not want the report, turn off <b>Options &gt; Create Health Scan Report after Scan</b>. The results folder is still created for routed files even when the optional report is turned off.</p>
 <h3>Pre-routing scan-state check</h3>
 <p>Before Preview Routing or Run Routing, CAS Curator compares the current package files with the selected MDB:</p>
 <ul>
@@ -7487,16 +8728,17 @@ class MainWindow(QMainWindow):
 <li>Tick <b>I understand: Run Routing will MOVE source files</b>.</li>
 <li>Click <b>Run Routing</b> and let it finish without manually moving the same files.</li>
 </ol>
-<p>After a successful routing run, CAS Curator uses its own move manifest to record the exact routed folder for each safely matched <code>.package</code> row as a File Location. This lets later <b>Open File Location</b> and <b>Move Selected to Location…</b> actions work without rescanning just to rediscover a move CAS Curator already performed. If <b>Recover Last Routing</b> later restores those files, CAS Curator also restores safely matched File Location records to the original folders. Ambiguous matches are skipped rather than guessed.</p>
-<p><b>Risk Score and textual Risk do not control Routing.</b> They remain review information only. Normal non-broken custom content with direct CASP identity is routed under folders such as <b>CASP_OBSERVED/Hair</b>; other identified non-CAS custom content is grouped under <b>CUSTOM_CONTENT/&lt;type&gt;</b>. Unknown custom content remains separate under <b>UNIDENTIFIED_CC</b>. Exact duplicate copies are routed separately to <b>DUPLICATES</b>.</p>
+<p>After a successful routing run, CAS Curator uses its own move manifest to record the exact routed folder for each safely matched <b>.package</b> row as a File Location. This lets later <b>Open File Location</b> and <b>Move Selected to Location…</b> actions work without rescanning just to rediscover a move CAS Curator already performed. If <b>Recover Last Routing</b> later restores those files, CAS Curator also restores safely matched File Location records to the original folders. Ambiguous matches are skipped rather than guessed.</p>
+<p><b>Performance Risk Score does not control Routing.</b> It is review information only and remains separate from Health Status. Confirmed CAS items are routed under folders such as <b>CASP_OBSERVED/Hair</b>; other identified custom content is grouped under <b>CUSTOM_CONTENT/&lt;type&gt;</b>. Unknown custom content remains separate under <b>UNIDENTIFIED_CC</b>. Exact duplicate copies are routed separately to <b>DUPLICATES</b>.</p>
 <p>Routes such as <b>CASP_OBSERVED/Hair</b> describe observed CASP evidence; they are not a claim that every resource in the whole package has been classified.</p>
-<p>Loose image files are routed under <b>IMAGES</b> while keeping the selected source-folder name and any subfolders beneath it. For example, an image from a selected folder named <b>Nightcrawler</b> is kept under <b>IMAGES/Nightcrawler/...</b> rather than being flattened into the IMAGES root.</p>
+<p>Loose image files are routed under <b>IMAGES</b> while keeping the selected source-folder name and any subfolders beneath it. For example, an image from a selected folder named <b>Simlicious</b> is kept under <b>IMAGES/Simlicious/...</b> rather than being flattened into the IMAGES root.</p>
 <p><b>ZIPs found during Scan:</b> when the selected Scan folder contains ZIP archives, CAS Curator asks before Scan starts. Choose <b>Extract &amp; Continue</b> to unpack each archive into its own folder beside the ZIP and include newly extracted package files in the same Scan, or <b>Keep Packed</b> to leave them untouched for normal ARCHIVES routing later. The prompt is the extraction decision; there is no second extraction confirmation or completion popup. Original ZIPs are never deleted or overwritten.</p>
-<p><b>ZIP preview/extract:</b> you can also use <b>Tools &gt; Library / Maintenance &gt; Preview / Extract ZIP…</b>, or right-click a ZIP in Routing Preview. CAS Curator previews the archive first, preserves an existing single top-level folder, and uses the ZIP filename as an outer folder when files are loose or use multiple roots. Extraction is explicit, keeps the original ZIP, rejects unsafe paths, and does not overwrite existing files.</p>
-<p><b>Sims3Packs found during Scan:</b> CAS Curator can read the Sims3Pack manifest without modifying the original file. For the conservative CAS workflow, only Sims3Packs declared as <b>CASpart</b> are eligible for package-copy extraction. If an identical standalone <code>.package</code> is already somewhere in the selected Scan tree, CAS Curator recognises it by SHA-256 and does not extract the same embedded package again. If a CASpart Sims3Pack has no equivalent standalone package, choose <b>Extract CAS &amp; Continue</b> to place the embedded package copy inside a folder named after the Sims3Pack, beside the untouched original. Extracted files use the original Sims3Pack name instead of the internal hexadecimal package name. A Sims3Pack can contain several CAS package parts; CAS Curator reports these as one multi-part set, duplicate-checks every part separately, and extracts all missing parts together using stable <code>__1</code>, <code>__2</code> and so on. The parts are not merged. Choose <b>Keep Packed &amp; Continue</b> to make no extraction changes. The prompt is the Sims3Pack decision; there is no extra extraction-complete popup before Scan continues.</p>
-<p><b>Protected Sims3Packs:</b> Lots, worlds, Sims/households, patterns, objects and unknown/mixed types are deliberately kept packed in this first conservative implementation. CAS Curator does not try to turn them into Mods/Packages content. The existing Routing system can continue to move the original Sims3Pack intact to <b>SIMS3PACK</b>. This restriction is intentionally stricter than a general Sims3Pack converter because CAS Curator is focused on safe CAS review.</p>
+<p><b>ZIP preview/extract during Routing:</b> right-click a ZIP in <b>Routing Preview</b> and choose <b>Preview / Extract ZIP…</b>. CAS Curator previews the archive first, preserves an existing single top-level folder, and uses the ZIP filename as an outer folder when files are loose or use multiple roots. Extraction is explicit, keeps the original ZIP, rejects unsafe paths, and does not overwrite existing files. There is no separate Library / Maintenance ZIP extraction tool because ZIP extraction is intended for the Scan and Routing workflows.</p>
+<p><b>Sims3Packs found during Scan:</b> CAS Curator can read the Sims3Pack manifest without modifying the original file. For CAS extraction, only Sims3Packs declared as <b>CASpart</b> are eligible for package-copy extraction. If an identical standalone <b>.package</b> is already somewhere in the selected Scan tree, CAS Curator recognises the identical file by its package hash and does not extract the same embedded package again. If a CASpart Sims3Pack has no equivalent standalone package, choose <b>Extract CAS &amp; Continue</b> to place the embedded package copy inside a folder named after the Sims3Pack, beside the untouched original. Extracted files use the original Sims3Pack name instead of the internal hexadecimal package name. A Sims3Pack can contain several CAS package parts; CAS Curator reports these as one multi-part set, duplicate-checks every part separately, and extracts all missing parts together using stable <b>__1</b>, <b>__2</b> and so on. The parts are not merged. Choose <b>Keep Packed &amp; Continue</b> to make no extraction changes. The prompt is the Sims3Pack decision; there is no extra extraction-complete popup before Scan continues.</p>
+<p><b>Protected Sims3Packs:</b> Lots, worlds, Sims/households, patterns, objects and unknown/mixed types are kept packed because CAS Curator does not yet unpack these types automatically. The original Sims3Pack can still be routed intact to <b>SIMS3PACK</b>.</p>
 
 <h2><a name="recovery"></a>Recover the last routing run</h2>
+<p class="where"><b>Where to find it:</b> <b>Tools &gt; Routing</b> recovery command after a recorded routing run.</p>
 <ol>
 <li>Click <b>Recover Last Routing</b>.</li>
 <li>Read the confirmation carefully.</li>
@@ -7506,6 +8748,7 @@ class MainWindow(QMainWindow):
 <p>The button applies to the last unrecovered routing manifest available in the current session.</p>
 
 <h2><a name="backups"></a>Backups, logs and result files</h2>
+<p class="where"><b>Where to find it:</b> Scan output folders beside the routing results; Library saves also create MDB backups.</p>
 <ul>
 <li><b>MDB backup:</b> scanner/manual writes create a backup before changing the workbook.</li>
 <li><b>Scanner log:</b> the embedded log remains on the Scan page. Use <b>Open Log</b>, <b>Copy Log</b> or <b>Expand Log</b> only when you want a larger/full view. CAS Curator no longer opens a separate large completion window automatically.</li>
@@ -7516,21 +8759,103 @@ class MainWindow(QMainWindow):
 <p>Keep the backup and move manifest until you are satisfied that a large operation is correct.</p>
 
 <h2><a name="troubleshooting"></a>Troubleshooting</h2>
-<p><b>No Master Database yet:</b> go to <b>Library</b>, click <b>Create new MDB…</b>, choose where to save it, then run your first Scan.</p>
-<p><b>The wrong MDB opens at startup:</b> click <b>Open MDB…</b> and choose the one you want. That becomes the remembered MDB. You can also untick <b>File &gt; Open last used MDB on startup</b>.</p>
+<p class="where"><b>Where to find it:</b> use this section when a Scan, Library action or Routing step does not behave as expected.</p>
+<p><b>No Master Database yet:</b> go to <b>Library</b>, click <b>Create new Master Database…</b>, choose where to save it, then run your first Scan.</p>
+<p><b>The wrong MDB opens at startup:</b> click <b>Open Master Database…</b> and choose the one you want. That becomes the remembered MDB. You can also untick <b>File &gt; Open last used Master Database on startup</b>.</p>
 <p><b>Scan shows the wrong MDB:</b> go to <b>Library</b> and open the Master Database you want. Scan updates automatically and cannot use a separate MDB.</p>
 <p><b>Run Scan is unavailable:</b> open a valid .xlsx Master Database in <b>Library</b>, choose a valid source folder, and save/revert pending manual Library edits.</p>
-<p><b>Scan reports an MDB compatibility issue:</b> some spreadsheet programs save extra workbook information that the scanner cannot safely read. Choose <b>Create compatible copy…</b>. CAS Curator leaves your original workbook untouched, creates and verifies a separate compatible copy, and switches Scan to that copy. If the affected MDB was open in Library, the compatible copy is opened there too. Run Scan again after the copy is ready.</p>
+<p><b>Scan reports that a Master Database needs a compatible copy:</b> some spreadsheet programs save extra workbook information that the scanner cannot safely read. Choose <b>Create compatible copy…</b>. CAS Curator leaves your original workbook untouched, creates and verifies a separate compatible copy, and switches Scan to that copy. If the affected MDB was open in Library, the compatible copy is opened there too. Run Scan again after the copy is ready.</p>
 <p><b>Run Routing is unavailable:</b> choose a valid source and separate destination, create a fresh Routing Preview, then tick the move acknowledgement.</p>
 <p><b>Routing says Changed since scan / Not in MDB:</b> choose <b>Run Scan First</b> when you want current scanner-derived metadata and reliable tracking. <b>Continue Routing Anyway</b> is available for deliberate cases, but stale or unknown packages may not have complete MDB information.</p>
 <p><b>Gallery looks empty:</b> use <b>Clear Quick Filters</b> if needed.</p>
-<p><b>Older fields say Unverified (legacy):</b> that means the value came from an older workflow and has not been regenerated by the current conservative scanner. Re-scan to generate the supported core fields.</p>
 <p><b>A package was held for review:</b> CAS Curator did not have enough safe identity/evidence to make the normal scanner write. Do not rename it to force a result; filenames are not classification evidence.</p>
 <p><b>A routing preview looks wrong:</b> do not run routing. Change the setup or leave the package for review.</p>
 <p><b>A scan/routing operation fails:</b> keep the Scanner log, backup and any preview/move manifest.</p>
 
-''')
+'''
+        # Render Guide callouts with inline themed fills. QTextDocument can be
+        # inconsistent about class-based paragraph backgrounds, especially after
+        # theme changes, so these user-facing highlights are applied directly to
+        # the HTML before display. Headings continue to use the document CSS.
+        def _render_guide_html():
+            html = self._guide_html
+            callout_styles = {
+                "where": (getattr(self, "_guide_highlight_1", "#FFF4C9"), getattr(self, "_guide_highlight_1_text", "#202020")),
+                "tip": (getattr(self, "_guide_highlight_2", "#E7F4EA"), getattr(self, "_guide_highlight_2_text", "#202020")),
+                "important": (getattr(self, "_guide_highlight_3", "#F9E3E3"), getattr(self, "_guide_highlight_3_text", "#202020")),
+            }
+            callout_borders = {
+                "where": getattr(self, "_guide_highlight_1_border", getattr(self, "_guide_callout_border", "#C3C3C3")),
+                "tip": getattr(self, "_guide_highlight_2_border", getattr(self, "_guide_callout_border", "#C3C3C3")),
+                "important": getattr(self, "_guide_highlight_3_border", getattr(self, "_guide_callout_border", "#C3C3C3")),
+            }
+            for cls, (fill, text) in callout_styles.items():
+                border = callout_borders[cls]
+                html = html.replace(
+                    f'<p class="{cls}">',
+                    f'<p style="background-color: {fill}; color: {text}; padding: 6px; border: 1px solid {border};">',
+                )
+            return html
+
+        self._render_guide_html = _render_guide_html
+        self.guide_browser.setHtml(self._render_guide_html())
         layout.addWidget(self.guide_browser, 1)
+
+        self._guide_search_positions = []
+        self._guide_search_index = -1
+
+        def refresh_guide_search(_text=None):
+            query = self.guide_search_edit.text().strip()
+            self._guide_search_positions = []
+            self._guide_search_index = -1
+            selections = []
+            if not query:
+                self.guide_browser.setExtraSelections([])
+                self.guide_search_count.setText("No search")
+                return
+
+            doc = self.guide_browser.document()
+            cursor = QTextCursor(doc)
+            highlight = QTextCharFormat()
+            highlight.setBackground(QColor("#FFE58A"))
+            highlight.setForeground(QColor("#202020"))
+            while True:
+                found = doc.find(query, cursor)
+                if found.isNull():
+                    break
+                extra = QTextEdit.ExtraSelection()
+                extra.cursor = found
+                extra.format = highlight
+                selections.append(extra)
+                self._guide_search_positions.append((found.selectionStart(), found.selectionEnd()))
+                cursor = QTextCursor(found)
+                cursor.setPosition(found.selectionEnd())
+
+            self.guide_browser.setExtraSelections(selections)
+            if self._guide_search_positions:
+                self._guide_search_index = 0
+                jump_to_guide_match(0)
+            else:
+                self.guide_search_count.setText("0 matches")
+
+        def jump_to_guide_match(index):
+            if not self._guide_search_positions:
+                self.guide_search_count.setText("0 matches" if self.guide_search_edit.text().strip() else "No search")
+                return
+            self._guide_search_index = index % len(self._guide_search_positions)
+            start_pos, end_pos = self._guide_search_positions[self._guide_search_index]
+            cursor = QTextCursor(self.guide_browser.document())
+            cursor.setPosition(start_pos)
+            cursor.setPosition(end_pos, QTextCursor.KeepAnchor)
+            self.guide_browser.setTextCursor(cursor)
+            self.guide_browser.ensureCursorVisible()
+            self.guide_search_count.setText(f"{self._guide_search_index + 1} of {len(self._guide_search_positions)}")
+
+        self.guide_search_edit.textChanged.connect(refresh_guide_search)
+        self.guide_search_edit.returnPressed.connect(lambda: jump_to_guide_match(self._guide_search_index + 1))
+        self.guide_search_next.clicked.connect(lambda _checked=False: jump_to_guide_match(self._guide_search_index + 1))
+        self.guide_search_prev.clicked.connect(lambda _checked=False: jump_to_guide_match(self._guide_search_index - 1))
+
         return page
 
     def _build_scan_shell_page(self):
@@ -7773,7 +9098,7 @@ class MainWindow(QMainWindow):
         self.scan_recover_routing_btn = QPushButton("Recover Last Routing")
         self.scan_recover_routing_btn.setEnabled(False)
         self.scan_recover_routing_btn.setToolTip(
-            "Move files from the latest routing run back to their recorded original paths after SHA-256 verification."
+            "Move files from the latest routing run back to their recorded original paths after file verification."
         )
         self.scan_recover_routing_btn.clicked.connect(self._recover_last_routing)
         log_top.addWidget(self.scan_recover_routing_btn)
@@ -7791,13 +9116,12 @@ class MainWindow(QMainWindow):
         self.scan_log.setReadOnly(True)
         if IS_PUBLIC_BUILD:
             ready_text = (
-                "CAS CURATOR - CONSERVATIVE CAS SCANNER\n\n"
-                "This release reads direct CASP metadata and GEOM face counts. Filenames are never used to classify content.\n"
-                "Run Scan generates CASP IDs, supported CC Type and Highest Polys, extracts dedicated THUM previews when available, and records package hash/scan time.\n"
-                "Whether a package contains or overlaps with EA resources is not assessed. Skin type, general IMG texture purpose, script/gameplay and Health/Risk are not supported scan results.\n"
+                "CAS CURATOR - CAS SCANNER\n\n"
+                "CAS Curator reads supported information directly from package resources. Filenames are not used as evidence for supported classifications.\n"
+                "Run Scan records supported package information including CASP IDs, CC Type, Highest Polys, Health Status, Performance Risk information, thumbnails when available, package hash and scan time.\n"
+                "Some Experimental classifications use additional clues and are clearly marked for review.\n"
                 "Run Scan creates a mandatory MDB backup before scanner writes.\n"
-                "Preview Routing before any move. Run Routing requires explicit acknowledgement and creates a recovery manifest.\n\n"
-                "Historical scanner-derived MDB classifications remain withheld unless independently validated."
+                "Preview Routing before any move. Run Routing requires explicit acknowledgement and creates a recovery manifest."
             )
         else:
             ready_text = (
@@ -7847,7 +9171,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(log_card, 1)
 
         workflow_hint = QLabel("Recommended workflow:  1. Run Scan  →  2. Preview Routing  →  3. Run Routing")
-        workflow_hint.setObjectName("ScanHint")
+        workflow_hint.setObjectName("ScanWorkflowHint")
         workflow_hint.setWordWrap(True)
         workflow_hint.setToolTip("Run Scan adds or refreshes MDB information. Preview Routing shows destinations without moving files. Run Routing moves files after confirmation.")
         layout.addWidget(workflow_hint)
@@ -7963,8 +9287,14 @@ class MainWindow(QMainWindow):
         self.random_sim_category_table.setSelectionMode(QAbstractItemView.NoSelection)
         self.random_sim_category_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.random_sim_category_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.random_sim_category_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.random_sim_category_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        # DEV scaling fit: cell widgets are not measured reliably by ResizeToContents.
+        # Give Count / Chance explicit practical widths so the editor chrome and
+        # spin/drop-down controls have room at 125%+ Windows scaling.
+        self.random_sim_category_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.random_sim_category_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.random_sim_category_table.setColumnWidth(2, 82)
+        self.random_sim_category_table.setColumnWidth(3, 108)
+        self.random_sim_category_table.verticalHeader().setDefaultSectionSize(34)
         self.random_sim_category_table.setMinimumHeight(180)
         self.random_sim_category_table.setMaximumHeight(320)
         config_layout.addWidget(self.random_sim_category_table)
@@ -8034,8 +9364,14 @@ class MainWindow(QMainWindow):
         self.random_sim_type_probability_table.setSelectionMode(QTableWidget.SingleSelection)
         self.random_sim_type_probability_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.random_sim_type_probability_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.random_sim_type_probability_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.random_sim_type_probability_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        # Keep the probability editors wide enough for their full text at 125% DPI.
+        # ResizeToContents only sees the table item/header reliably when a cellWidget
+        # is used, so the padded combo could otherwise be squeezed down to "Mode".
+        self.random_sim_type_probability_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.random_sim_type_probability_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.random_sim_type_probability_table.setColumnWidth(2, 160)
+        self.random_sim_type_probability_table.setColumnWidth(3, 138)
+        self.random_sim_type_probability_table.verticalHeader().setDefaultSectionSize(34)
         self.random_sim_type_probability_table.setMinimumHeight(130)
         self.random_sim_type_probability_table.setMaximumHeight(220)
         self.random_sim_type_probability_table.itemSelectionChanged.connect(self._random_sim_type_rule_selected)
@@ -8052,8 +9388,13 @@ class MainWindow(QMainWindow):
         self.random_sim_item_probability_table.setSelectionMode(QTableWidget.SingleSelection)
         self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        # Match the type/subtype table: Mode must comfortably show "Weight" /
+        # "Exact %" and Value must include its suffix + spin arrows at 125% DPI.
+        self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+        self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.Fixed)
+        self.random_sim_item_probability_table.setColumnWidth(2, 160)
+        self.random_sim_item_probability_table.setColumnWidth(3, 138)
+        self.random_sim_item_probability_table.verticalHeader().setDefaultSectionSize(34)
         self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         self.random_sim_item_probability_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         self.random_sim_item_probability_table.setMinimumHeight(220)
@@ -8299,7 +9640,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(history_card)
 
         next_note = QLabel(
-            "Next planned DEV stage: Color/Theme Studio improvements — separate Lock to Slot vs Keep in Shuffle colour locks, plus persistent custom-theme storage across CAS Curator updates."
+            "Current DEV stage: Theme Studio now has separate Section Lock and Shuffle Lock controls, and custom themes use persistent per-user storage across CAS Curator updates."
         )
         next_note.setObjectName("EditHelp")
         next_note.setWordWrap(True)
@@ -8388,6 +9729,19 @@ class MainWindow(QMainWindow):
                     pass
         return chances
 
+    def _random_sim_set_padded_cell_widget(self, table, row, column, widget, h_margin=6, v_margin=3):
+        """Centre a compact editor inside the table cell so its border never touches the row/grid lines."""
+        host = QWidget()
+        host.setObjectName("RandomSimCellEditorHost")
+        host_layout = QHBoxLayout(host)
+        host_layout.setContentsMargins(h_margin, v_margin, h_margin, v_margin)
+        host_layout.setSpacing(0)
+        widget.setMinimumWidth(0)
+        widget.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        host_layout.addWidget(widget, 0, Qt.AlignCenter)
+        table.setCellWidget(row, column, host)
+        return host
+
     def _random_sim_rule_widgets(self, table, row, store_name, key):
         store = self.random_sim_type_rules if store_name == "type" else self.random_sim_item_rules
         rule = store.get(key) if isinstance(store.get(key), dict) else {}
@@ -8399,17 +9753,22 @@ class MainWindow(QMainWindow):
             numeric = value_default
 
         mode = QComboBox()
+        mode.setObjectName("RandomSimModeCombo")
+        mode.setFixedSize(140, 26)
         mode.addItems(["Weight", "Exact %"])
         mode.setCurrentIndex(1 if mode_value == "exact" else 0)
-        mode.setMinimumWidth(92)
-        table.setCellWidget(row, 2, mode)
+        # Cell editors must obey the actual table-cell width.  Fixed/minimum
+        # widths caused the DEV Random Sim Mode/Value controls to spill across
+        # grid lines at Windows DPI scaling (notably 125%).
+        self._random_sim_set_padded_cell_widget(table, row, 2, mode)
 
         value = QDoubleSpinBox()
+        value.setObjectName("RandomSimValueSpin")
+        value.setFixedSize(118, 26)
         value.setDecimals(2)
         value.setRange(0.0, 100.0)
         value.setValue(max(0.0, min(100.0, numeric)))
-        value.setMinimumWidth(88)
-        table.setCellWidget(row, 3, value)
+        self._random_sim_set_padded_cell_widget(table, row, 3, value)
 
         def commit(*_args):
             selected_mode = "exact" if mode.currentText().startswith("Exact") else "weight"
@@ -8711,19 +10070,21 @@ class MainWindow(QMainWindow):
             self.random_sim_category_table.setItem(row, 1, available_item)
 
             combo = QComboBox()
+            combo.setObjectName("RandomSimCountCombo")
+            combo.setFixedSize(62, 26)
             combo.addItems(["0", "1", "2"])
             wanted = previous_counts.get(category, default_count_for_category(category))
             combo.setCurrentText(str(max(0, min(2, int(wanted)))))
-            combo.setMinimumWidth(58)
-            self.random_sim_category_table.setCellWidget(row, 2, combo)
+            self._random_sim_set_padded_cell_widget(self.random_sim_category_table, row, 2, combo)
             self.random_sim_count_boxes[category] = combo
 
             chance_spin = QDoubleSpinBox()
+            chance_spin.setObjectName("RandomSimChanceSpin")
+            chance_spin.setFixedSize(92, 26)
             chance_spin.setDecimals(0)
             chance_spin.setRange(0.0, 100.0)
             chance_spin.setSuffix(" %")
             chance_spin.setSingleStep(5.0)
-            chance_spin.setMinimumWidth(82)
             try:
                 chance_value = float(previous_chances.get(category, self.random_sim_category_chances.get(category, 100.0)))
             except (TypeError, ValueError):
@@ -8732,7 +10093,7 @@ class MainWindow(QMainWindow):
             chance_spin.valueChanged.connect(
                 lambda value, cat=category: self._random_sim_set_category_chance(cat, value)
             )
-            self.random_sim_category_table.setCellWidget(row, 3, chance_spin)
+            self._random_sim_set_padded_cell_widget(self.random_sim_category_table, row, 3, chance_spin)
             self.random_sim_category_chance_boxes[category] = chance_spin
 
         self._random_sim_refresh_probability_editor()
@@ -8955,7 +10316,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Collection export blocked",
-                "No collection was committed because the preflight check failed:\n\n" + details,
+                "No collection was created because the safety check found a problem:\n\n" + details,
             )
             return
         except Exception as exc:
@@ -9104,7 +10465,7 @@ class MainWindow(QMainWindow):
             f"<b>Created:</b> {html.escape(str(sim.get('created_at', '') or '—').replace('T', ' '))}<br>"
             f"<b>Selected CC:</b> {selected_count} &nbsp; <b>Dependencies:</b> {dependency_count}<br>"
             f"<b>CAS Curator:</b> {html.escape(str(sim.get('app_version', '') or '—'))}<br>"
-            f"<b>Original MDB:</b> {html.escape(str(sim.get('master_database', '') or '—'))}<br>"
+            f"<b>Original Master Database:</b> {html.escape(str(sim.get('master_database', '') or '—'))}<br>"
             f"<b>Export folder:</b> {html.escape(folder_display)} ({folder_status})"
             f"{generation_note}"
         )
@@ -9193,12 +10554,12 @@ class MainWindow(QMainWindow):
                         fallback += "\nCASP: " + casp_short
                     thumb.setText(fallback)
                 else:
-                    thumb.setText("Original CC not found\nin the current MDB")
+                    thumb.setText("Original CC not found\nin the current Library")
             card_layout.addWidget(thumb)
 
             short_package = package if len(package) <= 38 else package[:35] + "…"
             open_button = QPushButton(short_package)
-            open_button.setToolTip(package + ("\nOpen original CC in Library" if matched else "\nNot present in the current MDB"))
+            open_button.setToolTip(package + ("\nOpen original CC in Library" if matched else "\nNot present in the current Library"))
             open_button.setEnabled(bool(matched))
             if matched:
                 open_button.clicked.connect(
@@ -9212,7 +10573,7 @@ class MainWindow(QMainWindow):
                 risk = str(record.get("Risk", "") or "—")
                 meta = QLabel(f"{subtype}\nHealth: {health} | Risk: {risk}")
             else:
-                meta = QLabel("Saved Sim link preserved; original MDB record is unavailable here.")
+                meta = QLabel("The saved Sim link is still available, but the original Library record is not in the currently opened Master Database.")
             meta.setObjectName("EditHelp")
             meta.setWordWrap(True)
             card_layout.addWidget(meta)
@@ -9276,6 +10637,149 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(manifest_path)))
 
 
+
+    def _preview_update_dialog_test(self):
+        release = {
+            "tag_name": "v1.1.1",
+            "name": "CAS Curator v1.1.1",
+            "body": "## New\n- In-app updater with changelog.\n\n## Improved\n- Performance Score refresh can reuse tracked routed locations.\n\n## Fixed\n- Example maintenance fixes are shown here exactly as GitHub release notes would appear.",
+            "published_at": "2026-10-29T00:00:00Z",
+            "html_url": PROJECT_SOURCE_URL + "/releases/tag/v1.1.1",
+            "assets": [
+                {"name": "CAS_Curator_Setup_v1.1.1.exe", "browser_download_url": "https://github.com/Taemaly/CAS-Curator/releases/download/v1.1.1/CAS_Curator_Setup_v1.1.1.exe", "size": 123456},
+                {"name": "CAS_Curator_Setup_v1.1.1.exe.sha256", "browser_download_url": "https://github.com/Taemaly/CAS-Curator/releases/download/v1.1.1/CAS_Curator_Setup_v1.1.1.exe.sha256", "size": 100},
+            ],
+        }
+        dialog = UpdateAvailableDialog(self, release)
+        self._update_dialog = dialog
+        dialog.exec()
+        self._update_dialog = None
+
+    def _check_for_updates(self, manual: bool = True):
+        if self._update_check_thread is not None:
+            try:
+                if self._update_check_thread.isRunning():
+                    if manual:
+                        self.statusBar().showMessage("An update check is already running…", 4000)
+                    return
+            except RuntimeError:
+                self._update_check_thread = None
+
+        if manual:
+            self.statusBar().showMessage("Checking for CAS Curator updates…")
+        thread = UpdateCheckThread(self)
+        self._update_check_thread = thread
+        thread.releaseReady.connect(lambda release, m=manual: self._on_update_release_ready(release, m))
+        thread.checkFailed.connect(lambda message, m=manual: self._on_update_check_failed(message, m))
+        thread.finished.connect(lambda t=thread: self._clear_update_check_thread(t))
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _clear_update_check_thread(self, thread):
+        if self._update_check_thread is thread:
+            self._update_check_thread = None
+
+    def _on_update_check_failed(self, message: str, manual: bool):
+        if manual:
+            QMessageBox.warning(self, "Check for Updates", message)
+            self.statusBar().showMessage("Update check failed", 5000)
+
+    def _on_update_release_ready(self, release: dict, manual: bool):
+        tag = str((release or {}).get("tag_name") or "").strip()
+        if not is_newer_version(VERSION, tag):
+            if manual:
+                QMessageBox.information(
+                    self,
+                    "Check for Updates",
+                    f"No newer stable CAS Curator release is available.\n\nCurrent: {VERSION}\nLatest stable: {tag or 'Unknown'}",
+                )
+                self.statusBar().showMessage("CAS Curator is up to date with the stable channel.", 5000)
+            return
+        dialog = UpdateAvailableDialog(self, release)
+        self._update_dialog = dialog
+        dialog.exec()
+        self._update_dialog = None
+
+    def _download_and_install_update(self, release: dict, dialog: UpdateAvailableDialog):
+        if not (IS_PUBLIC_BUILD and not IS_TEST_BUILD):
+            QMessageBox.information(self, "CAS Curator Update", "Automatic installation is enabled only in stable PUBLIC builds.")
+            return
+        if self.scan_process is not None and self.scan_process.state() != QProcess.NotRunning:
+            QMessageBox.information(self, "CAS Curator Update", "Finish the current Scan/Routing task before installing an update.")
+            return
+        if self.performance_refresh_process is not None and self.performance_refresh_process.state() != QProcess.NotRunning:
+            QMessageBox.information(self, "CAS Curator Update", "Finish the current Performance Score refresh before installing an update.")
+            return
+        if not self._confirm_pending_changes():
+            return
+        if self._update_download_thread is not None:
+            try:
+                if self._update_download_thread.isRunning():
+                    return
+            except RuntimeError:
+                self._update_download_thread = None
+
+        dialog.set_busy(True)
+        dialog.status_label.setText("Preparing verified update download…")
+        thread = UpdateDownloadThread(release, self)
+        self._update_download_thread = thread
+        thread.progressChanged.connect(dialog.set_download_progress)
+        thread.downloadReady.connect(lambda result, d=dialog: self._on_update_download_ready(result, d))
+        thread.downloadFailed.connect(lambda message, d=dialog: self._on_update_download_failed(message, d))
+        thread.finished.connect(lambda t=thread: self._clear_update_download_thread(t))
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _clear_update_download_thread(self, thread):
+        if self._update_download_thread is thread:
+            self._update_download_thread = None
+
+    def _on_update_download_failed(self, message: str, dialog: UpdateAvailableDialog):
+        dialog.set_busy(False)
+        dialog.progress.setVisible(False)
+        dialog.status_label.setText("Update download/verification failed. Nothing was installed.")
+        QMessageBox.warning(self, "CAS Curator Update", message)
+
+    def _on_update_download_ready(self, result: dict, dialog: UpdateAvailableDialog):
+        installer = Path(str((result or {}).get("installer_path") or ""))
+        if not installer.is_file():
+            self._on_update_download_failed("The verified installer could not be found after download.", dialog)
+            return
+        dialog.progress.setVisible(True)
+        dialog.progress.setRange(0, 100)
+        dialog.progress.setValue(100)
+        digest = str((result or {}).get("sha256") or "")
+        dialog.status_label.setText(f"Download verified successfully. Starting installer…")
+        self.settings.sync()
+
+        # Launch through a tiny helper outside the install directory so CAS
+        # Curator can fully exit before the installer starts replacing files.
+        helper = installer.parent / "install_after_cas_curator_exit.cmd"
+        if os.name == "nt":
+            if installer.suffix.lower() == ".msi":
+                install_line = f'start "" /wait msiexec.exe /i "{installer}"'
+            else:
+                install_line = f'start "" /wait "{installer}"'
+            helper.write_text(
+                "@echo off\n"
+                "ping 127.0.0.1 -n 3 >nul\n"
+                + install_line + "\n"
+                + 'del "%~f0" >nul 2>nul\n',
+                encoding="utf-8",
+            )
+            started = QProcess.startDetached("cmd.exe", ["/c", str(helper)])
+        else:
+            started = QProcess.startDetached(str(installer), [])
+        if not started:
+            dialog.set_busy(False)
+            QMessageBox.warning(
+                self,
+                "CAS Curator Update",
+                f"The update was downloaded and verified, but the installer helper could not start.\n\nInstaller:\n{installer}",
+            )
+            return
+        QApplication.instance().quit()
+
     def _version_info_text(self) -> str:
         return (
             f"{APP_NAME} {VERSION}\n"
@@ -9329,6 +10833,26 @@ class MainWindow(QMainWindow):
         version_label = QLabel(f"<b>Version:</b> {html.escape(VERSION)}")
         build_label = QLabel(f"<b>Build date:</b> {html.escape(BUILD_DATE)}")
         creator_label = QLabel(f"<b>Created by:</b> {html.escape(PROJECT_CREATOR)}")
+
+        creator_row = QHBoxLayout()
+        creator_row.setContentsMargins(0, 0, 0, 0)
+        creator_row.setSpacing(8)
+        creator_row.addWidget(creator_label)
+        ukraine_flag = QLabel()
+        ukraine_flag.setToolTip("Ukraine")
+        flag_pixmap = QPixmap(30, 20)
+        flag_pixmap.fill(Qt.GlobalColor.transparent)
+        flag_painter = QPainter(flag_pixmap)
+        flag_painter.fillRect(0, 0, 30, 10, QColor("#0057B8"))
+        flag_painter.fillRect(0, 10, 30, 10, QColor("#FFD700"))
+        flag_painter.setPen(QPen(QColor("#8A8A8A"), 1))
+        flag_painter.drawRect(0, 0, 29, 19)
+        flag_painter.end()
+        ukraine_flag.setPixmap(flag_pixmap)
+        ukraine_flag.setFixedSize(30, 20)
+        creator_row.addWidget(ukraine_flag)
+        creator_row.addStretch(1)
+
         source_label = QLabel(
             f'<b>Source / support:</b> <a href="{html.escape(PROJECT_SOURCE_URL)}">'
             f'{html.escape(PROJECT_SOURCE_URL)}</a>'
@@ -9336,13 +10860,15 @@ class MainWindow(QMainWindow):
         source_label.setOpenExternalLinks(True)
         source_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextBrowserInteraction)
         source_label.setWordWrap(True)
-        for widget in (version_label, build_label, creator_label, source_label):
-            info_layout.addWidget(widget)
+        info_layout.addWidget(version_label)
+        info_layout.addWidget(build_label)
+        info_layout.addLayout(creator_row)
+        info_layout.addWidget(source_label)
         layout.addWidget(info_card)
 
         button_row = QHBoxLayout()
         button_row.setSpacing(8)
-        open_source = QPushButton("View Source Code")
+        open_source = QPushButton("Open Source Code")
         open_source.setToolTip("Open the CAS Curator GitHub repository in your default browser.")
         open_source.clicked.connect(self._open_project_source)
         copy_info = QPushButton("Copy version info")
@@ -9389,6 +10915,10 @@ class MainWindow(QMainWindow):
         self.scan_shell_badge.setVisible(is_scan)
         self.library_mdb_row.setVisible(is_library)
         self.library_filters_row.setVisible(is_library)
+        if hasattr(self, "find_identifier_btn"):
+            self.find_identifier_btn.setVisible(
+                is_library and bool(IS_DEV_BUILD or self.advanced_features)
+            )
 
         self.splitter.setVisible(is_library)
         self.pinned_bar.setVisible(is_library and bool(self.pinned_packages))
@@ -9467,7 +10997,7 @@ class MainWindow(QMainWindow):
 
     def _scan_use_opened_mdb(self):
         if not self.mdb:
-            QMessageBox.information(self, "Scan MDB", "Open a Master Database in the Library first, or use Browse… to choose another MDB.")
+            QMessageBox.information(self, "Scan Master Database", "Open a Master Database in the Library first, or use Browse… to choose another one.")
             return
         self.scan_mdb_path = str(self.mdb.path.resolve())
         self.scan_mdb_edit.setText(self.scan_mdb_path)
@@ -9492,7 +11022,13 @@ class MainWindow(QMainWindow):
     def _update_scan_start_state(self):
         if not hasattr(self, "scan_start_btn"):
             return
-        running = self.scan_process is not None and self.scan_process.state() != QProcess.NotRunning
+        running = (
+            (self.scan_process is not None and self.scan_process.state() != QProcess.NotRunning)
+            or (
+                self.performance_refresh_process is not None
+                and self.performance_refresh_process.state() != QProcess.NotRunning
+            )
+        )
         source_ok = bool(self.scan_source_path and Path(self.scan_source_path).is_dir())
         mdb_ok = bool(self.scan_mdb_path and Path(self.scan_mdb_path).is_file() and self.scan_mdb_path.lower().endswith(".xlsx"))
         routing_ok = bool(self.routing_preview_root and Path(self.routing_preview_root).is_dir())
@@ -9544,18 +11080,18 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(
                 self,
-                "MDB compatibility check failed",
-                "CAS Curator could not inspect this Master Database safely.\n\n"
-                f"MDB:\n{target}\n\nError:\n{exc}",
+                "Master Database compatibility check failed",
+                "CAS Curator could not check this Master Database before scanning. Nothing was changed.\n\n"
+                f"Master Database:\n{target}\n\nDetails:\n{exc}",
             )
             return False
 
         if report.error:
             QMessageBox.critical(
                 self,
-                "MDB compatibility check failed",
-                "CAS Curator could not verify this Master Database before Scan.\n\n"
-                f"MDB:\n{target}\n\n{report.error}",
+                "Master Database compatibility check failed",
+                "CAS Curator could not confirm that this Master Database is ready for scanning. Nothing was changed.\n\n"
+                f"Master Database:\n{target}\n\nDetails:\n{report.error}",
             )
             return False
         if not report.needs_compatible_copy:
@@ -9563,8 +11099,8 @@ class MainWindow(QMainWindow):
 
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Warning)
-        msg.setWindowTitle("MDB compatibility issue")
-        msg.setText("This Master Database contains spreadsheet-specific metadata that prevents the scanner from opening it.")
+        msg.setWindowTitle("Master Database needs a compatible copy")
+        msg.setText("This Master Database was saved with spreadsheet features that the scanner cannot open directly.")
         details = [
             f"Scanner-blocking fill-style extensions: {report.patternfill_extlst_count:,}",
             f"Scanner-blocking data-validation attributes: {report.data_validation_view_count:,}",
@@ -9572,11 +11108,9 @@ class MainWindow(QMainWindow):
         if report.vendor_extlst_count:
             details.append(f"Spreadsheet-app extension blocks in the workbook: {report.vendor_extlst_count:,}")
         msg.setInformativeText(
-            "\n".join(details)
-            + "\n\nCAS Curator can create a separate scanner-compatible copy beside the original MDB. "
-              "The original workbook will NOT be changed. The copy removes spreadsheet-app-specific extension blocks that openpyxl cannot preserve, plus the known attributes that block the scanner from opening the workbook, then CAS Curator verifies the copy before using it.\n\n"
-              "Keep the original workbook if you rely on application-specific spreadsheet metadata. Standard workbook data remains in the compatible copy.\n\n"
-              "Create a compatible copy now?"
+            "CAS Curator can create a separate compatible copy beside the original. Your original Master Database will not be changed.\n\n"
+            "The copy keeps the normal workbook data needed by CAS Curator while removing spreadsheet-specific information that prevents scanning.\n\n"
+            "Create a compatible copy now?"
         )
         create_btn = msg.addButton("Create compatible copy…", QMessageBox.ButtonRole.AcceptRole)
         cancel_btn = msg.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
@@ -9592,9 +11126,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(
                 self,
-                "Could not create compatible MDB copy",
-                "The original MDB was left untouched.\n\n"
-                f"MDB:\n{target}\n\nError:\n{exc}",
+                "Could not create compatible Master Database copy",
+                "The original Master Database was left unchanged.\n\n"
+                f"Master Database:\n{target}\n\nDetails:\n{exc}",
             )
             return False
         finally:
@@ -9612,7 +11146,7 @@ class MainWindow(QMainWindow):
                 pass
             QMessageBox.critical(
                 self,
-                "Could not verify compatible MDB copy",
+                "Could not verify compatible Master Database copy",
                 "CAS Curator created the temporary compatible copy but could not verify it because the scanner's Python 3.8 runtime is unavailable. "
                 "The compatible copy was removed and the original MDB was left untouched.\n\n"
                 + python38_error,
@@ -9640,7 +11174,7 @@ class MainWindow(QMainWindow):
                 pass
             QMessageBox.critical(
                 self,
-                "Could not verify compatible MDB copy",
+                "Could not verify compatible Master Database copy",
                 "Verification could not be completed. The compatible copy was removed and the original MDB was left untouched.\n\n"
                 f"Error:\n{exc}",
             )
@@ -9653,7 +11187,7 @@ class MainWindow(QMainWindow):
                 pass
             QMessageBox.critical(
                 self,
-                "Compatible MDB verification failed",
+                "Compatible Master Database check failed",
                 "CAS Curator did not switch to the copy because the scanner's Excel library still could not open it. "
                 "The failed copy was removed and the original MDB was left untouched.\n\n"
                 f"Details:\n{detail[-4000:]}",
@@ -9675,10 +11209,8 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "Compatible MDB copy created",
-            "The original MDB was not changed.\n\n"
+            "CAS Curator created a compatible copy and left your original Master Database unchanged.\n\n"
             f"Compatible copy:\n{compatible}\n\n"
-            f"Removed spreadsheet-app extension blocks from the copy: {result.removed_vendor_extlst:,}\n"
-            f"Removed blocking data-validation attributes: {result.removed_data_validation_view:,}\n\n"
             + message_tail,
         )
         self.scan_log.appendPlainText(
@@ -9774,7 +11306,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "ZIP extraction blocked",
-                "No ZIPs were extracted. CAS Curator found a safety/integrity problem during preflight:\n\n"
+                "CAS Curator found a problem before extraction, so no ZIP files were extracted:\n\n"
                 f"{exc}\n\n"
                 "Fix/remove the affected archive, or run Scan again and choose Keep ZIPs packed.",
             )
@@ -9840,7 +11372,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "Sims3Pack analysis blocked",
-                "CAS Curator could not hash the existing standalone packages safely. No Sims3Packs were changed.\n\n"
+                "CAS Curator could not verify the existing standalone package files, so no Sims3Packs were changed.\n\n"
                 f"Error:\n{exc}",
             )
             return None
@@ -10322,7 +11854,7 @@ class MainWindow(QMainWindow):
                     self,
                     "MDB backup failed",
                     "The scan was NOT started because the safety backup could not be created.\n\n"
-                    f"MDB:\n{target}\n\nError:\n{exc}",
+                    f"Master Database:\n{target}\n\nDetails:\n{exc}",
                 )
                 return
 
@@ -10351,13 +11883,13 @@ class MainWindow(QMainWindow):
         self.scan_log.clear()
         if IS_PUBLIC_BUILD:
             self.scan_log.appendPlainText(
-                "CAS CURATOR - CONSERVATIVE CAS SCANNER\n\n"
-                "This release reads direct CASP metadata and GEOM face counts. Filenames are never used to classify supported content types.\n"
-                "Run Scan generates CASP IDs, supported CC Type and Highest Polys, extracts dedicated THUM previews when available, and records package hash/scan time.\n"
-                "Whether a package contains or overlaps with EA resources is not assessed. Skin type, general IMG texture purpose, script/gameplay and Health/Risk are not supported scan results.\n"
+                "CAS CURATOR - CAS SCANNER\n\n"
+                "CAS Curator reads supported information directly from package resources. Filenames are not used as evidence for supported classifications.\n"
+                "Run Scan records supported package information including CASP IDs, CC Type, Highest Polys, Health Status, Performance Risk information, thumbnails when available, package hash and scan time.\n"
+                "Some Experimental classifications use additional clues and are clearly marked for review.\n"
                 "Run Scan creates a mandatory MDB backup before scanner writes.\n"
                 "Preview Routing before any move. Run Routing requires explicit acknowledgement and creates a recovery manifest.\n\n"
-                "Experimental features can display provisional information for review, but they never control Routing automatically.\n"
+                "Experimental information is for review and does not control normal Routing automatically.\n"
             )
         if real_routing:
             self.scan_log.appendPlainText("STARTING ROUTING")
@@ -10370,6 +11902,13 @@ class MainWindow(QMainWindow):
         if not IS_PUBLIC_BUILD:
             self.scan_log.appendPlainText(f"Mode: {self._scan_mode_code()}")
         self.scan_log.appendPlainText(f"Python 3.8: {python38}")
+        if not real_routing and not preview_routing:
+            report_enabled = True
+            if hasattr(self, "create_scan_report_action"):
+                report_enabled = bool(self.create_scan_report_action.isChecked())
+            self.scan_log.appendPlainText(
+                "Optional Health Scan Report: " + ("ON" if report_enabled else "OFF — MDB data is still saved")
+            )
         self.scan_log.appendPlainText("Launch method: direct process (no cmd.exe / batch wrapper)")
         if self.last_scan_backup_path:
             self.scan_log.appendPlainText(f"MDB safety backup: {self.last_scan_backup_path}")
@@ -10426,12 +11965,17 @@ class MainWindow(QMainWindow):
         proc.errorOccurred.connect(self._scan_process_error)
         proc.setWorkingDirectory(str(Path(__file__).resolve().parent))
 
+        create_scan_report = True
+        if hasattr(self, "create_scan_report_action"):
+            create_scan_report = bool(self.create_scan_report_action.isChecked())
+
         args = [
             "-u", str(runner_py),
             "--source", str(source),
             "--mdb", str(target),
             "--mode", self._scan_mode_code(),
             "--edition", APP_EDITION,
+            "--create-report", "1" if create_scan_report else "0",
         ]
         if preview_routing:
             preview_workdir = Path(__file__).resolve().parent / "routing_preview_runs"
@@ -10453,6 +11997,862 @@ class MainWindow(QMainWindow):
             self.real_routing_btn.setEnabled(False)
         self.scan_cancel_btn.setEnabled(False)
         proc.start(str(python38), args)
+
+
+    def _performance_score_version_is_current(self) -> bool:
+        if not self.mdb:
+            return True
+        metadata = getattr(self.mdb, "metadata", {}) or {}
+        stored = str(metadata.get(PERFORMANCE_SCORE_VERSION_METADATA_KEY, "") or "").strip()
+        return stored == CURRENT_PERFORMANCE_SCORE_VERSION
+
+    def _performance_report_setting_key(self) -> str:
+        if not self.mdb:
+            return "performance_refresh_report/none"
+        identity = str(Path(self.mdb.path).resolve()).casefold().encode("utf-8", errors="ignore")
+        return "performance_refresh_report/" + hashlib.sha1(identity).hexdigest()
+
+    def _remember_performance_report(self, report_path: str):
+        path = str(report_path or "").strip()
+        if not path or not self.mdb:
+            return
+        self.settings.setValue(self._performance_report_setting_key(), path)
+        self.settings.sync()
+
+    def _find_automatic_performance_report(self) -> str:
+        """Return one safely remembered/nearby Health_Scan_Report.xlsx, or blank if ambiguous."""
+        if not self.mdb:
+            return ""
+        candidates = []
+        remembered = str(self.settings.value(self._performance_report_setting_key(), "") or "").strip()
+        if remembered and Path(remembered).is_file():
+            return str(Path(remembered).resolve())
+
+        parent = Path(self.mdb.path).resolve().parent
+        direct = parent / "Health_Scan_Report.xlsx"
+        if direct.is_file():
+            candidates.append(direct)
+        try:
+            candidates.extend(path for path in parent.glob("*/Health_Scan_Report.xlsx") if path.is_file())
+        except OSError:
+            pass
+
+        unique = []
+        seen = set()
+        for path in candidates:
+            try:
+                resolved = path.resolve()
+            except OSError:
+                resolved = path.absolute()
+            key = os.path.normcase(str(resolved)).casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(resolved)
+        if len(unique) == 1:
+            self._remember_performance_report(str(unique[0]))
+            return str(unique[0])
+        return ""
+
+    def _maybe_offer_performance_score_update(self):
+        if not self.mdb or not self.mdb.records or self._performance_score_version_is_current():
+            return
+        path_key = os.path.normcase(str(Path(self.mdb.path).resolve())).casefold()
+        prompt_key = path_key + "|" + CURRENT_PERFORMANCE_SCORE_VERSION
+        if prompt_key in self._performance_score_prompted_paths:
+            return
+        self._performance_score_prompted_paths.add(prompt_key)
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Performance Score update available")
+        box.setIcon(QMessageBox.Information)
+        box.setText("The most recent CAS Curator update includes a more accurate Performance Risk Score model.")
+        box.setInformativeText(
+            "This may change the Performance Score shown for some packages, so we recommend refreshing "
+            "your Library's Performance Scores.\n\n"
+            "Your existing scan data and Health Status remain valid. No full rescan is required.\n\n"
+            "CAS Curator can update the scores automatically using your existing Health Scan Report or the "
+            "package locations it already knows.\n\n"
+            "You'll see a preview before anything is changed."
+        )
+        update_button = box.addButton("Update Scores Now", QMessageBox.AcceptRole)
+        later_button = box.addButton("Later", QMessageBox.RejectRole)
+        box.setDefaultButton(update_button)
+        box.exec()
+        if box.clickedButton() == update_button:
+            # Do not launch another modal/progress workflow while this startup
+            # QMessageBox is still unwinding. Frozen Qt builds can lose the
+            # follow-up UI in that nested close path. Return to the event loop
+            # first, then start the refresh.
+            QTimer.singleShot(150, lambda: self._refresh_performance_scores(auto_update=True))
+
+    def _refresh_performance_scores(self, auto_update: bool = False):
+        """Recalculate advisory performance fields without a full scanner pass."""
+        if not self.mdb:
+            QMessageBox.information(
+                self,
+                "Refresh Performance Scores",
+                "Open a Master Database in Library first.",
+            )
+            return
+        if self.scan_process is not None and self.scan_process.state() != QProcess.NotRunning:
+            QMessageBox.warning(
+                self,
+                "Refresh Performance Scores",
+                "A Scan or Routing process is already running. Finish or cancel it first.",
+            )
+            return
+        if self.performance_refresh_process is not None and self.performance_refresh_process.state() != QProcess.NotRunning:
+            QMessageBox.information(
+                self,
+                "Refresh Performance Scores",
+                "A Performance Score refresh is already running.",
+            )
+            return
+        if not self._confirm_pending_changes():
+            return
+
+        total_rows = len(self.model.records)
+        if total_rows <= 0:
+            QMessageBox.information(
+                self, "Refresh Performance Scores", "The current Master Database has no package rows."
+            )
+            return
+
+        selected_rows = sorted(set(self._selected_source_rows()))
+        scope_rows = list(range(total_rows))
+        if not auto_update:
+            if selected_rows and len(selected_rows) < total_rows:
+                box = QMessageBox(self)
+                box.setWindowTitle("Refresh Performance Scores")
+                box.setIcon(QMessageBox.Question)
+                box.setText("Which packages should be refreshed?")
+                box.setInformativeText(
+                    "This is not a full rescan. CAS Curator verifies each package against its stored Package Hash, "
+                    "reads only texture dimensions and GEOM byte size, then recalculates the advisory score using "
+                    "the stored CC Type and Highest Polys. Health Status, classification and Routing are not changed."
+                )
+                selected_button = box.addButton(
+                    f"Selected packages ({len(selected_rows):,})", QMessageBox.AcceptRole
+                )
+                all_button = box.addButton(
+                    f"Entire Library ({total_rows:,})", QMessageBox.ActionRole
+                )
+                cancel_button = box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(all_button)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked == cancel_button:
+                    return
+                if clicked == selected_button:
+                    scope_rows = selected_rows
+            else:
+                box = QMessageBox(self)
+                box.setWindowTitle("Refresh Performance Scores")
+                box.setIcon(QMessageBox.Question)
+                box.setText(f"Refresh Performance Scores for {total_rows:,} package(s)?")
+                box.setInformativeText(
+                    "This is a lightweight performance-only refresh, not a full health rescan. "
+                    "CAS Curator verifies package identity, reads only texture dimensions and GEOM byte size, "
+                    "and leaves Health Status, classification, thumbnails and Routing untouched.\n\n"
+                    "A preview of changed/skipped scores is shown before anything is written to the MDB."
+                )
+                box.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+                box.setDefaultButton(QMessageBox.Yes)
+                if box.exec() != QMessageBox.Yes:
+                    return
+
+        performance_worker_exe = None
+        python38 = None
+        if getattr(sys, "frozen", False):
+            performance_worker_exe = (
+                Path(sys.executable).resolve().parent
+                / "scanner"
+                / "CASCurator_PerformanceRefresh.exe"
+            )
+            if not performance_worker_exe.is_file():
+                QMessageBox.critical(
+                    self,
+                    "Refresh Performance Scores",
+                    "The bundled Performance Score refresh worker is missing, so the refresh could not start.\n\n"
+                    "Nothing was changed.\n\nDetails:\n" + str(performance_worker_exe),
+                )
+                return
+        else:
+            python38, python_error = self._resolve_scanner_python38()
+            if python38 is None:
+                QMessageBox.warning(self, "Refresh Performance Scores", python_error)
+                return
+
+        items = []
+        for source_row in scope_rows:
+            rec = self.model.record(source_row)
+            if not rec:
+                continue
+            try:
+                excel_row = int(rec.get("_ExcelRow", "0") or 0)
+            except (TypeError, ValueError):
+                excel_row = 0
+            if excel_row <= 1:
+                continue
+
+            package_name = str(rec.get("Package", "") or "").strip()
+            location_name = self.model.effective_value(source_row, "File Location").strip()
+            location_path = self._file_location_path_for_name(location_name) if location_name else ""
+            original_paths = [
+                line.strip()
+                for line in str(rec.get("Original Source Path", "") or "").splitlines()
+                if line.strip()
+            ]
+
+            mixed_types = []
+            seen_types = set()
+            if str(rec.get("CC Type", "") or "").strip() == "Mixed CAS":
+                observations = self.mdb.casp_observations_by_package.get(package_name.casefold(), [])
+                for observation in observations:
+                    cc_type = str(observation.get("CC Type", "") or "").strip()
+                    key = cc_type.casefold()
+                    if cc_type and key not in seen_types and cc_type != "Mixed CAS":
+                        seen_types.add(key)
+                        mixed_types.append(cc_type)
+
+            items.append({
+                "source_row": source_row,
+                "excel_row": excel_row,
+                "package": package_name,
+                "package_hash": str(rec.get("Package Hash", "") or "").strip(),
+                "file_location_path": str(location_path or ""),
+                "original_source_paths": original_paths,
+                "cc_type": str(rec.get("CC Type", "") or "").strip(),
+                "highest_polys": str(rec.get("Highest Polys", "") or ""),
+                "mixed_casp_types": mixed_types,
+                "performance_data_version": str(rec.get("Performance Data Version", "") or ""),
+                "mdb_measurements": {
+                    "texture_resolutions": str(rec.get("Texture Resolutions", "") or ""),
+                    "geom_total_bytes": str(rec.get("GEOM Total Bytes", "") or ""),
+                    "fourk_texture_count": str(rec.get("4K Texture Count", "") or ""),
+                    "biggest_texture": str(rec.get("Biggest Texture", "") or ""),
+                },
+                "old": {
+                    "Risk": str(rec.get("Risk", "") or ""),
+                    "Risk Score": str(rec.get("Risk Score", "") or ""),
+                    "HQ Warning": str(rec.get("HQ Warning", "") or ""),
+                    "Poly Warning": str(rec.get("Poly Warning", "") or ""),
+                    "Biggest Texture": str(rec.get("Biggest Texture", "") or ""),
+                },
+            })
+
+        if not items:
+            QMessageBox.information(
+                self, "Refresh Performance Scores", "No usable package records were found in this scope."
+            )
+            return
+
+        # All currently configured managed File Locations are available as a
+        # hash-verified fallback. This is especially important for libraries that
+        # were already routed by CAS Curator: post-routing tracking records the
+        # exact current folder in the MDB, so users do not need to restore files
+        # to their pre-routing locations just to refresh an advisory score.
+        managed_search_roots = []
+        seen_managed_roots = set()
+        for _location_name, raw_path in self.file_location_registry_current:
+            raw_path = str(raw_path or "").strip()
+            if not raw_path:
+                continue
+            try:
+                path = Path(raw_path).resolve()
+            except Exception:
+                path = Path(raw_path).absolute()
+            key = os.path.normcase(str(path)).casefold()
+            if key in seen_managed_roots or not path.is_dir():
+                continue
+            seen_managed_roots.add(key)
+            managed_search_roots.append(str(path))
+
+        health_scan_report_path = ""
+        health_scan_report_optional = False
+        fallback_search_roots = []
+
+        has_direct_location = any(
+            str(item.get("file_location_path", "") or "").strip()
+            or (item.get("original_source_paths") or [])
+            for item in items
+        )
+        has_tracked_sources = bool(has_direct_location or managed_search_roots)
+        all_have_mdb_performance_data = bool(items) and all(
+            str(item.get("performance_data_version", "") or "").strip() == "1"
+            for item in items
+        )
+
+        if auto_update:
+            # Current-model scans keep the measurements needed for future score
+            # recalculation directly in the MDB. Older rows may still need the
+            # historical report or a hash-verified physical-package fallback.
+            if all_have_mdb_performance_data:
+                health_scan_report_path = ""
+            else:
+                health_scan_report_path = self._find_automatic_performance_report()
+            if health_scan_report_path:
+                # Automatic discovery is intentionally non-fatal: if this remembered/nearby
+                # report is stale or incompatible, the worker falls back to hash-verified
+                # tracked package locations instead of blocking the update.
+                health_scan_report_optional = True
+            elif not has_tracked_sources and not all_have_mdb_performance_data:
+                auto_update = False
+
+        if not auto_update and not all_have_mdb_performance_data:
+            source_box = QMessageBox(self)
+            source_box.setWindowTitle("Refresh Performance Scores")
+            source_box.setIcon(QMessageBox.Question)
+            source_box.setText("Choose the best available refresh source")
+            source_box.setInformativeText(
+                "CAS Curator will use the information already stored in your Master Database whenever possible.\n\n"
+                "For older packages, the easiest fallback is the Health Scan Report created by the original scan.\n\n"
+                "If that report is gone, choose Tracked Package Locations. CAS Curator will look in the package locations it already knows and verify that it found the correct files.\n\n"
+                "Choose Package Folder only if the report and tracked locations cannot find the packages."
+            )
+            report_button = source_box.addButton("Use Health Scan Report…", QMessageBox.AcceptRole)
+            tracked_button = source_box.addButton("Use Tracked Package Locations", QMessageBox.ActionRole)
+            folder_button = source_box.addButton("Choose Package Folder…", QMessageBox.ActionRole)
+            source_cancel_button = source_box.addButton(QMessageBox.Cancel)
+            source_box.setDefaultButton(report_button)
+            source_box.exec()
+            source_clicked = source_box.clickedButton()
+            if source_clicked == source_cancel_button:
+                return
+            if source_clicked == report_button:
+                start_dir = (
+                    str(Path(self.mdb.path).parent)
+                    if self.mdb and getattr(self.mdb, "path", None)
+                    else str(Path.home())
+                )
+                report_path, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Choose Health_Scan_Report.xlsx",
+                    start_dir,
+                    "Excel Workbooks (*.xlsx);;All Files (*.*)",
+                )
+                if not report_path:
+                    return
+                health_scan_report_path = str(Path(report_path).resolve())
+                self._remember_performance_report(health_scan_report_path)
+            elif source_clicked == folder_button:
+                start = (
+                    self.scan_source_path
+                    if self.scan_source_path and Path(self.scan_source_path).is_dir()
+                    else str(Path.home())
+                )
+                root = QFileDialog.getExistingDirectory(
+                    self,
+                    "Choose the root folder containing your Sims 3 package files",
+                    start,
+                )
+                if not root:
+                    return
+                fallback_search_roots.append(str(Path(root).resolve()))
+            elif source_clicked == tracked_button:
+                if not has_tracked_sources:
+                    path_box = QMessageBox(self)
+                    path_box.setWindowTitle("No tracked package locations available")
+                    path_box.setIcon(QMessageBox.Information)
+                    path_box.setText("CAS Curator does not have a usable saved location for these packages.")
+                    path_box.setInformativeText(
+                        "Choose the main folder containing these package files. CAS Curator will search it once and verify that each file is the correct package."
+                    )
+                    choose_root_btn = path_box.addButton("Choose Package Folder…", QMessageBox.AcceptRole)
+                    cancel_btn = path_box.addButton(QMessageBox.Cancel)
+                    path_box.setDefaultButton(choose_root_btn)
+                    path_box.exec()
+                    if path_box.clickedButton() == cancel_btn:
+                        return
+                    root = QFileDialog.getExistingDirectory(
+                        self,
+                        "Choose the root folder containing your Sims 3 package files",
+                        str(Path.home()),
+                    )
+                    if not root:
+                        return
+                    fallback_search_roots.append(str(Path(root).resolve()))
+        temp_dir = Path(tempfile.mkdtemp(prefix="cas_curator_performance_refresh_"))
+        manifest_path = temp_dir / "manifest.json"
+        result_path = temp_dir / "results.json"
+        manifest_path.write_text(
+            json.dumps(
+                {
+                    "items": items,
+                    "managed_search_roots": managed_search_roots,
+                    "fallback_search_roots": fallback_search_roots,
+                    "health_scan_report_path": health_scan_report_path,
+                    "health_scan_report_optional": health_scan_report_optional,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+
+        worker_path = None
+        if not getattr(sys, "frozen", False):
+            worker_path = Path(__file__).resolve().parent / "performance_score_refresh.py"
+            if not worker_path.is_file():
+                shutil.rmtree(temp_dir, ignore_errors=True)
+                QMessageBox.critical(
+                    self,
+                    "Refresh Performance Scores",
+                    "A file needed to refresh Performance Scores is missing, so the refresh could not start.\n\nNothing was changed.\n\nDetails:\n\n" + str(worker_path),
+                )
+                return
+
+        self.performance_refresh_context = {
+            "temp_dir": temp_dir,
+            "manifest_path": manifest_path,
+            "result_path": result_path,
+            "scope_count": len(items),
+            "full_library_scope": len(scope_rows) == total_rows and len(items) == total_rows,
+            "auto_update": bool(auto_update),
+        }
+        self._performance_refresh_output_buffer = ""
+
+        progress = QProgressDialog(
+            "Preparing Performance Score refresh…",
+            "Cancel",
+            0,
+            len(items),
+            self,
+        )
+        progress.setWindowTitle("Refresh Performance Scores")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.canceled.connect(self._cancel_performance_score_refresh)
+        self.performance_refresh_progress = progress
+
+        proc = QProcess(self)
+        self.performance_refresh_process = proc
+        proc.setProcessChannelMode(QProcess.MergedChannels)
+        proc.setWorkingDirectory(str(Path(__file__).resolve().parent))
+        proc.readyReadStandardOutput.connect(self._performance_refresh_read_output)
+        proc.finished.connect(self._performance_refresh_finished)
+        proc.errorOccurred.connect(self._performance_refresh_process_error)
+
+        if getattr(sys, "frozen", False):
+            args = [
+                "--manifest", str(manifest_path),
+                "--result", str(result_path),
+            ]
+            command = str(performance_worker_exe)
+        else:
+            args = [
+                "-u",
+                str(worker_path),
+                "--manifest",
+                str(manifest_path),
+                "--result",
+                str(result_path),
+            ]
+            command = str(python38)
+        self.statusBar().showMessage(
+            f"Refreshing Performance Scores for {len(items):,} package(s)…"
+        )
+        progress.show()
+        proc.start(command, args)
+
+    def _performance_refresh_read_output(self):
+        proc = self.performance_refresh_process
+        if proc is None:
+            return
+        raw = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not raw:
+            return
+        self.performance_refresh_context["worker_output"] = (
+            str(self.performance_refresh_context.get("worker_output", "") or "") + raw
+        )[-12000:]
+        self._performance_refresh_output_buffer += raw.replace("\r\n", "\n").replace("\r", "\n")
+        while "\n" in self._performance_refresh_output_buffer:
+            line, self._performance_refresh_output_buffer = self._performance_refresh_output_buffer.split("\n", 1)
+            self._handle_performance_refresh_line(line.strip())
+
+    def _handle_performance_refresh_line(self, line: str):
+        if not line:
+            return
+        if line.startswith("PROGRESS|"):
+            parts = line.split("|", 3)
+            if len(parts) >= 4:
+                try:
+                    current = int(parts[1])
+                    total = int(parts[2])
+                except ValueError:
+                    return
+                package_name = parts[3]
+                progress = self.performance_refresh_progress
+                if progress is not None:
+                    progress.setMaximum(max(total, 1))
+                    progress.setValue(min(current, total))
+                    progress.setLabelText(
+                        f"Reading performance data…\n{current:,} / {total:,}\n{package_name}"
+                    )
+
+    def _cancel_performance_score_refresh(self):
+        self.performance_refresh_context["cancelled"] = True
+        proc = self.performance_refresh_process
+        if proc is not None and proc.state() != QProcess.NotRunning:
+            proc.kill()
+        self.statusBar().showMessage("Performance Score refresh cancelled — MDB unchanged", 5000)
+
+    def _performance_refresh_process_error(self, _error):
+        proc = self.performance_refresh_process
+        if proc is None:
+            return
+        self.statusBar().showMessage(
+            "Performance Score refresh process error: " + proc.errorString(),
+            7000,
+        )
+
+    def _performance_refresh_finished(self, exit_code: int, _exit_status):
+        proc = self.performance_refresh_process
+        if proc is not None:
+            raw = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
+            if raw:
+                self.performance_refresh_context["worker_output"] = (
+                    str(self.performance_refresh_context.get("worker_output", "") or "") + raw
+                )[-12000:]
+                self._performance_refresh_output_buffer += raw.replace("\r\n", "\n").replace("\r", "\n")
+            if self._performance_refresh_output_buffer.strip():
+                for line in self._performance_refresh_output_buffer.split("\n"):
+                    self._handle_performance_refresh_line(line.strip())
+        self._performance_refresh_output_buffer = ""
+
+        progress = self.performance_refresh_progress
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+        self.performance_refresh_progress = None
+
+        if proc is not None:
+            proc.deleteLater()
+        self.performance_refresh_process = None
+
+        context = dict(self.performance_refresh_context or {})
+        result_path = Path(context.get("result_path", ""))
+        if not result_path.is_file():
+            cancelled = bool(context.get("cancelled"))
+            captured_output = str(context.get("worker_output", "") or "").strip()
+            self._cleanup_performance_refresh_temp()
+            if not cancelled:
+                details = f"Worker exit code: {exit_code}"
+                if captured_output:
+                    details += "\n\nWorker output:\n" + captured_output[-4000:]
+                QMessageBox.warning(
+                    self,
+                    "Refresh Performance Scores",
+                    "CAS Curator could not finish checking the Performance Scores. No changes were made.\n\n" + details,
+                )
+            return
+
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            self._cleanup_performance_refresh_temp()
+            QMessageBox.critical(
+                self,
+                "Refresh Performance Scores",
+                f"CAS Curator could not finish the Performance Score refresh. No changes were made.\n\nDetails:\n{exc}",
+            )
+            return
+
+        fatal_error = str(payload.get("fatal_error", "") or "").strip()
+        if fatal_error:
+            self._cleanup_performance_refresh_temp()
+            QMessageBox.critical(
+                self,
+                "Refresh Performance Scores",
+                fatal_error + "\n\nNo MDB values were changed.",
+            )
+            return
+
+        results = list(payload.get("results") or [])
+        changed = [item for item in results if item.get("status") == "changed"]
+        skipped = [item for item in results if item.get("status") == "skipped"]
+        backfill = [
+            item for item in results
+            if item.get("status") != "skipped" and bool(item.get("backfill_required"))
+        ]
+        would_update = [
+            item for item in results
+            if item.get("status") != "skipped"
+            and (item.get("status") == "changed" or bool(item.get("backfill_required")))
+        ]
+        already_current = [
+            item for item in results
+            if item.get("status") == "unchanged" and not bool(item.get("backfill_required"))
+        ]
+        version_is_old = not self._performance_score_version_is_current()
+        mark_version_current = bool(
+            version_is_old
+            and context.get("full_library_scope")
+            and len(results) == int(context.get("scope_count", 0) or 0)
+            and not skipped
+        )
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Performance Score Refresh Preview")
+        box.setIcon(QMessageBox.Information if not skipped else QMessageBox.Warning)
+        box.setText(
+            f"Checked: {len(results):,}\n"
+            f"Would update: {len(would_update):,}\n"
+            f"Performance Scores changing: {len(changed):,}\n"
+            f"Performance data being saved to the Master Database: {len(backfill):,}\n"
+            f"Already current: {len(already_current):,}\n"
+            f"Skipped: {len(skipped):,}"
+        )
+        version_note = (
+            f"\n\nBecause the entire Library was checked successfully, CAS Curator will also mark these Performance Scores as up to date."
+            if mark_version_current else ""
+        )
+        if changed and backfill:
+            action_note = (
+                "Some Performance Scores will change. CAS Curator will also save the measurements used for future "
+                "Performance Score updates directly in the Master Database. Nothing will be saved until you choose Apply Updates."
+            )
+        elif changed:
+            action_note = "Nothing will be changed until you choose Apply Updates."
+        elif backfill:
+            action_note = (
+                "The Performance Scores themselves are already current. CAS Curator can save the measurements used "
+                "for future Performance Score updates directly in the Master Database, so these packages will no longer "
+                "depend on the old scan report. Nothing will be saved until you choose Apply Updates."
+            )
+        elif mark_version_current:
+            action_note = (
+                "No Performance Score values need changing. Nothing will be saved until you choose Confirm Scores Are Current."
+            )
+        elif skipped:
+            skipped_count = len(skipped)
+            package_word = "package" if skipped_count == 1 else "packages"
+            if already_current:
+                action_note = (
+                    "No changes were needed for the packages that could be checked.\n\n"
+                    f"{skipped_count:,} {package_word} could not be updated because no compatible "
+                    "Health Scan Report data or matching package file was found in the expected locations."
+                )
+            else:
+                action_note = (
+                    f"{skipped_count:,} {package_word} could not be updated because no compatible "
+                    "Health Scan Report data or matching package file was found in the expected locations."
+                )
+        else:
+            action_note = "No Performance Score changes were found to apply."
+
+        if changed:
+            informative_text = (
+                action_note + version_note + "\n\n"
+                "Only Performance Score information and the measurements used to calculate it will change. "
+                "Health Status, classification, scan dates, Routing and the rest of your Library data will stay unchanged."
+            )
+        else:
+            informative_text = action_note + version_note
+        box.setInformativeText(informative_text)
+
+        details = []
+        for item in changed[:200]:
+            old = item.get("old") or {}
+            new = item.get("new") or {}
+            details.append(
+                "CHANGED: {package}\n"
+                "  Source: {source}\n"
+                "  Performance Score: {old_score} {old_risk} -> {new_score} {new_risk}\n"
+                "  HQ: {old_hq} -> {new_hq} | Poly: {old_poly} -> {new_poly}\n".format(
+                    package=item.get("package", ""),
+                    source=item.get("source", "") or "Unknown",
+                    old_score=old.get("Risk Score", "") or "(blank)",
+                    old_risk=old.get("Risk", "") or "",
+                    new_score=new.get("Risk Score", "") or "(blank)",
+                    new_risk=new.get("Risk", "") or "",
+                    old_hq=old.get("HQ Warning", "") or "(blank)",
+                    new_hq=new.get("HQ Warning", "") or "(blank)",
+                    old_poly=old.get("Poly Warning", "") or "(blank)",
+                    new_poly=new.get("Poly Warning", "") or "(blank)",
+                )
+            )
+        for item in skipped[:100]:
+            raw_error = str(item.get("error", "") or "")
+            if (
+                "Could not locate the original package" in raw_error
+                or "No usable refresh source was available" in raw_error
+                or "Health Scan Report not found" in raw_error
+            ):
+                display_error = (
+                    "No compatible Health Scan Report data or matching package file was found "
+                    "in the expected locations, so this Performance Score could not be updated."
+                )
+            else:
+                display_error = raw_error or "Could not refresh this package."
+            details.append(
+                "SKIPPED: {package}\n  {error}\n".format(
+                    package=item.get("package", ""),
+                    error=display_error,
+                )
+            )
+        if len(changed) > 200 or len(skipped) > 100:
+            details.append(
+                "...preview shortened; all successful changed rows will still be applied if you continue."
+            )
+        if details:
+            box.setDetailedText("\n".join(details))
+
+        apply_button = None
+        if would_update or mark_version_current:
+            apply_label = "Apply Updates" if would_update else "Confirm Scores Are Current"
+            apply_button = box.addButton(apply_label, QMessageBox.AcceptRole)
+        close_label = "Close Without Applying" if apply_button is not None else "Close"
+        close_button = box.addButton(close_label, QMessageBox.RejectRole)
+        box.setDefaultButton(apply_button or close_button)
+        box.exec()
+
+        if apply_button is not None and box.clickedButton() == apply_button:
+            self._apply_performance_score_refresh(would_update, mark_version_current=mark_version_current)
+        else:
+            self._cleanup_performance_refresh_temp()
+            self.statusBar().showMessage(
+                "Performance Score refresh preview closed — nothing changed", 5000
+            )
+
+
+    def _apply_performance_score_refresh(self, changed_results, mark_version_current: bool = False):
+        if not self.mdb:
+            self._cleanup_performance_refresh_temp()
+            return
+
+        changes = {}
+        for item in changed_results:
+            try:
+                excel_row = int(item.get("excel_row", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if excel_row <= 1:
+                continue
+            row_changes = {}
+            if item.get("status") == "changed":
+                new_fields = item.get("new") or {}
+                row_changes.update({
+                    field: str(new_fields.get(field, "") or "")
+                    for field in ("Risk", "Risk Score", "HQ Warning", "Poly Warning", "Biggest Texture")
+                })
+            if bool(item.get("backfill_required")):
+                measurement_fields = item.get("measurement_fields") or {}
+                row_changes.update({
+                    field: str(measurement_fields.get(field, "") or "")
+                    for field in (
+                        "Texture Resolutions", "GEOM Total Bytes",
+                        "4K Texture Count", "Performance Data Version",
+                    )
+                })
+            if row_changes:
+                changes[excel_row] = row_changes
+
+        if not changes and not mark_version_current:
+            self._cleanup_performance_refresh_temp()
+            return
+
+        if changes:
+            action_text = f"Applying {len(changes):,} Performance Score update(s)"
+        else:
+            action_text = "Recording the current Performance Score model"
+        self.statusBar().showMessage(action_text + " and creating a Master Database backup…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = MDBWorkbook().save_performance_score_refresh(
+                self.mdb,
+                changes,
+                performance_score_version=(
+                    CURRENT_PERFORMANCE_SCORE_VERSION if mark_version_current else None
+                ),
+            )
+        except WorkbookChangedError as exc:
+            QMessageBox.warning(self, "Master Database changed", "This Master Database changed outside CAS Curator after it was opened. Reload it before saving so newer changes are not overwritten.\n\nDetails:\n" + str(exc))
+            self.statusBar().showMessage("Performance Score update cancelled — reload the Master Database first")
+            return
+        except Exception as exc:
+            QMessageBox.critical(
+                self,
+                "Refresh Performance Scores",
+                f"CAS Curator could not save the refreshed Performance Scores. The original Master Database was left unchanged.\n\nDetails:\n{exc}",
+            )
+            self.statusBar().showMessage("Performance Score update failed — Master Database unchanged")
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._cleanup_performance_refresh_temp()
+
+        if mark_version_current:
+            version_text = f" Performance Score model {CURRENT_PERFORMANCE_SCORE_VERSION} is now current."
+        else:
+            version_text = ""
+        self.statusBar().showMessage(
+            f"Updated {result.changed_rows:,} package record(s).{version_text} Backup: {result.backup_path.name}",
+            12000,
+        )
+
+        message = (
+            f"Updated {result.changed_rows:,} package(s).\n\n"
+            f"Backup created:\n{result.backup_path}\n\n"
+            "Recovered performance measurements are now stored in the Master Database for future score updates. "
+            "Health Status and the rest of the scan data were not changed."
+        )
+
+        def _show_result_then_refresh():
+            try:
+                result_box = QMessageBox(self)
+                result_box.setWindowTitle("Performance Scores Updated")
+                result_box.setIcon(QMessageBox.Information)
+                result_box.setText(message)
+                result_box.setStandardButtons(QMessageBox.Ok)
+                result_box.exec()
+            except Exception:
+                pass
+
+            try:
+                by_excel_row = {}
+                for source_row, rec in enumerate(self.model.records):
+                    try:
+                        excel_row = int(rec.get("_ExcelRow", "0") or 0)
+                    except (TypeError, ValueError):
+                        continue
+                    by_excel_row[excel_row] = (source_row, rec)
+
+                for excel_row, row_changes in changes.items():
+                    target = by_excel_row.get(excel_row)
+                    if not target:
+                        continue
+                    source_row, rec = target
+                    rec.update(row_changes)
+                    self.model.notify_row_changed(source_row)
+
+                self._populate_filters()
+                self._apply_filters()
+                if self.current_source_row is not None:
+                    rec = self.model.record(self.current_source_row)
+                    if rec:
+                        self.show_record(rec)
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Performance Scores Updated",
+                    "The Performance Score update was saved successfully, but the Library view could not refresh automatically. "
+                    "Reopen the Master Database to refresh the view.\n\nDetails:\n" + str(exc),
+                )
+
+        QTimer.singleShot(250, _show_result_then_refresh)
+
+    def _cleanup_performance_refresh_temp(self):
+        context = dict(self.performance_refresh_context or {})
+        temp_dir = context.get("temp_dir")
+        self.performance_refresh_context = {}
+        if temp_dir:
+            try:
+                shutil.rmtree(Path(temp_dir), ignore_errors=True)
+            except Exception:
+                pass
 
     def _resolve_scanner_python38(self):
         """Resolve the real Python 3.8 executable without shell quoting."""
@@ -10807,11 +13207,11 @@ class MainWindow(QMainWindow):
     def _open_scan_backup(self):
         path = self.last_scan_backup_path
         if not path or not path.exists():
-            QMessageBox.information(self, "MDB backup", "No pre-scan MDB backup is available for the latest run.")
+            QMessageBox.information(self, "Scan Backup", "No scan backup is available for the latest run.")
             return
         folder = path.parent
         if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
-            QMessageBox.warning(self, "MDB backup", f"Could not open:\n{folder}")
+            QMessageBox.warning(self, "Scan Backup", f"Could not open:\n{folder}")
 
     def _open_move_manifest(self):
         path = self.last_move_manifest_path
@@ -10908,7 +13308,7 @@ class MainWindow(QMainWindow):
             btn.clicked.connect(self._open_sorted_folder)
             row1.addWidget(btn)
         if self.last_scan_backup_path and self.last_scan_backup_path.exists():
-            btn = QPushButton("Open MDB Backup")
+            btn = QPushButton("Open Scan Backup")
             btn.clicked.connect(self._open_scan_backup)
             row1.addWidget(btn)
         layout.addLayout(row1)
@@ -11254,8 +13654,8 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Recover Last Routing?",
-            "CAS Curator will move the routed files back to their recorded original paths after SHA-256 verification.\n\n"
-            "Nothing will be overwritten. Recovery stops if an original path already exists or a hash differs.\n\n"
+            "CAS Curator will first verify each routed file, then move it back to its recorded original location.\n\n"
+            "Nothing will be overwritten. Recovery stops if an original location is already occupied or the file no longer matches the one CAS Curator routed.\n\n"
             f"Files to recover: {len(verified):,}\n\nContinue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -11457,6 +13857,125 @@ class MainWindow(QMainWindow):
         rec = self.model.record(self.current_source_row)
         self._copy_filename_text(rec.get("Package", ""), self.copy_filename_btn)
 
+    def _casp_observations_for_record(self, rec: Dict[str, str]) -> List[Dict[str, str]]:
+        if not self.mdb:
+            return []
+        by_package = getattr(self.mdb, "casp_observations_by_package", {}) or {}
+        package_key = str(rec.get("Package", "") or "").strip().casefold()
+        direct = list(by_package.get(package_key, []) or [])
+        if direct:
+            return direct
+        wanted = {m.casefold() for m in re.findall(r"0x[0-9a-fA-F]{1,16}", str(rec.get("CASP Instance IDs", "") or ""))}
+        if not wanted:
+            return []
+        linked = []
+        seen = set()
+        for rows in by_package.values():
+            for row in rows or []:
+                instance = str(row.get("CASP Instance", "") or "").strip().casefold()
+                if instance not in wanted:
+                    continue
+                identity = (str(row.get("Package", "") or "").casefold(), instance)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                linked.append(row)
+        return linked
+
+    def _identifier_text_for_source_row(self, source_row: int) -> str:
+        rec = self.model.record(source_row) if self.model else {}
+        if not rec:
+            return ""
+        lines = []
+        package = str(rec.get("Package", "") or "").strip()
+        if package:
+            lines.append(f"Package: {package}")
+        for field in ("Package Hash", "Normalized Package", "CASP Instance IDs"):
+            value = str(rec.get(field, "") or "").strip()
+            if value:
+                lines.append(f"{_display_field_name(field)}: {value}")
+        for field in RESOURCE_IDENTIFIER_FIELDS:
+            if field == "CASP Instance IDs":
+                continue
+            value = str(rec.get(field, "") or "").strip()
+            if value:
+                lines.append(f"{field}: {value}")
+        for field in sorted(rec):
+            key = str(field or "").casefold()
+            if not (key.startswith("broken ") and key.endswith(" ids")):
+                continue
+            value = str(rec.get(field, "") or "").strip()
+            if value:
+                lines.append(f"{field}: {value}")
+        location_name = self.model.effective_value(source_row, "File Location").strip() if self.model else ""
+        if location_name:
+            lines.append(f"Current File Location: {location_name}")
+        source = str(rec.get("Original Source Path", "") or "").strip()
+        if source:
+            lines.append(f"Original Source Path: {source}")
+        return "\n".join(lines)
+
+    def _copy_identifiers_for_source_row(self, source_row: int):
+        text = self._identifier_text_for_source_row(source_row)
+        if not text:
+            self.statusBar().showMessage("No identifiers are available for this package", 3000)
+            return
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage("Copied package/resource identifiers", 3000)
+
+    def _copy_current_identifiers(self):
+        if self.current_source_row is None:
+            self.statusBar().showMessage("Select a package first", 2500)
+            return
+        self._copy_identifiers_for_source_row(self.current_source_row)
+
+    def _copy_current_casp_ids(self):
+        if self.current_source_row is None:
+            self.statusBar().showMessage("Select a package first", 2500)
+            return
+        value = str(self.model.record(self.current_source_row).get("CASP Instance IDs", "") or "").strip()
+        if not value:
+            self.statusBar().showMessage("This package has no stored CASP Instance IDs", 3000)
+            return
+        QApplication.clipboard().setText(value)
+        self.statusBar().showMessage("Copied CASP Instance IDs", 3000)
+
+    def _resolve_package_path_for_source_row(self, source_row: int) -> Path:
+        path, _actual_hash = self._resolve_managed_package_source(source_row)
+        return Path(path)
+
+    def _copy_current_exact_path(self):
+        if self.current_source_row is None:
+            QMessageBox.information(self, "Copy Exact Path", "Select a package first.")
+            return
+        try:
+            path = self._resolve_package_path_for_source_row(self.current_source_row)
+        except Exception as exc:
+            QMessageBox.warning(self, "Copy Exact Path", str(exc))
+            return
+        QApplication.clipboard().setText(str(path))
+        self.statusBar().showMessage(f"Copied exact package path: {path}", 4000)
+
+    def _reveal_package_for_source_row(self, source_row: int) -> bool:
+        try:
+            path = self._resolve_package_path_for_source_row(source_row)
+        except Exception as exc:
+            QMessageBox.warning(self, "Show Package in Explorer", str(exc))
+            return False
+        try:
+            if os.name == "nt":
+                subprocess.Popen(["explorer.exe", "/select,", str(path)])
+                return True
+        except Exception:
+            pass
+        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent.resolve()))))
+
+    def _reveal_current_package(self):
+        if self.current_source_row is None:
+            QMessageBox.information(self, "Show Package in Explorer", "Select a package first.")
+            return
+        self._reveal_package_for_source_row(self.current_source_row)
+
     def _show_table_context_menu(self, pos):
         self._show_library_table_context_menu(self.table, pos)
 
@@ -11480,11 +13999,20 @@ class MainWindow(QMainWindow):
         file_location_name = self.model.effective_value(source_index.row(), "File Location").strip()
         open_location_action = None
         if file_location_name:
-            open_location_action = menu.addAction("Open File Location")
+            open_location_action = menu.addAction(self._tool_icon("SP_DirOpenIcon"), "Open File Location")
+        reveal_package_action = menu.addAction(self._tool_icon("SP_FileDialogContentsView", "SP_DirOpenIcon"), "Show Package in Explorer")
+        reveal_package_action.setToolTip("Resolve the exact original package and verify its Package Hash before revealing it in Explorer.")
+        pinned = self._source_row_is_pinned(source_index.row())
+        pin_action = menu.addAction(self._pin_icon(), "Unpin This Item" if pinned else "Pin This Item")
+        pin_action.setToolTip(
+            "Remove this package from the persistent Pinned strip"
+            if pinned else "Keep this package in the persistent Pinned strip"
+        )
+        copy_identifiers_action = menu.addAction(self._tool_icon("SP_FileDialogInfoView"), "Copy Package Identifiers")
         creator = self.model.effective_value(source_index.row(), "Creator").strip()
-        search_web_action = menu.addAction("Search Web for Package")
+        search_web_action = menu.addAction(self._tool_icon("SP_DriveNetIcon"), "Search Web for Package")
         search_web_action.setEnabled(bool(str(filename or "").strip()))
-        attribution_action = menu.addAction("Find Creator / Converter Online…")
+        attribution_action = menu.addAction(self._tool_icon("SP_DialogHelpButton"), "Find Creator / Converter Online…")
         attribution_action.setToolTip("Open Google directly for this package to help identify its Creator and/or Converter.")
         menu.addSeparator()
         # Reuse the same QAction as Tools > Routing so its icon, enabled state,
@@ -11495,25 +14023,35 @@ class MainWindow(QMainWindow):
         selected_rows = self._selected_source_rows() or [source_index.row()]
         selected_count = len(selected_rows)
         set_creator_action = menu.addAction(
+            self._tool_icon("SP_FileDialogInfoView"),
             "Set Creator…" if selected_count == 1 else f"Set Creator for {selected_count} Selected…"
         )
         move_location_action = menu.addAction(
+            self._tool_icon("SP_ArrowRight"),
             "Move Package to Location…" if selected_count == 1 else f"Move {selected_count} Selected Packages to Location…"
         )
         copy_dropin_action = menu.addAction(
+            self._tool_icon("SP_FileLinkIcon", "SP_ArrowForward"),
             "Copy Package to CC Magic Import…" if selected_count == 1 else f"Copy {selected_count} Selected Packages to CC Magic Import…"
         )
         menu.addSeparator()
-        copy_action = menu.addAction("Copy file name")
+        copy_action = menu.addAction(self._tool_icon("SP_FileIcon"), "Copy file name")
         menu.addSeparator()
         delete_action = menu.addAction(
+            self._tool_icon("SP_TrashIcon"),
             "Delete Record…" if selected_count == 1 else f"Delete {selected_count} Selected Records…"
         )
-        delete_action.setToolTip("Stage selected Library/MDB records for deletion. Physical .package files are never deleted.")
+        delete_action.setToolTip("Mark selected Library/MDB records for deletion. Physical .package files are never deleted.")
         delete_action.setEnabled(self._has_deletable_source_rows(selected_rows))
         chosen = menu.exec(view.viewport().mapToGlobal(pos))
         if open_location_action is not None and chosen == open_location_action:
             self._open_file_location_for_source_row(source_index.row())
+        elif chosen == reveal_package_action:
+            self._reveal_package_for_source_row(source_index.row())
+        elif chosen == pin_action:
+            self._toggle_pin_for_source_row(source_index.row())
+        elif chosen == copy_identifiers_action:
+            self._copy_identifiers_for_source_row(source_index.row())
         elif chosen == search_web_action:
             self._search_package_web(filename, creator)
         elif chosen == attribution_action:
@@ -11613,8 +14151,8 @@ class MainWindow(QMainWindow):
         if overwrite_nonblank:
             details.append(f"{overwrite_nonblank:,} existing non-empty Creator value(s) will be replaced.")
         if skipped_deletions:
-            details.append(f"{skipped_deletions:,} row(s) staged for deletion will be skipped.")
-        details.append("These edits remain staged until you use Save Changes.")
+            details.append(f"{skipped_deletions:,} row(s) marked for deletion will be skipped.")
+        details.append("These edits are not saved until you choose Save Changes.")
         answer = QMessageBox.question(
             self,
             "Set Creator for Selected",
@@ -11872,7 +14410,7 @@ class MainWindow(QMainWindow):
         try:
             plans = self._managed_preflight_sources(rows)
         except Exception as exc:
-            QMessageBox.warning(self, "Move preflight failed", str(exc))
+            QMessageBox.warning(self, "Move could not start", "CAS Curator found a problem before moving any files, so nothing was moved.\n\n" + str(exc))
             return
 
         target_keys = set()
@@ -11915,7 +14453,7 @@ class MainWindow(QMainWindow):
             preview.append(f"…and {len(plans) - 12} more package(s).")
         preview += [
             "",
-            "CAS Curator copies each file first, verifies SHA-256, deletes the original only after verification, then updates File Location in the MDB. The MDB writer creates its normal backup. Existing destination files are never overwritten.",
+            "CAS Curator copies and verifies each file before removing the original, then updates File Location and creates the normal Master Database backup. Existing destination files are never overwritten.",
         ]
         answer = QMessageBox.question(
             self, "Preview managed move", "\n".join(preview),
@@ -11936,7 +14474,7 @@ class MainWindow(QMainWindow):
                     shutil.copy2(source, destination)
                     if self._managed_file_sha256(destination) != item["hash"]:
                         destination.unlink(missing_ok=True)
-                        raise ValueError("copied file failed SHA-256 verification")
+                        raise ValueError("the copied file could not be verified")
                     try:
                         source.unlink()
                     except Exception:
@@ -11960,7 +14498,7 @@ class MainWindow(QMainWindow):
                 result = MDBWorkbook().save_manual_changes(self.mdb, changes)
             except Exception as exc:
                 rollback_problems = self._rollback_managed_moves(moved)
-                detail = f"The files were moved, but the MDB update failed: {exc}\n\nCAS Curator attempted to restore the original file locations."
+                detail = f"The files were moved, but CAS Curator could not update their saved File Locations: {exc}\n\nCAS Curator attempted to restore the original file locations."
                 if rollback_problems:
                     detail += "\n\nRollback needs attention:\n" + "\n".join(f"• {p}" for p in rollback_problems)
                 raise RuntimeError(detail) from exc
@@ -11986,7 +14524,7 @@ class MainWindow(QMainWindow):
         move_lines = [f"Moved: {moved_count:,}"]
         if already_in_destination:
             move_lines.append(f"Already in destination: {already_in_destination:,}")
-        move_lines += ["", "File Location was updated in the MDB.", f"Backup: {result.backup_path.name}"]
+        move_lines += ["", "File Location was updated in the Master Database.", f"Backup: {result.backup_path.name}"]
         QMessageBox.information(self, "Managed move complete", "\n".join(move_lines))
         self.statusBar().showMessage(
             f"Managed move: {moved_count:,} moved, {already_in_destination:,} already in '{target_name}'", 9000
@@ -12157,7 +14695,7 @@ class MainWindow(QMainWindow):
         try:
             plans = self._managed_preflight_sources(rows)
         except Exception as exc:
-            QMessageBox.warning(self, "Copy preflight failed", str(exc))
+            QMessageBox.warning(self, "Copy could not start", "CAS Curator found a problem before copying any files, so nothing was copied.\n\n" + str(exc))
             return
 
         target_keys = set()
@@ -12191,7 +14729,7 @@ class MainWindow(QMainWindow):
         if not to_copy and already_present:
             QMessageBox.information(
                 self, "CC Magic Import",
-                f"All {len(already_present):,} selected package(s) are already present in the CC Magic Import folder with matching SHA-256 hashes. Nothing was changed."
+                f"All {len(already_present):,} selected package(s) are already present in the CC Magic Import folder and match the originals. Nothing was changed."
             )
             return
 
@@ -12209,7 +14747,7 @@ class MainWindow(QMainWindow):
             preview.append(f"…and {len(to_copy) - 12} more package(s).")
         preview += [
             "",
-            "Original package files stay in place. CAS Curator verifies SHA-256 after each copy and never overwrites an existing different file. File Location is not changed because CC Magic Import is a deployment copy, not the master storage location.",
+            "Original package files stay in place. CAS Curator verifies each copy and never overwrites a different existing file. File Location is not changed because CC Magic Import is a copy for deployment, not the original storage location.",
         ]
         answer = QMessageBox.question(
             self, "Preview CC Magic copy", "\n".join(preview),
@@ -12227,7 +14765,7 @@ class MainWindow(QMainWindow):
                     shutil.copy2(item["source"], destination)
                     if self._managed_file_sha256(destination) != item["hash"]:
                         destination.unlink(missing_ok=True)
-                        raise ValueError("copied file failed SHA-256 verification")
+                        raise ValueError("the copied file could not be verified")
                     copied.append(item)
                 except Exception as exc:
                     try:
@@ -12422,7 +14960,7 @@ class MainWindow(QMainWindow):
         info = QLabel(
             "CAS Curator found names you previously confirmed in Creator/Converter fields. "
             "Matches come only from package filenames; nothing is added automatically. "
-            "Review the checked rows before staging them."
+            "Review the checked rows before applying these changes."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -12456,7 +14994,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(select_all)
         controls.addWidget(clear_all)
         controls.addStretch(1)
-        stage_btn = QPushButton("Stage Checked Suggestions")
+        stage_btn = QPushButton("Use Checked Suggestions")
         not_now_btn = QPushButton("Not now")
         controls.addWidget(stage_btn)
         controls.addWidget(not_now_btn)
@@ -12475,8 +15013,8 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self,
-            "Stage remembered attribution?",
-            f"Stage {len(checked):,} Creator/Converter suggestion(s)?\n\n"
+            "Use remembered attribution?",
+            f"Use {len(checked):,} Creator/Converter suggestion(s)?\n\n"
             "They will remain unsaved until you use Save Changes.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
@@ -12507,7 +15045,7 @@ class MainWindow(QMainWindow):
         self._update_selected_dirty_label()
         self._apply_filters()
         self.statusBar().showMessage(
-            f"Staged {changed_count:,} remembered Creator/Converter suggestion(s) — unsaved until Save Changes",
+            f"Updated {changed_count:,} remembered Creator/Converter suggestion(s) — not saved until Save Changes",
             9000,
         )
 
@@ -12674,7 +15212,7 @@ class MainWindow(QMainWindow):
                 "Clear selected field",
                 f"{label} is read-only in the Table.\n\n"
                 "Choose an editable column, then press Delete. "
-                "Use Shift+Delete if you want to stage deletion of the selected Library record(s).",
+                "Use Shift+Delete if you want to mark the selected Library record(s) for deletion.",
             )
             return
 
@@ -12713,7 +15251,7 @@ class MainWindow(QMainWindow):
         detail_lines = [
             f"Clear {label} in {len(source_rows):,} selected row(s)?",
             f"{populated:,} populated value(s) will be erased.",
-            "These changes remain staged until you use Save Changes.",
+            "These changes are not saved until you choose Save Changes.",
         ]
         if skipped:
             detail_lines.append(f"{skipped:,} selected row(s) are not editable for this field and will be skipped.")
@@ -12804,7 +15342,7 @@ class MainWindow(QMainWindow):
 
         if not candidates:
             if already_staged:
-                QMessageBox.information(self, "Delete Record", "All selected records are already staged for deletion.")
+                QMessageBox.information(self, "Delete Record", "All selected records are already marked for deletion.")
             else:
                 QMessageBox.warning(self, "Delete Record", "The selected record(s) cannot be deleted safely.")
             return
@@ -12824,10 +15362,10 @@ class MainWindow(QMainWindow):
         if unsaved_count:
             notes.append(f"Unsaved edits on {unsaved_count:,} selected record(s) will be discarded if you continue.")
         if already_staged:
-            notes.append(f"{already_staged:,} selected record(s) are already staged and will be left as-is.")
+            notes.append(f"{already_staged:,} selected record(s) are already marked for deletion and will be left as-is.")
         if unsafe:
-            notes.append(f"{unsafe:,} selected row(s) could not be safely staged and will be skipped.")
-        notes.append(f"Stage {count:,} record(s) for deletion?")
+            notes.append(f"{unsafe:,} selected row(s) could not be safely marked for deletion and will be skipped.")
+        notes.append(f"Mark {count:,} record(s) for deletion?")
         answer = QMessageBox.question(
             self,
             "Delete Records?" if count > 1 else "Delete Record?",
@@ -12858,7 +15396,7 @@ class MainWindow(QMainWindow):
         self._update_dirty_state()
         self._update_selected_dirty_label()
         self.statusBar().showMessage(
-            f"{count:,} record(s) staged for deletion. Use Save Changes to write the workbook change, "
+            f"{count:,} record(s) marked for deletion. Use Save Changes to save the Library change, "
             "or Revert All Unsaved Changes to cancel it. Package files are untouched.",
             10000,
         )
@@ -12933,17 +15471,6 @@ class MainWindow(QMainWindow):
             summary = f"{filename} | {category} | Duplicate: {duplicate} | {destination} | {status}"
             QApplication.clipboard().setText(summary)
             self.statusBar().showMessage("Route summary copied to clipboard", 2500)
-
-    def _choose_zip_preview_extract(self):
-        start = self.scan_source_path or str(self.settings.value("last_dir", str(Path.home())))
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Choose ZIP archive",
-            start,
-            "ZIP archives (*.zip);;All files (*.*)",
-        )
-        if path:
-            self._show_zip_preview_extract(Path(path))
 
     def _show_zip_preview_extract(self, zip_path: Path):
         archive = Path(zip_path)
@@ -13272,8 +15799,8 @@ class MainWindow(QMainWindow):
             self.scan_progress.setValue(99)
             self.scan_progress_label.setText("Refresh failed")
             self.scan_status_label.setText("Scan finished, but Library refresh failed")
-        QMessageBox.critical(self, "Could not open MDB", message)
-        self.statusBar().showMessage("Could not open MDB")
+        QMessageBox.critical(self, "Could not open Master Database", message)
+        self.statusBar().showMessage("Could not open Master Database")
 
     def _on_loaded(self, mdb: MDBData):
         self.setEnabled(True)
@@ -13369,6 +15896,7 @@ class MainWindow(QMainWindow):
         # this MDB, then offer conservative filename matches for blank fields.
         self._remember_attribution_names_from_records(mdb.records)
         QTimer.singleShot(250, self._maybe_offer_remembered_attribution_suggestions)
+        QTimer.singleShot(650, self._maybe_offer_performance_score_update)
         self.statusBar().showMessage(
             f"Loaded: {mdb.path.resolve()} | {len(mdb.records):,} library records | manual editing enabled"
         )
@@ -13523,7 +16051,7 @@ class MainWindow(QMainWindow):
 
         checks = {}
         for field in fields:
-            cb = QCheckBox(_display_field_name(field))
+            cb = VisibleColumnCheckBox(_display_field_name(field))
             cb.setChecked(field in self.visible_columns)
             checks[field] = cb
             container_layout.addWidget(cb)
@@ -14164,15 +16692,15 @@ class MainWindow(QMainWindow):
 
 
     def _apply_filters(self):
-        if IS_PUBLIC_BUILD:
-            permanent_fields = {"Status", "CC Type", "Creator"}
-            filters = {
-                field: box.currentText()
-                for field, box in self.filter_boxes.items()
-                if field in permanent_fields and box.currentText() != "All"
-            }
-        else:
-            filters = {f: b.currentText() for f, b in self.filter_boxes.items() if b.currentText() != "All"}
+        # Release-parity permanent filters in both PUBLIC and DEV. Health, Risk,
+        # File Location and Profile membership are explicit + Add Quick Filter…
+        # choices, so hidden technical boxes can never filter the Library.
+        permanent_fields = {"Status", "CC Type", "Creator"}
+        filters = {
+            field: box.currentText()
+            for field, box in self.filter_boxes.items()
+            if field in permanent_fields and box.currentText() != "All"
+        }
         self.proxy.set_filters(filters)
         self.proxy.set_column_filters(self.extra_column_filters)
         self.proxy.set_search_text(self.search_edit.text())
@@ -14186,6 +16714,133 @@ class MainWindow(QMainWindow):
         self._refresh_active_filter_chips()
         self._apply_filters()
 
+    def _perform_identifier_search(self, term: str) -> int:
+        term = str(term or "").strip()
+        if not term:
+            return 0
+        if not self.mdb:
+            return -1
+
+        # Find ID is a locate-this-package workflow. Search the source records
+        # directly instead of routing a technical identifier through the normal
+        # live Library search filter. This keeps pasted CASP/resource IDs safe
+        # even when an MDB contains legacy/blank/non-string technical headers.
+        wanted = term.casefold()
+        matches = []
+        for source_row in range(self.model.rowCount() if self.model else 0):
+            rec = self.model.record(source_row) or {}
+            values = []
+            # Find ID deliberately searches technical identity fields, including
+            # hidden columns, independently of normal Library Search.
+            for field in ["Package", "File Location", *TECHNICAL_IDENTIFIER_FIELDS]:
+                try:
+                    value = self.model.effective_value(source_row, field)
+                except Exception:
+                    value = rec.get(field, "")
+                values.append(str(value or ""))
+
+            known = {"Package", "File Location", *TECHNICAL_IDENTIFIER_FIELDS}
+            for raw_field, raw_value in rec.items():
+                raw_name = str(raw_field or "")
+                key = raw_name.strip().casefold()
+                if raw_name in known or raw_name.startswith("_"):
+                    continue
+                if (
+                    key.endswith(" ids") or "instance id" in key or key.endswith(" hash")
+                    or key.endswith(" path") or (key.startswith("broken ") and key.endswith(" ids"))
+                ):
+                    values.append(str(raw_value or ""))
+
+            if wanted in "\n".join(values).casefold():
+                matches.append(source_row)
+
+        if not matches:
+            self.statusBar().showMessage("No package matched that identifier", 3500)
+            return 0
+
+        # Clear temporary view filters only after a real match was found, then
+        # map the first matching source row into the unfiltered Library view.
+        self._set_app_page("library")
+        self.clear_filters()
+        source_index = self.model.index(matches[0], 0)
+        first = self.proxy.mapFromSource(source_index)
+        if not first.isValid():
+            self.statusBar().showMessage("Identifier matched, but the Library row could not be selected", 3500)
+            return 0
+        self.table.setCurrentIndex(first)
+        self.table.selectRow(first.row())
+        self.table.scrollTo(first, QAbstractItemView.PositionAtCenter)
+        self._show_selected()
+
+        # A successful identifier lookup should land directly on the evidence
+        # the user asked for, even if Details had previously been collapsed.
+        if getattr(self, "detail_panel_collapsed", False):
+            self.splitter.set_detail_panel_collapsed(False)
+        if hasattr(self, "identifiers_page"):
+            self.tabs.setCurrentWidget(self.identifiers_page)
+        count = len(matches)
+        self.statusBar().showMessage(
+            f"Identifier search found {count} package{'s' if count != 1 else ''}", 3500
+        )
+        return count
+
+    def _open_identifier_lookup(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Find Identifier")
+        dialog.resize(560, 190)
+        layout = QVBoxLayout(dialog)
+        info = QLabel(
+            "Paste a CASP/resource ID, Package Hash, or stored package path. "
+            "CAS Curator searches the whole Library and clears temporary Quick Filters so a match cannot be hidden."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        entry_row = QHBoxLayout()
+        entry_row.setSpacing(6)
+        entry = QLineEdit(dialog)
+        entry.setPlaceholderText("CASP / resource ID, package hash, or stored path…")
+        entry.setClearButtonEnabled(True)
+        entry_row.addWidget(entry, 1)
+        paste_btn = QPushButton("Paste", dialog)
+        paste_btn.setToolTip("Paste an identifier, package hash, or stored path from the clipboard")
+        paste_btn.clicked.connect(lambda: entry.setText(QApplication.clipboard().text().strip()))
+        entry_row.addWidget(paste_btn)
+        layout.addLayout(entry_row)
+
+        result = QLabel("")
+        result.setWordWrap(True)
+        layout.addWidget(result)
+
+        buttons = QDialogButtonBox(dialog)
+        search_btn = buttons.addButton("Search", QDialogButtonBox.AcceptRole)
+        cancel_btn = buttons.addButton(QDialogButtonBox.Cancel)
+        search_btn.setDefault(True)
+        layout.addWidget(buttons)
+
+        def run_search():
+            term = entry.text().strip()
+            if not term:
+                result.setText("Paste an identifier, package hash, or stored path first.")
+                entry.setFocus()
+                return
+            count = self._perform_identifier_search(term)
+            if count < 0:
+                result.setText("Open a Master Database first, then search again.")
+                return
+            if count == 0:
+                result.setText(f"No Library package matched: {term}")
+                entry.selectAll()
+                entry.setFocus()
+                return
+            dialog.accept()
+
+        search_btn.clicked.connect(run_search)
+        cancel_btn.clicked.connect(dialog.reject)
+        entry.returnPressed.connect(run_search)
+        QTimer.singleShot(0, entry.setFocus)
+        dialog.exec()
+
     def _show_selected(self, *_):
         selection = self.table.selectionModel()
         proxy_index = selection.currentIndex() if selection else QModelIndex()
@@ -14197,6 +16852,15 @@ class MainWindow(QMainWindow):
             self._set_editor_enabled(False)
             if hasattr(self, "copy_filename_btn"):
                 self.copy_filename_btn.setEnabled(False)
+            for button_name in ("copy_identifiers_btn", "copy_casp_ids_btn", "copy_exact_path_btn", "reveal_package_btn"):
+                button = getattr(self, button_name, None)
+                if button is not None:
+                    button.setEnabled(False)
+            if hasattr(self, "identifiers_browser"):
+                self.identifiers_browser.setHtml(
+                    "<p><b>No package selected.</b></p>"
+                    "<p>Use <b>Find ID…</b> in the top bar to locate a package by CASP/resource ID, hash, or stored path.</p>"
+                )
             self._update_pin_button()
             self._refresh_pinned_bar()
             return
@@ -14204,6 +16868,10 @@ class MainWindow(QMainWindow):
         self.current_source_row = source_index.row()
         if hasattr(self, "copy_filename_btn"):
             self.copy_filename_btn.setEnabled(True)
+        for button_name in ("copy_identifiers_btn", "copy_casp_ids_btn", "copy_exact_path_btn", "reveal_package_btn"):
+            button = getattr(self, button_name, None)
+            if button is not None:
+                button.setEnabled(True)
         rec = self.model.record(source_index.row())
         if rec:
             self.show_record(rec)
@@ -14388,6 +17056,7 @@ class MainWindow(QMainWindow):
         self._refresh_pinned_bar()
 
         summary_html = []
+        detail_secondary = html.escape(str(getattr(self, "_detail_secondary_text", "#666666")))
         for field in _BASE_SUMMARY_FIELDS:
             if not (_public_field_visible(field) or (IS_PUBLIC_BUILD and field in PUBLIC_OVERVIEW_ONLY_FIELDS)):
                 continue
@@ -14409,31 +17078,103 @@ class MainWindow(QMainWindow):
                 basis = _subtype_basis_label(effective)
                 if basis:
                     safe += (
-                        "<br><span style='font-size:11px; color:#666666'>"
+                        f"<br><span style='font-size:11px; color:{detail_secondary}'>"
                         f"Experimental · {html.escape(basis)}</span>"
                     )
             if field == "Skin Type" and (IS_DEV_BUILD or self.experimental_features):
                 basis = _skin_type_basis_label(effective)
                 if basis:
                     safe += (
-                        "<br><span style='font-size:11px; color:#666666'>"
+                        f"<br><span style='font-size:11px; color:{detail_secondary}'>"
                         f"Experimental · {html.escape(basis)}</span>"
                     )
             if field == "Outfit Category" and (IS_DEV_BUILD or self.experimental_features):
                 basis = _outfit_category_basis_label(effective)
                 if basis:
                     safe += (
-                        "<br><span style='font-size:11px; color:#666666'>"
+                        f"<br><span style='font-size:11px; color:{detail_secondary}'>"
                         f"Experimental · {html.escape(basis)}</span>"
                     )
             display_name = _display_field_name(field)
             if field == "CC Magic Profiles":
                 display_name = "Profile" if len(_split_cc_magic_profiles(value)) == 1 else "Profiles"
+            if field == "Risk Score":
+                safe += f"<br><span style='font-size:11px; color:{detail_secondary}'>Advisory performance estimate · separate from Health Status · not a broken/unsafe verdict</span>"
+            if field == "Highest Polys":
+                safe += f"<br><span style='font-size:11px; color:{detail_secondary}'>Performance evidence only · appropriate range depends on CC category</span>"
             summary_html.append(f"<div style='margin-bottom:10px'><b>{display_name}:</b>&nbsp; {safe}</div>")
         usage_html = self._random_sim_usage_html(rec)
         if usage_html:
             summary_html.insert(0, usage_html)
         self.info_browser.setHtml("".join(summary_html) or "<span style='color:#171717'>No additional details.</span>")
+
+        if hasattr(self, "identifiers_browser"):
+            package_rows = []
+            resource_rows = []
+            location_rows = []
+            package_fields = [("Package", "Filename"), ("Package Hash", "SHA-256 / Package Hash"), ("Normalized Package", "Normalized Package")]
+            for field, label in package_fields:
+                value = str(effective.get(field, "") or "").strip()
+                if value:
+                    package_rows.append(f"<div style='margin-bottom:7px'><b>{html.escape(label)}:</b>&nbsp; {html.escape(value).replace(chr(10), '<br>')}</div>")
+
+            casp_ids = str(effective.get("CASP Instance IDs", "") or "").strip()
+            if casp_ids:
+                resource_rows.append(
+                    "<div style='margin-bottom:7px'><b>In-game lookup / CASP Instance IDs:</b>&nbsp; "
+                    + html.escape(casp_ids).replace("\n", "<br>") + "</div>"
+                )
+            casp_observations = self._casp_observations_for_record(rec)
+            for index, observation in enumerate(casp_observations, start=1):
+                parts = []
+                for key in ("CASP Instance", "CC Type", "Data Type", "Body Type", "Age Gender", "Category", "Overlay Priority"):
+                    value = str(observation.get(key, "") or "").strip()
+                    if value:
+                        parts.append(f"<b>{html.escape(key)}:</b> {html.escape(value)}")
+                if parts:
+                    resource_rows.append(
+                        f"<div style='margin:8px 0 10px 0'><b>CAS resource {index}</b><br>" + "<br>".join(parts) + "</div>"
+                    )
+            for field in RESOURCE_IDENTIFIER_FIELDS:
+                if field == "CASP Instance IDs":
+                    continue
+                value = str(effective.get(field, "") or rec.get(field, "") or "").strip()
+                if value:
+                    resource_rows.append(f"<div style='margin-bottom:7px'><b>{html.escape(field)}:</b>&nbsp; {html.escape(value).replace(chr(10), '<br>')}</div>")
+            for field in sorted(rec):
+                key = str(field or "").casefold()
+                if not (key.startswith("broken ") and key.endswith(" ids")):
+                    continue
+                value = str(rec.get(field, "") or "").strip()
+                if value:
+                    resource_rows.append(f"<div style='margin-bottom:7px'><b>{html.escape(field)}:</b>&nbsp; {html.escape(value).replace(chr(10), '<br>')}</div>")
+
+            location_name = str(effective.get("File Location", "") or "").strip()
+            if location_name:
+                folder = self._file_location_path_for_name(location_name) or ""
+                location_rows.append(f"<div style='margin-bottom:7px'><b>Current File Location:</b>&nbsp; {html.escape(location_name)}</div>")
+                if folder:
+                    location_rows.append(f"<div style='margin-bottom:7px'><b>Managed folder:</b>&nbsp; {html.escape(folder)}</div>")
+            original_source = str(effective.get("Original Source Path", "") or rec.get("Original Source Path", "") or "").strip()
+            if original_source:
+                location_rows.append(f"<div style='margin-bottom:7px'><b>Original Source Path:</b>&nbsp; {html.escape(original_source).replace(chr(10), '<br>')}</div>")
+
+            identifier_html = [
+                "<h3 style='margin:0 0 7px 0'>Package identity</h3>",
+                "".join(package_rows) or "<p>No package identity evidence is stored.</p>",
+                "<h3 style='margin:12px 0 7px 0'>CAS / resource identity</h3>",
+                "".join(resource_rows) or "<p>No resource identifiers are stored for this package.</p>",
+                "<h3 style='margin:12px 0 7px 0'>Location</h3>",
+                "".join(location_rows) or "<p>No physical location/source path is currently linked.</p>",
+                "<h3 style='margin:12px 0 7px 0'>Dependency analysis</h3>",
+                "<p><b>Not assessed by the stable scanner.</b> Dependency checking is intentionally a separate analysis layer so scanner identity/health logic stays unchanged. Missing evidence is never guessed.</p>",
+            ]
+            self.identifiers_browser.setHtml("".join(identifier_html))
+            has_identifiers = bool(self._identifier_text_for_source_row(self.current_source_row or 0))
+            self.copy_identifiers_btn.setEnabled(has_identifiers)
+            self.copy_casp_ids_btn.setEnabled(bool(casp_ids))
+            self.copy_exact_path_btn.setEnabled(True)
+            self.reveal_package_btn.setEnabled(True)
 
         if hasattr(self, "casp_observations_browser"):
             casp_rows = []
@@ -14444,20 +17185,28 @@ class MainWindow(QMainWindow):
             casp_fields = [("CC Type", "CC Type"), ("Age", "Age"), ("Gender", "Gender")]
             if IS_DEV_BUILD or self.experimental_features:
                 casp_fields.append(("Outfit Category", "Outfit Category"))
-            if IS_DEV_BUILD or self.advanced_features:
-                casp_fields.insert(0, ("CASP Instance IDs", "CASP Instance IDs"))
             for label, field in casp_fields:
                 value = str(effective.get(field, "") or "").strip()
                 if not value:
                     continue
                 safe_value = html.escape(value).replace("\n", "<br>")
                 casp_rows.append(f"<div style='margin-bottom:10px'><b>{label}:</b>&nbsp; {safe_value}</div>")
-            has_casp_identity = bool(str(effective.get("CASP Instance IDs", "") or "").strip())
+            casp_identity_text = str(effective.get("CASP Instance IDs", "") or "").strip()
+            has_casp_identity = bool(casp_identity_text)
+            show_casp_identity_row = bool(has_casp_identity and (IS_DEV_BUILD or self.advanced_features))
+            if hasattr(self, "casp_identity_value"):
+                self.casp_identity_value.setText(casp_identity_text if show_casp_identity_row else "")
+                self.casp_identity_copy_btn.setEnabled(show_casp_identity_row)
+                self.casp_identity_row.setVisible(show_casp_identity_row)
             if has_casp_identity:
                 if IS_PUBLIC_BUILD and not self.advanced_features:
-                    casp_rows.append("<div style='margin-top:8px'><i>Enable Advanced features in Options to view the CASP Instance IDs.</i></div>")
+                    casp_rows.append("<div style='margin-top:8px'><i>Enable Advanced features in Options to view and copy the CASP Instance IDs.</i></div>")
                 self.casp_observations_browser.setHtml("".join(casp_rows) or "Direct CASP identity is linked, but no additional display fields are available.")
             else:
+                if hasattr(self, "casp_identity_row"):
+                    self.casp_identity_value.clear()
+                    self.casp_identity_copy_btn.setEnabled(False)
+                    self.casp_identity_row.setVisible(False)
                 self.casp_observations_browser.setHtml(
                     "<p><b>No direct CASP observations are linked to this package yet.</b></p>"
                     "<p>Run the scanner on the original package and reload the Master Database.</p>"
@@ -14546,8 +17295,8 @@ class MainWindow(QMainWindow):
         if overwritten_nonblank:
             detail_lines.append(f"{overwritten_nonblank:,} non-empty value(s) will be replaced.")
         if skipped_deletions:
-            detail_lines.append(f"{skipped_deletions:,} row(s) staged for deletion will be skipped.")
-        detail_lines.append("These edits remain staged until you use Save Changes.")
+            detail_lines.append(f"{skipped_deletions:,} row(s) marked for deletion will be skipped.")
+        detail_lines.append("These edits are not saved until you choose Save Changes.")
 
         if getattr(self, "confirm_fill_action", None) is None or self.confirm_fill_action.isChecked():
             answer = QMessageBox.question(
@@ -14591,7 +17340,7 @@ class MainWindow(QMainWindow):
         self._update_selected_dirty_label()
         self._apply_filters()
         self.statusBar().showMessage(
-            f"Unsaved {field} change — press Ctrl+S or use Save Changes to write it to the MDB",
+            f"Unsaved {field} change — press Ctrl+S or use Save Changes to save it",
             7000,
         )
 
@@ -14717,7 +17466,7 @@ class MainWindow(QMainWindow):
             "Each name points to the folder containing an original, unmerged package. Add Folder uses the selected Windows folder's name automatically; "
             "use Rename only if you want a different display name. Assigning a location never moves or copies a package. "
             "Missing folders are shown as unavailable; paths are never substituted automatically. "
-            "Changes remain staged until Save Changes."
+            "Changes are not saved until you choose Save Changes."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
@@ -14857,7 +17606,7 @@ class MainWindow(QMainWindow):
                 return
             new_name = new_name.strip()
             if not new_name:
-                QMessageBox.information(dialog, "File Location", "Enter a non-empty location name.")
+                QMessageBox.information(dialog, "File Location", "Enter a location name.")
                 return
             if new_name.casefold() != old_name.casefold() and any(
                 name.casefold() == new_name.casefold() for name, _ in self.file_location_registry_current
@@ -14877,7 +17626,7 @@ class MainWindow(QMainWindow):
             refresh_table(new_name)
             if changed or layout_changed:
                 self.statusBar().showMessage(
-                    f"Staged File Location rename across {changed:,} current assignment(s) and "
+                    f"Updated File Location name across {changed:,} current assignment(s) and "
                     f"{layout_changed:,} Profile Layout target(s). Save Changes to keep it.",
                     9000,
                 )
@@ -15235,7 +17984,7 @@ class MainWindow(QMainWindow):
             self._stage_profile_on_rows(profile, [self.current_source_row], True)
         if self._set_profile_layout_target(profile, rec, target):
             self.statusBar().showMessage(
-                f"Staged Planned Location for '{profile}' — Save Changes stores the plan; no file moved.",
+                f"Updated Planned Location for '{profile}' — choose Save Changes to save the plan; no file moved.",
                 8000,
             )
 
@@ -15837,8 +18586,8 @@ class MainWindow(QMainWindow):
             if len(errors) > 14:
                 shown += f"\n\n…and {len(errors) - 14} more problem(s)."
             QMessageBox.warning(
-                self, "Routing Structure preflight blocked",
-                "Nothing was moved because the full routing batch did not pass safety preflight:\n\n" + shown,
+                self, "Routing Structure could not start",
+                "CAS Curator found a problem before moving any files, so nothing was moved:\n\n" + shown,
             )
             return False
         if not plans:
@@ -15878,8 +18627,8 @@ class MainWindow(QMainWindow):
             preview.append(f"…and {len(plans) - 14} more package(s).")
         preview += [
             "",
-            "CAS Curator copies first, verifies SHA-256, then deletes the original. Existing destination files are never overwritten.",
-            "If any move or MDB save fails, completed moves are rolled back where possible.",
+            "CAS Curator copies and verifies each file before removing the original. Existing destination files are never overwritten.",
+            "If a move or save fails, CAS Curator restores completed moves where possible.",
         ]
         answer = QMessageBox.question(
             self, "Preview Routing Structure moves", "\n".join(preview),
@@ -15939,7 +18688,7 @@ class MainWindow(QMainWindow):
                     if self._managed_file_sha256(destination) != item["hash"]:
                         destination.unlink(missing_ok=True)
                         self._remove_empty_created_dirs(item["created_dirs"])
-                        raise ValueError("copied file failed SHA-256 verification")
+                        raise ValueError("the copied file could not be verified")
                     try:
                         source.unlink()
                     except Exception:
@@ -16121,7 +18870,7 @@ class MainWindow(QMainWindow):
         # deliberately selected. The old "Currently shown" scope was too easy
         # to confuse with an explicit selection and is intentionally removed.
         scope_box.addItem("Selected packages", "selected")
-        scope_box.addItem("All packages in MDB", "all")
+        scope_box.addItem("All packages in Library", "all")
         missing_box = QComboBox()
         missing_box.addItem("Use Unassigned folder", "unassigned")
         missing_box.addItem("Skip that folder level", "skip")
@@ -16167,8 +18916,8 @@ class MainWindow(QMainWindow):
         available_header.setContentsMargins(0, 0, 0, 0)
         available_header.addWidget(QLabel("Available folder levels"))
         available_header.addStretch(1)
-        colour_key_btn = QPushButton("Key")
-        colour_key_btn.setFixedWidth(54)
+        colour_key_btn = QPushButton("Colour Key")
+        colour_key_btn.setMinimumWidth(92)
         colour_key_btn.setToolTip("Show what the folder-level colours mean")
         available_header.addWidget(colour_key_btn)
         left_layout.addLayout(available_header)
@@ -16781,7 +19530,7 @@ class MainWindow(QMainWindow):
                 table.setItem(row, 3, planned_item)
             status.setText(
                 f"{len(members):,} package(s) currently belong to '{profile}'. "
-                f"{planned:,} have a saved/staged Planned Location. "
+                f"{planned:,} have a saved or unsaved Planned Location. "
                 + (
                     "<b>Unsaved layout changes:</b> use the main Save Changes button before applying."
                     if self.profile_layouts_dirty else
@@ -16820,7 +19569,7 @@ class MainWindow(QMainWindow):
                     changed += 1
             refresh()
             self.statusBar().showMessage(
-                f"Staged {changed:,} Planned Location change(s) for '{profile}' — Save Changes stores the plan.",
+                f"Updated {changed:,} Planned Location change(s) for '{profile}' — choose Save Changes to save the plan.",
                 8000,
             )
 
@@ -16848,7 +19597,7 @@ class MainWindow(QMainWindow):
                     dialog,
                     "Save before applying?",
                     "Profile Layouts and/or other Library changes are still unsaved.\n\n"
-                    "Apply Profile Locations uses the saved MDB state. Save Changes now?",
+                    "Apply Profile Locations uses the last saved Library data. Save your changes now?",
                     QMessageBox.Yes | QMessageBox.No,
                     QMessageBox.Yes,
                 )
@@ -16996,7 +19745,7 @@ class MainWindow(QMainWindow):
             if len(errors) > 12:
                 shown += f"\n\n…and {len(errors) - 12} more problem(s)."
             QMessageBox.warning(
-                self, "Profile Layout preflight blocked",
+                self, "Profile Layout could not start",
                 "Nothing was moved because the full Profile Layout was not conflict-free:\n\n" + shown
             )
             return False
@@ -17027,8 +19776,7 @@ class MainWindow(QMainWindow):
         preview += [
             "",
             "Folder structure below the current managed root is preserved where possible.",
-            "CAS Curator copies first, verifies SHA-256, deletes the original only after verification, "
-            "then updates Current File Location in the MDB. Existing files are never overwritten.",
+            "CAS Curator copies and verifies each file before removing the original, then updates its Current File Location. Existing files are never overwritten.",
             "",
             "Choosing/filtering Profiles alone never performs these moves.",
         ]
@@ -17060,7 +19808,7 @@ class MainWindow(QMainWindow):
                     if self._managed_file_sha256(destination) != item["hash"]:
                         self._managed_unlink_even_if_read_only(destination)
                         self._remove_empty_created_dirs(item["created_dirs"])
-                        raise ValueError("copied file failed SHA-256 verification")
+                        raise ValueError("the copied file could not be verified")
                     try:
                         source.unlink()
                     except Exception as source_exc:
@@ -17413,7 +20161,7 @@ class MainWindow(QMainWindow):
 
         detail = (
             f"Remove Profile '{profile}' from this package?\n\n"
-            "This only stages the membership change until Save Changes."
+            "This membership change is not saved until you choose Save Changes."
         )
         if planned:
             detail += (
@@ -17562,7 +20310,7 @@ class MainWindow(QMainWindow):
             self,
             f"{verb} Profile",
             f"{verb} '{profile}' {relation} the {len(source_rows):,} selected package(s)?\n\n"
-            "This only stages unsaved MDB changes. Nothing is written until Save Changes.",
+            "These Library changes are not saved until you choose Save Changes.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -17570,7 +20318,7 @@ class MainWindow(QMainWindow):
             return
         changed = self._stage_profile_on_rows(profile, source_rows, add)
         self.statusBar().showMessage(
-            f"Staged profile change for {changed:,} selected package(s) — use Save Changes to write the MDB",
+            f"Updated Profile Membership for {changed:,} selected package(s) — use Save Changes to save it",
             8000,
         )
         if changed == 0:
@@ -17596,7 +20344,7 @@ class MainWindow(QMainWindow):
             self,
             f"{verb} Profile",
             f"{verb} '{profile}' {relation} all {shown:,} package(s) currently shown by the Library filters/search?\n\n"
-            "This only stages unsaved MDB changes. Nothing is written until Save Changes.",
+            "These Library changes are not saved until you choose Save Changes.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -17609,7 +20357,7 @@ class MainWindow(QMainWindow):
                 source_rows.append(self.proxy.mapToSource(proxy_index).row())
         changed = self._stage_profile_on_rows(profile, source_rows, add)
         self.statusBar().showMessage(
-            f"Staged profile change for {changed:,} shown package(s) — use Save Changes to write the MDB",
+            f"Updated Profile Membership for {changed:,} shown package(s) — use Save Changes to save it",
             8000,
         )
         if changed == 0:
@@ -17731,7 +20479,7 @@ class MainWindow(QMainWindow):
             "Profiles are optional groups for playthroughs, themes, saves, testing setups, or other organisational purposes. "
             "The Current Profile is the Profile context used for Profile Rules and Experimental Planned Locations. "
             "Changing the Current Profile never moves package files. "
-            "Create/rename/delete changes are staged first; use Save Changes in the main window to write MDB changes."
+            "Profile changes are previewed before being applied."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
@@ -17897,7 +20645,7 @@ class MainWindow(QMainWindow):
                 dialog,
                 "Rename Profile",
                 f"Rename '{old_name}' to '{new_name}' across {count:,} package(s)?{merge_note}\n\n"
-                "This stages the changes only. Use Save Changes in the main window to write them to the MDB.",
+                "These changes are not saved until you choose Save Changes in the main window.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -17905,7 +20653,7 @@ class MainWindow(QMainWindow):
                 return
             changed = self._stage_cc_magic_profile_global_change(old_name, new_name)
             refresh_table(new_name)
-            status.setText(f"Staged rename on {changed:,} package(s). Save Changes when ready.")
+            status.setText(f"Renamed on {changed:,} package(s). Choose Save Changes when ready.")
 
         def delete_selected():
             old_name = selected_profile()
@@ -17917,7 +20665,7 @@ class MainWindow(QMainWindow):
                 dialog,
                 "Delete Profile",
                 f"Delete profile '{old_name}' and remove it from {count:,} package(s)?\n\n"
-                "This does NOT move or delete package files. The change is staged until Save Changes.",
+                "This does NOT move or delete package files. The change is not saved until you choose Save Changes.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -17925,7 +20673,7 @@ class MainWindow(QMainWindow):
                 return
             changed = self._stage_cc_magic_profile_global_change(old_name, None)
             refresh_table()
-            status.setText(f"Staged Profile deletion from {changed:,} package(s). Save Changes when ready.")
+            status.setText(f"Removed the Profile from {changed:,} package(s). Choose Save Changes when ready.")
 
         def save_current_filters():
             self._save_filters_to_active_profile()
@@ -18107,7 +20855,7 @@ class MainWindow(QMainWindow):
         selected = [name for name, cb in checks.items() if cb.isChecked()]
         self._stage_merge_profiles_for_current(selected)
         self.statusBar().showMessage(
-            f"Staged {len(selected):,} Merge Profile assignment(s) for this package — Save Changes to write the MDB",
+            f"Updated {len(selected):,} Merge Profile assignment(s) for this package — choose Save Changes to save them",
             8000,
         )
 
@@ -18168,7 +20916,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(dialog)
         help_label = QLabel(
             "Merge Profiles are names for merged collections. They are separate from general Profiles, and one package can belong to several. "
-            "Create, rename and remove names here. Changes remain staged until Save Changes."
+            "Create, rename and remove names here. Changes are not saved until you choose Save Changes."
         )
         help_label.setWordWrap(True)
         layout.addWidget(help_label)
@@ -18260,7 +21008,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 dialog,
                 "Rename Merge Profile",
-                f"Rename '{old}' to '{new}' across {count:,} package(s)?{merge_note}\n\nThe change stays staged until Save Changes.",
+                f"Rename '{old}' to '{new}' across {count:,} package(s)?{merge_note}\n\nThe change is not saved until you choose Save Changes.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -18268,7 +21016,7 @@ class MainWindow(QMainWindow):
                 return
             changed = self._stage_merge_profile_global_change(old, new)
             refresh(new)
-            status.setText(f"Staged rename on {changed:,} package(s). Save Changes when ready.")
+            status.setText(f"Renamed on {changed:,} package(s). Choose Save Changes when ready.")
 
         def delete_profile():
             old = selected_name()
@@ -18279,7 +21027,7 @@ class MainWindow(QMainWindow):
             answer = QMessageBox.question(
                 dialog,
                 "Delete Merge Profile",
-                f"Delete '{old}' and remove it from {count:,} package(s)?\n\nThis does not move or delete package files. The change stays staged until Save Changes.",
+                f"Delete '{old}' and remove it from {count:,} package(s)?\n\nThis does not move or delete package files. The change is not saved until you choose Save Changes.",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
@@ -18287,7 +21035,7 @@ class MainWindow(QMainWindow):
                 return
             changed = self._stage_merge_profile_global_change(old, None)
             refresh()
-            status.setText(f"Staged removal from {changed:,} package(s). Save Changes when ready.")
+            status.setText(f"Removed from {changed:,} package(s). Choose Save Changes when ready.")
 
         create_btn.clicked.connect(create_profile)
         rename_btn.clicked.connect(rename_profile)
@@ -18414,13 +21162,13 @@ class MainWindow(QMainWindow):
         chosen = str(Path(path).resolve())
         self.settings.setValue("last_image_dir", str(Path(chosen).parent))
         self._set_pending_image_value(chosen)
-        self.statusBar().showMessage("Preview image changed — Save Changes to write it to the MDB", 7000)
+        self.statusBar().showMessage("Preview image changed — Save Changes to save it", 7000)
 
     def _clear_manual_preview_image(self):
         if not self.mdb or self.current_source_row is None:
             return
         self._set_pending_image_value("")
-        self.statusBar().showMessage("Preview image cleared — Save Changes to write it to the MDB; Scan can restore an extractable package preview", 9000)
+        self.statusBar().showMessage("Preview image cleared — Save Changes to save it; Scan can restore an extractable package preview", 9000)
 
     def _update_selected_dirty_label(self):
         if not hasattr(self, "edit_dirty_label"):
@@ -18434,7 +21182,7 @@ class MainWindow(QMainWindow):
         if profile_layout_dirty:
             display_fields.append("Profile Location")
         if row_num in self.pending_deletions:
-            self.edit_dirty_label.setText("Record staged for deletion — use Revert this to cancel")
+            self.edit_dirty_label.setText("Record marked for deletion — use Revert this to cancel")
         elif display_fields:
             self.edit_dirty_label.setText("Unsaved for this package: " + ", ".join(display_fields))
         else:
@@ -18497,7 +21245,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Revert unsaved changes",
-            "Discard all unsaved Library/Profile/Profile Layout/Merge Profile/Status/File Location changes, including staged record deletions?",
+            "Discard all unsaved Library/Profile/Profile Layout/Merge Profile/Status/File Location changes, including records marked for deletion?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -18595,11 +21343,11 @@ class MainWindow(QMainWindow):
             "Legacy Delete/Deleted values will not be changed because they may have "
             "special scanner meaning.",
             "",
-            "If you continue, these record changes will be staged in the app and the "
-            "Settings Status list will be updated on Save Changes. The normal full-workbook "
-            "backup will be created before writing.",
+            "If you continue, these record changes will be prepared in the app and the "
+            "Settings Status list will be updated when you choose Save Changes. The normal full-workbook "
+            "backup will be created before saving.",
             "",
-            "Stage these conversions?",
+            "Apply these conversions?",
         ]
         answer = QMessageBox.question(
             self,
@@ -18639,7 +21387,7 @@ class MainWindow(QMainWindow):
         self._update_dirty_state()
         self._update_selected_dirty_label()
         self.statusBar().showMessage(
-            f"Staged {staged} legacy Status conversion(s). Review them and use Save Changes to write.",
+            f"Prepared {staged} legacy Status conversion(s). Review them and choose Save Changes when ready.",
             10000,
         )
 
@@ -18674,7 +21422,7 @@ class MainWindow(QMainWindow):
         merge_profile_registry_was_dirty = merge_profile_registry_needs_save
         file_location_registry_was_dirty = self.file_location_registry_dirty
         profile_layouts_were_dirty = self.profile_layouts_dirty
-        self.statusBar().showMessage("Saving Library/Profile/Profile Layout changes and creating MDB backup…")
+        self.statusBar().showMessage("Saving Library/Profile/Profile Layout changes and creating a Master Database backup…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             result = MDBWorkbook().save_manual_changes(
@@ -18688,11 +21436,11 @@ class MainWindow(QMainWindow):
                 profile_layouts=self.profile_layouts_current if profile_layouts_were_dirty else None,
             )
         except WorkbookChangedError as exc:
-            QMessageBox.warning(self, "Master Database changed", str(exc))
+            QMessageBox.warning(self, "Master Database changed", "This Master Database changed outside CAS Curator after it was opened. Reload it before saving so newer changes are not overwritten.\n\nDetails:\n" + str(exc))
             self.statusBar().showMessage("Save cancelled — reload the Master Database first")
             return False
         except Exception as exc:
-            QMessageBox.critical(self, "Could not save changes", str(exc))
+            QMessageBox.critical(self, "Could not save changes", "CAS Curator could not save your changes. The original Master Database was left unchanged.\n\nDetails:\n" + str(exc))
             self.statusBar().showMessage("Save failed — the original Master Database was left unchanged")
             return False
         finally:
@@ -18783,7 +21531,7 @@ class MainWindow(QMainWindow):
             return True
         box = QMessageBox(self)
         box.setWindowTitle("Unsaved changes")
-        box.setText("You have unsaved Library/Profile/Profile Layout/Merge Profile/Status/File Location changes, including any staged record deletions.")
+        box.setText("You have unsaved Library/Profile/Profile Layout/Merge Profile/Status/File Location changes, including any records marked for deletion.")
         box.setInformativeText("Save them before continuing?")
         box.setStandardButtons(QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel)
         box.setDefaultButton(QMessageBox.Save)
@@ -18823,6 +21571,17 @@ class MainWindow(QMainWindow):
                 "Scanner is running",
                 "Wait for the scanner to finish before closing the app. "
                 "This protects the MDB from being interrupted during a save."
+            )
+            event.ignore()
+            return
+        if (
+            self.performance_refresh_process is not None
+            and self.performance_refresh_process.state() != QProcess.NotRunning
+        ):
+            QMessageBox.warning(
+                self,
+                "Performance Score refresh is running",
+                "Cancel or finish the Performance Score refresh before closing CAS Curator."
             )
             event.ignore()
             return
