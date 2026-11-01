@@ -16,9 +16,16 @@ ELIGIBLE_BASE_TYPES = {
 }
 
 DISPLAY_NAMES = {
+    # Display-only friendly CAS category names. Stored scanner/MDB values and
+    # Random Sim keys remain unchanged.
+    "top": "Tops",
+    "bottom": "Bottoms",
+    "body": "Full Body",
+    "accessory": "Accessories",
+    "glove": "Gloves",
     "glasses_f": "Glasses",
-    "ring_lt": "Ring",
-    "armband": "Arm Band",
+    "ring_lt": "Rings",
+    "armband": "Arm Bands",
 }
 
 # Categories where choosing two pieces is especially useful. The UI still lets
