@@ -58,7 +58,12 @@ class TestConfirmationsAndPath(unittest.TestCase):
         scan = ast.unparse(method("_start_scan_operation"))
         self.assertIn("_routing_scan_state_decision", scan)
         self.assertIn("routing_preflight_confirmed", scan)
-        self.assertIn("if sqlite_mode and real_routing", scan)
+        # Both staged versions fail closed for SQLite moves; the older
+        # GitHub GUI also blocks preview until its public integration lands.
+        self.assertTrue(
+            "if sqlite_mode and real_routing" in scan
+            or "if sqlite_mode and (preview_routing or real_routing)" in scan
+        )
         self.assertIn("self.real_routing_check", SOURCE)
         self.assertIn("acknowledged", SOURCE)
 
