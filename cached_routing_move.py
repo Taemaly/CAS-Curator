@@ -59,8 +59,8 @@ def execute(sqlite_db, source_root, destination_root, approved_preview, output_r
             raise RuntimeError('Destination already exists: ' + dst + '. Refresh Preview; no files moved.')
         if os.path.islink(src):
             raise RuntimeError('Symlink source is not supported: ' + src)
-        if os.path.commonpath([_path_key(dst), _path_key(destination_root)]) != _path_key(destination_root):
-            raise RuntimeError('Destination escapes routing root: ' + dst)
+        _validate_child(src, source_root)
+        _validate_child(dst, destination_root)
     # One root per approved plan; no broad source scanning.
     stamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')
     session = Path(output_root) / ('Cached_Routing_Move_' + stamp)
