@@ -130,8 +130,10 @@ class PublicLibraryUIRegression(unittest.TestCase):
     def test_compact_buttons_and_legacy_excel_workflow_retained(self):
         text = (ROOT / "app.py").read_text(encoding="utf-8")
         for snippet in (
-            'QPushButton("Create\\nDB")',
-            'QPushButton("Open\\nDB")',
+            'QPushButton("Create DB")',
+            'QPushButton("Open DB")',
+            'self.mdb_path_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)',
+            'display_folder.replace',
             'self.mdb_path_label.setWordWrap(True)',
             'self.mdb_path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)',
             'Create legacy Excel MDB…',
