@@ -89,7 +89,7 @@ from mdb_reader import (
     CURRENT_PERFORMANCE_SCORE_VERSION, PERFORMANCE_SCORE_VERSION_METADATA_KEY,
 )
 from mdb_compat import inspect_mdb_compatibility, create_compatible_copy
-from sqlite_store import load_sqlite_library, save_sqlite_manual_changes
+from sqlite_store import load_sqlite_library, save_sqlite_manual_changes, create_fresh_sqlite_library
 from custom_theme_tools import palette_metadata, palette_source
 from theme_studio_core import (
     guide_section_tint, guide_highlight_tint, ensure_guide_highlight_separation,
@@ -3013,7 +3013,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._set_app_page("library")
         self.apply_theme(self.theme_name)
-        self.statusBar().showMessage("No Master Database loaded — choose File > Open Master Database…")
+        self.statusBar().showMessage("No Library open — use File > Open Library…")
         # v1.0 behaviour: reopen the last successfully loaded MDB unless the
         # user explicitly disabled File > Open last used Master Database on startup.
         raw_open_last = self.settings.value("open_last_mdb_on_startup", True)
@@ -3102,13 +3102,19 @@ class MainWindow(QMainWindow):
 
     def _build_menus(self):
         file_menu = self.menuBar().addMenu("File")
-        open_action = QAction("Open Master Database…", self)
+        open_action = QAction("Open Library…", self)
         open_action.triggered.connect(self.choose_file)
         file_menu.addAction(open_action)
+        create_db_action = QAction("Create SQLite Library…", self)
+        create_db_action.triggered.connect(self.create_new_database)
+        file_menu.addAction(create_db_action)
+        create_legacy_action = QAction("Create legacy Excel MDB…", self)
+        create_legacy_action.triggered.connect(self.create_new_mdb)
+        file_menu.addAction(create_legacy_action)
         reload_action = QAction("Reload", self)
         reload_action.triggered.connect(self.reload)
         file_menu.addAction(reload_action)
-        self.open_last_mdb_action = QAction("Open last used Master Database on startup", self, checkable=True)
+        self.open_last_mdb_action = QAction("Open last used Library on startup", self, checkable=True)
         raw_open_last = self.settings.value("open_last_mdb_on_startup", True)
         open_last = raw_open_last if isinstance(raw_open_last, bool) else str(raw_open_last).strip().lower() not in {"0", "false", "no", "off", ""}
         self.open_last_mdb_action.setChecked(open_last)
@@ -4262,23 +4268,33 @@ class MainWindow(QMainWindow):
         # bar, while retaining a separate inner path field for readability.
         mdb_identity_layout.setContentsMargins(10, 4, 10, 4)
         mdb_identity_layout.setSpacing(8)
-        mdb_caption = QLabel("Opened Master Database:")
+        mdb_caption = QLabel("Opened DB:")
         mdb_caption.setObjectName("MDBPathCaption")
-        self.mdb_path_label = QLabel("None — choose a Master Database")
+        self.mdb_path_label = QLabel("None — open or create a Library")
         self.mdb_path_label.setObjectName("MDBPathLabel")
         self.mdb_path_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.mdb_path_label.setToolTip("No Master Database loaded")
+        self.mdb_path_label.setToolTip("No Library loaded")
+        # Do not let a long Windows path force the action buttons offscreen.
+        # Show the full path in the tooltip and wrap it in the available area.
+        self.mdb_path_label.setWordWrap(True)
+        self.mdb_path_label.setMinimumWidth(0)
+        self.mdb_path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.library_mdb_identity.setMinimumWidth(0)
         mdb_identity_layout.addWidget(mdb_caption)
         mdb_identity_layout.addWidget(self.mdb_path_label, 1)
 
-        create_mdb_btn = QPushButton("Create new Master Database…")
+        create_mdb_btn = QPushButton("Create\nDB")
         create_mdb_btn.setObjectName("OpenMDBButton")
-        create_mdb_btn.clicked.connect(self.create_new_mdb)
-        create_mdb_btn.setMinimumWidth(125)
-        open_mdb_btn = QPushButton("Open Master Database…")
+        create_mdb_btn.setToolTip("Create a new SQLite Library (.db). Existing databases are never overwritten here.")
+        create_mdb_btn.clicked.connect(self.create_new_database)
+        create_mdb_btn.setMinimumWidth(82)
+        create_mdb_btn.setMinimumHeight(44)
+        open_mdb_btn = QPushButton("Open\nDB")
         open_mdb_btn.setObjectName("OpenMDBButton")
+        open_mdb_btn.setToolTip("Open a SQLite Library (.db) or a legacy Excel MDB (.xlsx).")
         open_mdb_btn.clicked.connect(self.choose_file)
-        open_mdb_btn.setMinimumWidth(100)
+        open_mdb_btn.setMinimumWidth(82)
+        open_mdb_btn.setMinimumHeight(44)
         mdb_actions = QWidget()
         mdb_actions.setObjectName("LibraryActionGroup")
         mdb_actions_layout = QHBoxLayout(mdb_actions)
@@ -8042,14 +8058,55 @@ class MainWindow(QMainWindow):
         open_last = raw_open_last if isinstance(raw_open_last, bool) else str(raw_open_last).strip().lower() not in {"0", "false", "no", "off", ""}
         if not open_last:
             return
-        saved = str(self.settings.value("last_mdb", "") or "").strip()
+        # Unified key records the actual last opened Library, regardless of
+        # whether it is SQLite or legacy XLSX. Existing TEST_004 preferences
+        # had separate keys; prefer the SQLite DB during the first migration.
+        saved = str(self.settings.value("last_library_path", "") or "").strip()
+        if not saved:
+            saved = str(self.settings.value("last_library_db", "") or "").strip()
+        if not saved:
+            saved = str(self.settings.value("last_mdb", "") or "").strip()
         if not saved:
             return
         path = Path(saved)
         if path.is_file():
             self.load_file(path)
         else:
-            self.statusBar().showMessage("Last used Master Database was not found — open it from its new location or create a new Master Database")
+            self.statusBar().showMessage("Last used Library was not found — choose its new location with Open DB")
+
+    def create_new_database(self):
+        """Create a fresh SQLite Library for the public application."""
+        if not self._confirm_pending_changes():
+            return
+        start_dir = Path(str(self.settings.value("last_dir", str(Path.home())) or Path.home()))
+        suggested = start_dir / "CCS3_Library.db"
+        chosen, _ = QFileDialog.getSaveFileName(
+            self, "Create SQLite Library", str(suggested),
+            "SQLite Library (*.db *.sqlite *.sqlite3)",
+        )
+        if not chosen:
+            return
+        target = Path(chosen)
+        if not target.suffix:
+            target = target.with_suffix(".db")
+        if target.suffix.lower() not in {".db", ".sqlite", ".sqlite3"}:
+            QMessageBox.warning(self, "Create SQLite Library", "Choose a .db, .sqlite or .sqlite3 filename.")
+            return
+        if target.exists():
+            QMessageBox.warning(
+                self, "Database already exists",
+                "That database already exists. Choose a different filename to avoid replacing existing Library data.",
+            )
+            return
+        try:
+            result = create_fresh_sqlite_library(target)
+        except Exception as exc:
+            QMessageBox.critical(self, "Create SQLite Library", "Could not create the database:\n" + str(exc))
+            return
+        self.settings.setValue("last_dir", str(result.db_path.parent))
+        self.scan_mdb_override = False
+        self.statusBar().showMessage("Created SQLite Library: " + str(result.db_path))
+        self.load_file(result.db_path)
 
     def create_new_mdb(self):
         """Create a fresh Master Database from the bundled blank template."""
@@ -8949,14 +9006,14 @@ class MainWindow(QMainWindow):
         source_layout.addWidget(source_row)
 
         # MDB row.
-        mdb_row, mdb_row_layout = make_row("Master Database:")
+        mdb_row, mdb_row_layout = make_row("Library DB:")
         self.scan_mdb_edit = QLineEdit()
         self.scan_mdb_edit.setObjectName("ScanPathField")
         self.scan_mdb_edit.setReadOnly(True)
         self.scan_mdb_edit.setFixedHeight(action_height)
         self.scan_mdb_edit.setReadOnly(True)
-        self.scan_mdb_edit.setPlaceholderText("No Master Database open — open or create one in Library.")
-        self.scan_mdb_edit.setToolTip("The Scan page uses the Master Database currently open in Library. Change it from Library.")
+        self.scan_mdb_edit.setPlaceholderText("No Library open — open or create a DB in Library.")
+        self.scan_mdb_edit.setToolTip("Scan uses the currently opened Library (.db or legacy .xlsx). Change it from Library.")
         mdb_row_layout.addWidget(self.scan_mdb_edit, 1)
         source_layout.addWidget(mdb_row)
 
@@ -9040,7 +9097,7 @@ class MainWindow(QMainWindow):
         progress_heading = QLabel("Scan progress")
         progress_heading.setObjectName("ScanSectionTitle")
         progress_top.addWidget(progress_heading)
-        self.scan_status_label = QLabel("Ready — choose a source folder and Master Database")
+        self.scan_status_label = QLabel("Ready — choose a source folder and Library DB")
         self.scan_status_label.setObjectName("ScanStatus")
         progress_top.addWidget(self.scan_status_label, 1)
         self.scan_progress_label = QLabel("0 / 0")
@@ -9125,7 +9182,7 @@ class MainWindow(QMainWindow):
                 "CAS Curator reads supported information directly from package resources. Filenames are not used as evidence for supported classifications.\n"
                 "Run Scan records supported package information including CASP IDs, CC Type, Highest Polys, Health Status, Performance Risk information, thumbnails when available, package hash and scan time.\n"
                 "Some Experimental classifications use additional clues and are clearly marked for review.\n"
-                "Run Scan creates a mandatory MDB backup before scanner writes.\n"
+                "Run Scan creates a database backup before saving results.\n"
                 "Preview Routing before any move. Run Routing requires explicit acknowledgement and creates a recovery manifest."
             )
         else:
@@ -10952,7 +11009,7 @@ class MainWindow(QMainWindow):
         elif self.mdb:
             self.statusBar().showMessage(f"Library: {self.mdb.path.resolve()}")
         else:
-            self.statusBar().showMessage("No Master Database loaded — choose File > Open Master Database…")
+            self.statusBar().showMessage("No Library open — use File > Open Library…")
 
     def _open_scan_source_folder(self):
         raw = str(self.scan_source_path or "").strip()
@@ -11925,7 +11982,7 @@ class MainWindow(QMainWindow):
                 "CAS Curator reads supported information directly from package resources. Filenames are not used as evidence for supported classifications.\n"
                 "Run Scan records supported package information including CASP IDs, CC Type, Highest Polys, Health Status, Performance Risk information, thumbnails when available, package hash and scan time.\n"
                 "Some Experimental classifications use additional clues and are clearly marked for review.\n"
-                "Run Scan creates a mandatory MDB backup before scanner writes.\n"
+                "Run Scan creates a database backup before saving results.\n"
                 "Preview Routing before any move. Run Routing requires explicit acknowledgement and creates a recovery manifest.\n\n"
                 "Experimental information is for review and does not control normal Routing automatically.\n"
             )
@@ -13312,7 +13369,7 @@ class MainWindow(QMainWindow):
             self.scan_current_file_label.setText("Refreshing Library…")
             self.scan_status_label.setText("Scan work finished — refreshing Library…")
             self._scan_completion_waiting_for_library = True
-            self.scan_log.appendPlainText("GUI: refreshing the open Library now…")
+            self.scan_log.appendPlainText("GUI: refreshing Library… completion will be confirmed below.")
             QTimer.singleShot(100, lambda p=Path(refresh_target): self.load_file(p))
         else:
             self._scan_completion_waiting_for_library = False
@@ -13386,7 +13443,7 @@ class MainWindow(QMainWindow):
         refresh_target = self._post_scan_refresh_target
         self._post_scan_refresh_target = None
         if refresh_target and Path(refresh_target).is_file():
-            self.scan_log.appendPlainText("GUI: refreshing the open Library now…")
+            self.scan_log.appendPlainText("GUI: refreshing Library… completion will be confirmed below.")
             QTimer.singleShot(100, lambda p=Path(refresh_target): self.load_file(p))
 
     def _sha256_file(self, path: Path) -> str:
@@ -15758,14 +15815,14 @@ class MainWindow(QMainWindow):
                 if hasattr(self, "real_routing_check"):
                     self.real_routing_check.setChecked(False)
                 if self.mdb and target and self.mdb.path.resolve() == target:
-                    self.scan_log.appendPlainText("GUI: Library will refresh automatically before Scan is marked complete…")
+                    self.scan_log.appendPlainText("GUI: scan data saved. Waiting for Library refresh to finish…")
                     self._post_scan_refresh_target = target
             else:
                 self.scan_status_label.setText("Scan completed successfully")
                 self.scan_log.appendPlainText("\nGUI: scanner process completed successfully.")
                 self.statusBar().showMessage("Scan completed successfully")
                 if self.mdb and target and self.mdb.path.resolve() == target:
-                    self.scan_log.appendPlainText("GUI: Library will refresh automatically before Scan is marked complete…")
+                    self.scan_log.appendPlainText("GUI: scan data saved. Waiting for Library refresh to finish…")
                     self._post_scan_refresh_target = target
 
             QTimer.singleShot(0, self._finalise_scan_without_popup)
@@ -15850,9 +15907,13 @@ class MainWindow(QMainWindow):
             self.scan_progress.setRange(0, 100)
             self.scan_progress.setValue(99)
             self.scan_progress_label.setText("Refresh failed")
-            self.scan_status_label.setText("Scan finished, but Library refresh failed")
-        QMessageBox.critical(self, "Could not open Master Database", message)
-        self.statusBar().showMessage("Could not open Master Database")
+            self.scan_status_label.setText("Scan saved, but Library refresh failed — reopen the Library")
+            self.scan_log.appendPlainText(
+                "GUI ERROR: Library refresh failed. The scan finished, but the Library did not reload. "
+                "Try Library > Reload. Details: " + str(message)
+            )
+        QMessageBox.critical(self, "Could not open Library", message)
+        self.statusBar().showMessage("Could not open Library")
 
     def _on_loaded(self, mdb: MDBData):
         self.setEnabled(True)
@@ -15880,6 +15941,9 @@ class MainWindow(QMainWindow):
             and str(getattr(mdb, "metadata", {}).get("_SQLitePrimary", "")) == "1"
             else ""
         )
+        # Always remember the most recently opened Library, not whichever
+        # MDB was last used before SQLite support was added.
+        self.settings.setValue("last_library_path", str(mdb.path.resolve()))
         if self.library_db_path:
             self.settings.setValue("last_library_db", self.library_db_path)
         else:
@@ -15964,6 +16028,12 @@ class MainWindow(QMainWindow):
         if getattr(self, "_scan_completion_waiting_for_library", False):
             self._scan_completion_waiting_for_library = False
             self._set_scan_progress_complete()
+            count = len(mdb.records)
+            self.scan_log.appendPlainText(
+                f"GUI: Library refresh COMPLETE — {count:,} packages loaded. Scan finished."
+            )
+            self.scan_status_label.setText(f"Scan complete — Library refreshed ({count:,} packages)")
+            self.statusBar().showMessage(f"Scan complete — Library refreshed ({count:,} packages)")
 
     def _available_column_fold_fields(self, group_name: str) -> List[str]:
         if not self.mdb:
