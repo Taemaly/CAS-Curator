@@ -5,6 +5,13 @@ from pathlib import Path
 
 
 def main():
+    # R27 SQLite path is opt-in, so the existing published MDB launch path
+    # keeps working until Library and Windows runtime integration is complete.
+    import sys
+    if "--sqlite-db" in sys.argv[1:]:
+        from scanner_sqlite_bridge import main as sqlite_main
+        return sqlite_main()
+
     parser = argparse.ArgumentParser(description="GUI bridge for the validated Sims 3 CC scanner core")
     default_edition = "PUBLIC" if (Path(__file__).resolve().parent / "PUBLIC_EDITION").exists() else "DEV"
     parser.add_argument("--source", required=True)
