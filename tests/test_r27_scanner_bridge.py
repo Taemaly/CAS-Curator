@@ -36,7 +36,7 @@ class PublicScannerDispatchTests(unittest.TestCase):
             shutil.copyfile(ROOT / name, self.root / name)
         core = self.root / "scanner_core_reference"
         core.mkdir()
-        (core / "Sims3_CC_Health_Scanner_CORE_INTEGRATED_TEST.py").write_text(
+        (core / "Sims3_CC_Health_Scanner_R27_SQLITE.py").write_text(
             "# sqlite_live_writer - mock for regression tests only\n"
             "import os\n"
             "print('MOCK_CORE: storage=%s move=%s batch=%s' % (\n"
@@ -110,7 +110,7 @@ class PublicScannerDispatchTests(unittest.TestCase):
         self.assertIn("not yet supported", out.stdout)
 
     def test_missing_upgraded_core_refuses_legacy_fallback(self):
-        core = self.root / "scanner_core_reference/Sims3_CC_Health_Scanner_CORE_INTEGRATED_TEST.py"
+        core = self.root / "scanner_core_reference/Sims3_CC_Health_Scanner_R27_SQLITE.py"
         core.write_text("print('SHOULD NOT RUN')\n", encoding="utf-8")
         out = self.run_runner("--sqlite-db", str(self.db), "--edition", "PUBLIC")
         self.assertNotEqual(out.returncode, 0)
