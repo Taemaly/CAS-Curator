@@ -15663,13 +15663,12 @@ class MainWindow(QMainWindow):
             # Quiet scanner logging can intentionally suppress diagnostic lines,
             # so keeping a partially populated live table caused Big Review to
             # show only the last few routes instead of the complete report.
+            from routing_preview_parser import read_preview_rows
+            # Headerless SQLite previews start with a real route, not a header.
+            # Skip only an explicitly recognised legacy column header.
+            rows = read_preview_rows(path)
             self.routing_preview_table.setRowCount(0)
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-            for line in lines[1:]:
-                parts = line.split("\t", 4)
-                if len(parts) != 5:
-                    continue
-                category, duplicate_flag, source_path, destination, note = parts
+            for category, duplicate_flag, source_path, destination, note in rows:
                 row = self.routing_preview_table.rowCount()
                 self.routing_preview_table.insertRow(row)
                 source_item = QTableWidgetItem(Path(source_path).name)
