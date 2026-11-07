@@ -29,8 +29,7 @@ class TestConfirmationsAndPath(unittest.TestCase):
         self.assertIn('class ElidedPathLabel(QLabel):', SOURCE)
         self.assertIn('self.mdb_path_label.setPath(full_mdb_path)', SOURCE)
         self.assertIn('Qt.ElideRight', SOURCE)
-        self.assertIn('self.mdb_path_label.setText(display_folder + "\\n" + mdb.path.name)', SOURCE)
-        self.assertIn('self.mdb_path_label.setToolTip(full_mdb_path)', SOURCE)
+        self.assertIn('self.setToolTip(self._full_path)', SOURCE)
 
     def test_saved_independent_preferences(self):
         opts = ast.unparse(method("_build_menus"))
