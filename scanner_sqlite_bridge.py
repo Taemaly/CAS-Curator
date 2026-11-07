@@ -137,11 +137,11 @@ def main(argv=None):
         return 0
 
     core_dir = Path(__file__).resolve().parent / "scanner_core_reference"
-    core_file = core_dir / "Sims3_CC_Health_Scanner_CORE_INTEGRATED_TEST.py"
+    core_file = core_dir / "Sims3_CC_Health_Scanner_R27_SQLITE.py"
     if not core_file.is_file() or "sqlite_live_writer" not in core_file.read_text(encoding="utf-8-sig", errors="replace"):
         raise SystemExit("ERROR: R27 SQLite scanner core not installed; refusing legacy fallback")
     sys.path.insert(0, str(core_dir))
-    __import__("Sims3_CC_Health_Scanner_CORE_INTEGRATED_TEST")
+    __import__("Sims3_CC_Health_Scanner_R27_SQLITE")
     return 0
 
 
