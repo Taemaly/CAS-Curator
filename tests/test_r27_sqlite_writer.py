@@ -101,6 +101,22 @@ class SQLiteWriterTests(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA integrity_check").fetchone()[0], "ok")
         self.assertEqual({p: p.read_bytes() for p in self.files}, self.original)
 
+    def test_wal_mode_backup_contains_committed_changes(self):
+        # SQLite WAL may hold pages outside the main .db file. A pre-scan
+        # backup must include all committed state, not just .db bytes.
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("INSERT INTO meta VALUES (?,?)", ("example_setting", "keep me"))
+        result = write_scan_to_sqlite([row_for(self.files[0])], [], self.db)
+        with sqlite3.connect(result["backup_path"]) as backup:
+            self.assertEqual(backup.execute(
+                "SELECT value FROM meta WHERE key='example_setting'").fetchone()[0], "keep me")
+            self.assertFalse(backup.execute(
+                "SELECT 1 FROM sqlite_master WHERE name='scan_packages_live'").fetchone())
+        with sqlite3.connect(self.db) as conn:
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM scan_packages_live").fetchone()[0], 1)
+
     def test_completed_scan_resumes_remaining_files(self):
         selected = select_next_batch(self.files, self.db, self.source, 2)
         self.assertEqual(selected["selected"], self.files[:2])
