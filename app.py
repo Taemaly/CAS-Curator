@@ -89,6 +89,7 @@ from mdb_reader import (
     CURRENT_PERFORMANCE_SCORE_VERSION, PERFORMANCE_SCORE_VERSION_METADATA_KEY,
 )
 from mdb_compat import inspect_mdb_compatibility, create_compatible_copy
+from sqlite_store import load_sqlite_library, save_sqlite_manual_changes
 from custom_theme_tools import palette_metadata, palette_source
 from theme_studio_core import (
     guide_section_tint, guide_highlight_tint, ensure_guide_highlight_separation,
@@ -1077,7 +1078,10 @@ class LoadWorker(QObject):
 
     def run(self):
         try:
-            self.finished.emit(MDBWorkbook().load(self.path))
+            loaded = (load_sqlite_library(self.path)
+                      if self.path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+                      else MDBWorkbook().load(self.path))
+            self.finished.emit(loaded)
         except Exception as exc:
             self.failed.emit(str(exc))
 
@@ -2905,6 +2909,7 @@ class MainWindow(QMainWindow):
         self.app_page = "library"
         self.scan_source_path = str(self.settings.value("scan_source_folder", "") or "")
         self.scan_mdb_path = ""
+        self.library_db_path = ""  # opened SQLite Library, when applicable
         self.routing_preview_root = str(self.settings.value("routing_preview_root", "") or "")
         self.cc_magic_dropin_path = str(self.settings.value("cc_magic_dropin_folder", "") or "")
         self._cc_magic_import_last_signature = None
@@ -11030,16 +11035,17 @@ class MainWindow(QMainWindow):
             )
         )
         source_ok = bool(self.scan_source_path and Path(self.scan_source_path).is_dir())
-        mdb_ok = bool(self.scan_mdb_path and Path(self.scan_mdb_path).is_file() and self.scan_mdb_path.lower().endswith(".xlsx"))
+        mdb_ok = bool(self.scan_mdb_path and Path(self.scan_mdb_path).is_file() and Path(self.scan_mdb_path).suffix.lower() in {".xlsx", ".db", ".sqlite", ".sqlite3"})
+        sqlite_mode = bool(mdb_ok and Path(self.scan_mdb_path).suffix.lower() in {".db", ".sqlite", ".sqlite3"})
         routing_ok = bool(self.routing_preview_root and Path(self.routing_preview_root).is_dir())
         preview_mode_ok = self._scan_mode_code() != "THUMBNAIL_BACKFILL" if hasattr(self, "scan_mode_combo") else False
         self.scan_start_btn.setEnabled(source_ok and mdb_ok and not running)
         if hasattr(self, "routing_preview_btn"):
-            self.routing_preview_btn.setEnabled(source_ok and mdb_ok and routing_ok and preview_mode_ok and not running)
+            self.routing_preview_btn.setEnabled(source_ok and mdb_ok and routing_ok and preview_mode_ok and not running and not sqlite_mode)
         if hasattr(self, "real_routing_btn"):
             acknowledged = bool(getattr(self, "real_routing_check", None) and self.real_routing_check.isChecked())
             real_mode_ok = self._scan_mode_code() in ("INDIVIDUAL", "BIG_REVIEW_BATCH") if hasattr(self, "scan_mode_combo") else False
-            self.real_routing_btn.setEnabled(source_ok and mdb_ok and routing_ok and real_mode_ok and acknowledged and not running)
+            self.real_routing_btn.setEnabled(source_ok and mdb_ok and routing_ok and real_mode_ok and acknowledged and not running and not sqlite_mode)
 
     def _scan_mode_code(self) -> str:
         label = self.scan_mode_combo.currentText()
@@ -11696,6 +11702,20 @@ class MainWindow(QMainWindow):
 
         source = Path(self.scan_source_path).resolve()
         target = Path(self.scan_mdb_path).resolve()
+        sqlite_mode = target.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+        if sqlite_mode and (preview_routing or real_routing):
+            QMessageBox.warning(
+                self, "SQLite Routing not enabled",
+                "SQLite Routing remains disabled in this integration test. "
+                "Batch-scoped Preview and Run Routing must be tested first. No files moved.",
+            )
+            return
+        if sqlite_mode and (
+            not self.mdb or self.mdb.path.resolve() != target or
+            str(getattr(self.mdb, "metadata", {}).get("_SQLitePrimary", "")) != "1"
+        ):
+            QMessageBox.warning(self, "SQLite Library not open", "Open this SQLite Library in the Library page first.")
+            return
         routing_root = Path(self.routing_preview_root).resolve() if (preview_routing or real_routing) else None
         if not source.is_dir() or not target.is_file() or ((preview_routing or real_routing) and not routing_root.is_dir()):
             QMessageBox.warning(
@@ -11723,20 +11743,27 @@ class MainWindow(QMainWindow):
             "matched": 0, "extracted_packages": 0, "errors": 0,
         }
         if not preview_routing and not real_routing:
-            if not self._prepare_scan_mdb_compatibility(target):
-                return
-            zip_intake = self._handle_scan_zip_archives(source)
-            if zip_intake is None:
-                return
-            # ZIP extraction may reveal Sims3Packs and/or matching standalone
-            # packages, so analyse Sims3Packs only after the ZIP intake step.
-            sims3pack_intake = self._handle_scan_sims3packs(source)
-            if sims3pack_intake is None:
-                return
+            if sqlite_mode:
+                # R27 SQLite scanner: no implicit archive extraction or ZIP/Sims3Pack
+                # prompts during Scan. This does not change the legacy XLSX path.
+                zip_intake = {"action": "skipped", "zip_count": 0, "extracted_files": 0, "package_files": 0}
+                sims3pack_intake["action"] = "skipped"
+            else:
+                if not self._prepare_scan_mdb_compatibility(target):
+                    return
+                zip_intake = self._handle_scan_zip_archives(source)
+                if zip_intake is None:
+                    return
+                sims3pack_intake = self._handle_scan_sims3packs(source)
+                if sims3pack_intake is None:
+                    return
 
         # Recount after optional ZIP/Sims3Pack extraction so newly unpacked
         # packages are included immediately in this same Scan.
-        package_count = sum(1 for p in source.rglob("*") if p.is_file() and p.suffix.lower() == ".package")
+        package_count = sum(
+            1 for p in source.rglob("*")
+            if p.is_file() and p.suffix.lower() in ((".package", ".sim") if sqlite_mode else (".package",))
+        )
         if self._scan_mode_code() != "THUMBNAIL_BACKFILL" and package_count == 0:
             QMessageBox.information(
                 self,
@@ -11834,6 +11861,15 @@ class MainWindow(QMainWindow):
         if not runner_py.exists():
             QMessageBox.critical(self, "Scanner", f"Missing integration runner:\n{runner_py}")
             return
+        if sqlite_mode and getattr(sys, "frozen", False):
+            # The published Windows binary's scanner runtime has not been
+            # rebuilt with the R27 core/bridge. Fail closed, not back to MDB.
+            QMessageBox.warning(
+                self, "SQLite scanner runtime not bundled",
+                "This test source needs the R27 Windows scanner runtime build. "
+                "Do not run SQLite scans from the old compiled runtime.",
+            )
+            return
 
         python38, python38_error = self._resolve_scanner_python38()
         if not python38:
@@ -11846,7 +11882,9 @@ class MainWindow(QMainWindow):
             return
 
         self.last_scan_backup_path = None
-        if not preview_routing:
+        # SQLite writer creates a WAL-safe backup immediately before its own
+        # atomic scan transaction. Never apply the legacy XLSX backup logic.
+        if not preview_routing and not sqlite_mode:
             try:
                 self.last_scan_backup_path = self._create_scan_mdb_backup(target)
             except Exception as exc:
@@ -11898,7 +11936,10 @@ class MainWindow(QMainWindow):
         else:
             self.scan_log.appendPlainText("STARTING SCAN")
         self.scan_log.appendPlainText(f"Source: {source}")
-        self.scan_log.appendPlainText(f"MDB: {target}")
+        self.scan_log.appendPlainText(f"{'SQLite Library' if sqlite_mode else 'MDB'}: {target}")
+        if sqlite_mode:
+            self.scan_log.appendPlainText("SQLite scan: source files remain unchanged; archives stay packed.")
+            self.scan_log.appendPlainText("SQLite writer will create a safety backup before committing live scan records.")
         if not IS_PUBLIC_BUILD:
             self.scan_log.appendPlainText(f"Mode: {self._scan_mode_code()}")
         self.scan_log.appendPlainText(f"Python 3.8: {python38}")
@@ -11972,11 +12013,14 @@ class MainWindow(QMainWindow):
         args = [
             "-u", str(runner_py),
             "--source", str(source),
-            "--mdb", str(target),
             "--mode", self._scan_mode_code(),
             "--edition", APP_EDITION,
             "--create-report", "1" if create_scan_report else "0",
         ]
+        if sqlite_mode:
+            args.extend(["--sqlite-db", str(target)])
+        else:
+            args.extend(["--mdb", str(target)])
         if preview_routing:
             preview_workdir = Path(__file__).resolve().parent / "routing_preview_runs"
             args.extend([
@@ -15739,7 +15783,10 @@ class MainWindow(QMainWindow):
         if not self._confirm_pending_changes():
             return
         start_dir = self.settings.value("last_dir", str(Path.home()))
-        path, _ = QFileDialog.getOpenFileName(self, "Open Master Database", str(start_dir), "Excel Workbook (*.xlsx);;All files (*)")
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Library Database", str(start_dir),
+            "CAS Curator SQLite Library (*.db *.sqlite *.sqlite3);;Legacy Master Database (*.xlsx);;All files (*)",
+        )
         if path:
             self.load_file(Path(path))
 
@@ -15822,7 +15869,16 @@ class MainWindow(QMainWindow):
         self.merge_profile_registry_current = list(self.merge_profile_registry_saved)
         self.merge_profile_registry_dirty = False
         self.current_source_row = None
-        self.settings.setValue("last_mdb", str(mdb.path.resolve()))
+        self.library_db_path = (
+            str(mdb.path.resolve())
+            if mdb.path.suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+            and str(getattr(mdb, "metadata", {}).get("_SQLitePrimary", "")) == "1"
+            else ""
+        )
+        if self.library_db_path:
+            self.settings.setValue("last_library_db", self.library_db_path)
+        else:
+            self.settings.setValue("last_mdb", str(mdb.path.resolve()))
         self.settings.setValue("last_dir", str(mdb.path.parent.resolve()))
         self.settings.sync()
         full_mdb_path = str(mdb.path.resolve())
@@ -21425,16 +21481,26 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Saving Library/Profile/Profile Layout changes and creating a Master Database backup…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
-            result = MDBWorkbook().save_manual_changes(
-                self.mdb,
-                self.pending_changes,
-                profile_options=self.profile_registry_current if profile_registry_needs_save else None,
-                status_options=PUBLIC_STATUS_OPTIONS if status_registry_was_dirty else None,
-                delete_rows=self.pending_deletions,
-                file_locations=self.file_location_registry_current if file_location_registry_was_dirty else None,
-                merge_profile_options=self.merge_profile_registry_current if merge_profile_registry_needs_save else None,
-                profile_layouts=self.profile_layouts_current if profile_layouts_were_dirty else None,
-            )
+            if self.library_db_path:
+                result = save_sqlite_manual_changes(
+                    self.mdb, self.library_db_path, self.pending_changes,
+                    profile_options=self.profile_registry_current if profile_registry_needs_save else None,
+                    status_options=PUBLIC_STATUS_OPTIONS if status_registry_was_dirty else None,
+                    delete_rows=self.pending_deletions,
+                    file_locations=self.file_location_registry_current if file_location_registry_was_dirty else None,
+                    merge_profile_options=self.merge_profile_registry_current if merge_profile_registry_needs_save else None,
+                    profile_layouts=self.profile_layouts_current if profile_layouts_were_dirty else None,
+                )
+            else:
+                result = MDBWorkbook().save_manual_changes(
+                    self.mdb, self.pending_changes,
+                    profile_options=self.profile_registry_current if profile_registry_needs_save else None,
+                    status_options=PUBLIC_STATUS_OPTIONS if status_registry_was_dirty else None,
+                    delete_rows=self.pending_deletions,
+                    file_locations=self.file_location_registry_current if file_location_registry_was_dirty else None,
+                    merge_profile_options=self.merge_profile_registry_current if merge_profile_registry_needs_save else None,
+                    profile_layouts=self.profile_layouts_current if profile_layouts_were_dirty else None,
+                )
         except WorkbookChangedError as exc:
             QMessageBox.warning(self, "Master Database changed", "This Master Database changed outside CAS Curator after it was opened. Reload it before saving so newer changes are not overwritten.\n\nDetails:\n" + str(exc))
             self.statusBar().showMessage("Save cancelled — reload the Master Database first")
