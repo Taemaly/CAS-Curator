@@ -45,6 +45,12 @@ class PublicScannerDispatchTests(unittest.TestCase):
             "    os.environ.get('S3CC_SCAN_BATCH_SIZE','not-set')))\n",
             encoding="utf-8",
         )
+        # Legacy XLSX runner still imports its published core, not R27.
+        # Install a separate mock so both launch paths can be tested.
+        shutil.copyfile(
+            core / "Sims3_CC_Health_Scanner_R27_SQLITE.py",
+            core / "Sims3_CC_Health_Scanner_CORE_INTEGRATED_TEST.py",
+        )
 
     def run_runner(self, *args):
         result = subprocess.run(
