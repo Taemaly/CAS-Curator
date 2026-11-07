@@ -1,0 +1,23 @@
+name: R27 backend regression tests
+
+on:
+  push:
+    branches:
+      - r27-public-backend-port
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout development branch
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Run SQLite and Merge Builder tests
+        run: python -m unittest discover -s tests -p 'test_r27_backend.py' -v
