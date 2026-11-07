@@ -12019,6 +12019,12 @@ class MainWindow(QMainWindow):
         ]
         if sqlite_mode:
             args.extend(["--sqlite-db", str(target)])
+            # No extra DEV controls: bound public Big Review to 500 files.
+            if self._scan_mode_code() == "BIG_REVIEW_BATCH":
+                args.extend(["--batch-size", "500"])
+                self.scan_log.appendPlainText(
+                    "SQLite Big Review: up to 500 new or changed files per scan."
+                )
         else:
             args.extend(["--mdb", str(target)])
         if preview_routing:
