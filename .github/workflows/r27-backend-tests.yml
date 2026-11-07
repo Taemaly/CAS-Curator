@@ -19,5 +19,11 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Reconstruct and verify exact R27 scanner core
+        run: python build_support/materialize_r27_sqlite_scanner.py
+      - name: Compile both scanner cores without running a scan
+        run: |
+          python -m py_compile scanner_core_reference/Sims3_CC_Health_Scanner_CORE_INTEGRATED_TEST.py
+          python -m py_compile scanner_core_reference/Sims3_CC_Health_Scanner_R27_SQLITE.py
       - name: Run SQLite and Merge Builder tests
         run: python -m unittest discover -s tests -p 'test_r27_*.py' -v
