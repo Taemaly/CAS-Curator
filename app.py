@@ -3291,6 +3291,34 @@ class MainWindow(QMainWindow):
         )
         options_menu.addAction(self.confirm_fill_action)
 
+        # Optional *extra* Yes/No prompts, not routing validation or consent.
+        options_menu.addSeparator()
+        self.confirm_scan_action = QAction("Confirm before Run Scan", self, checkable=True)
+        self.confirm_scan_action.setChecked(setting_bool("scan/confirm_scan", False))
+        self.confirm_scan_action.setToolTip("Ask once before scanning. Off by default; scanning never moves source files.")
+        self.confirm_scan_action.toggled.connect(
+            lambda checked: (self.settings.setValue("scan/confirm_scan", checked), self.settings.sync())
+        )
+        options_menu.addAction(self.confirm_scan_action)
+
+        self.confirm_preview_action = QAction("Confirm before Preview Routing", self, checkable=True)
+        self.confirm_preview_action.setChecked(setting_bool("scan/confirm_preview", True))
+        self.confirm_preview_action.setToolTip("Turn off to skip the extra Yes/No dialog before read-only routing preview.")
+        self.confirm_preview_action.toggled.connect(
+            lambda checked: (self.settings.setValue("scan/confirm_preview", checked), self.settings.sync())
+        )
+        options_menu.addAction(self.confirm_preview_action)
+
+        self.confirm_move_action = QAction("Confirm before Run Routing", self, checkable=True)
+        self.confirm_move_action.setChecked(setting_bool("scan/confirm_move", True))
+        self.confirm_move_action.setToolTip(
+            "Turn off only the extra Yes/No dialog; move acknowledgement, validation and any required approved preview remain mandatory."
+        )
+        self.confirm_move_action.toggled.connect(
+            lambda checked: (self.settings.setValue("scan/confirm_move", checked), self.settings.sync())
+        )
+        options_menu.addAction(self.confirm_move_action)
+
         if IS_PUBLIC_BUILD:
             options_menu.addSeparator()
             self.create_scan_report_action = QAction("Create Health Scan Report after Scan", self, checkable=True)
@@ -4279,22 +4307,23 @@ class MainWindow(QMainWindow):
         self.mdb_path_label.setWordWrap(True)
         self.mdb_path_label.setMinimumWidth(0)
         self.mdb_path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self.mdb_path_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         self.library_mdb_identity.setMinimumWidth(0)
         mdb_identity_layout.addWidget(mdb_caption)
         mdb_identity_layout.addWidget(self.mdb_path_label, 1)
 
-        create_mdb_btn = QPushButton("Create\nDB")
+        create_mdb_btn = QPushButton("Create DB")
         create_mdb_btn.setObjectName("OpenMDBButton")
         create_mdb_btn.setToolTip("Create a new SQLite Library (.db). Existing databases are never overwritten here.")
         create_mdb_btn.clicked.connect(self.create_new_database)
-        create_mdb_btn.setMinimumWidth(82)
-        create_mdb_btn.setMinimumHeight(44)
-        open_mdb_btn = QPushButton("Open\nDB")
+        create_mdb_btn.setMinimumWidth(max(100, QFontMetrics(create_mdb_btn.font()).horizontalAdvance("Create DB") + 28))
+        create_mdb_btn.setMinimumHeight(34)
+        open_mdb_btn = QPushButton("Open DB")
         open_mdb_btn.setObjectName("OpenMDBButton")
         open_mdb_btn.setToolTip("Open a SQLite Library (.db) or a legacy Excel MDB (.xlsx).")
         open_mdb_btn.clicked.connect(self.choose_file)
-        open_mdb_btn.setMinimumWidth(82)
-        open_mdb_btn.setMinimumHeight(44)
+        open_mdb_btn.setMinimumWidth(max(94, QFontMetrics(open_mdb_btn.font()).horizontalAdvance("Open DB") + 28))
+        open_mdb_btn.setMinimumHeight(34)
         mdb_actions = QWidget()
         mdb_actions.setObjectName("LibraryActionGroup")
         mdb_actions_layout = QHBoxLayout(mdb_actions)
@@ -11863,22 +11892,31 @@ class MainWindow(QMainWindow):
             destination_item_count = len(destination_items)
 
         if hasattr(self, "scan_log"):
-            self.scan_log.appendPlainText("GUI: validation passed; preparing operation confirmation…")
+            self.scan_log.appendPlainText("GUI: validation passed; checking confirmation preferences…")
 
         self.show()
         self.raise_()
         self.activateWindow()
         QApplication.processEvents()
 
+        def ask_confirmation(setting_key: str, default: bool) -> bool:
+            value = self.settings.value(setting_key, default)
+            if isinstance(value, bool):
+                return value
+            return str(value).strip().lower() not in {"0", "false", "no", "off", ""}
+
+        confirm_needed = (
+            ask_confirmation("scan/confirm_move", True) if real_routing else
+            ask_confirmation("scan/confirm_preview", True) if preview_routing else
+            ask_confirmation("scan/confirm_scan", False)
+        )
         if routing_preflight_confirmed:
             if hasattr(self, "scan_log"):
                 self.scan_log.appendPlainText(
                     "GUI: scan-state warning accepted; Continue Routing Anyway is serving as the final confirmation."
                 )
-        elif real_routing or preview_routing:
-            # Routing changes files (or previews a destination plan), so keep one
-            # deliberate confirmation. A normal Run Scan no longer gets an extra
-            # Yes/No box after the user already clicked Run Scan.
+        elif confirm_needed:
+            # Only the routine Yes/No prompt is optional; safety checks above remain.
             msg = QMessageBox(self)
             msg.setIcon(QMessageBox.Warning if real_routing else QMessageBox.Information)
             msg.setTextFormat(Qt.RichText)
@@ -11890,12 +11928,19 @@ class MainWindow(QMainWindow):
                     "Source files will be moved, not copied. Existing destination files are never overwritten. "
                     "The MDB will be updated after successful routing."
                 )
-            else:
+            elif preview_routing:
                 msg.setWindowTitle("Preview Routing?")
                 msg.setText(f"<b>Preview routes for {package_count:,} package(s)?</b>")
                 msg.setInformativeText(
                     f"Source: {source}\nDestination preview: {routing_root}\n\n"
                     "Dry run only — no source files move, no destination files are created, and the MDB is not written."
+                )
+            else:
+                msg.setWindowTitle("Run Scan?")
+                msg.setText(f"<b>Scan {package_count:,} package(s)?</b>")
+                msg.setInformativeText(
+                    f"Source: {source}\nLibrary: {target}\n\n"
+                    "Source packages will not be moved. The Library will be updated after scanning."
                 )
             msg.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
             msg.setDefaultButton(QMessageBox.No)
@@ -11909,7 +11954,7 @@ class MainWindow(QMainWindow):
                     self.scan_log.appendPlainText("GUI: operation cancelled at confirmation.")
                 return
         elif hasattr(self, "scan_log"):
-            self.scan_log.appendPlainText("GUI: validation passed; Run Scan starts directly (no redundant confirmation).")
+            self.scan_log.appendPlainText("GUI: validation passed; starting without extra confirmation.")
 
         if getattr(sys, "frozen", False):
             runner_py = Path(sys.executable).resolve().parent / "scanner" / "CASCurator_ScannerRuntime.exe"
@@ -15952,7 +15997,11 @@ class MainWindow(QMainWindow):
         self.settings.sync()
         full_mdb_path = str(mdb.path.resolve())
         if hasattr(self, "mdb_path_label"):
-            self.mdb_path_label.setText(full_mdb_path)
+            # Folder path wraps at separators; file name is on its own line.
+            # Preserve the full path unchanged in its tooltip.
+            display_folder = str(mdb.path.resolve().parent)
+            display_folder = display_folder.replace("\\", "\\\u200b").replace("/", "/\u200b")
+            self.mdb_path_label.setText(display_folder + "\n" + mdb.path.name)
             self.mdb_path_label.setToolTip(full_mdb_path)
         self.scan_mdb_path = full_mdb_path
         self.scan_mdb_override = False
