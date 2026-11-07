@@ -23,22 +23,23 @@ class Settings:
 
 
 class TestConfirmationsAndPath(unittest.TestCase):
-    def test_one_line_buttons_and_breakable_path(self):
+    def test_one_line_buttons_and_elided_path(self):
         self.assertIn('QPushButton("Create DB")', SOURCE)
         self.assertIn('QPushButton("Open DB")', SOURCE)
-        self.assertIn('display_folder.replace', SOURCE)
+        self.assertIn('class ElidedPathLabel(QLabel):', SOURCE)
+        self.assertIn('self.mdb_path_label.setPath(full_mdb_path)', SOURCE)
+        self.assertIn('Qt.ElideRight', SOURCE)
         self.assertIn('self.mdb_path_label.setText(display_folder + "\\n" + mdb.path.name)', SOURCE)
         self.assertIn('self.mdb_path_label.setToolTip(full_mdb_path)', SOURCE)
 
     def test_saved_independent_preferences(self):
         opts = ast.unparse(method("_build_menus"))
-        for name, key in (
-            ("Confirm before Run Scan", "scan/confirm_scan"),
-            ("Confirm before Preview Routing", "scan/confirm_preview"),
-            ("Confirm before Run Routing", "scan/confirm_move"),
-        ):
-            self.assertIn(name, opts)
-            self.assertIn(key, opts)
+        self.assertIn("Confirm before Run Routing", opts)
+        self.assertIn("scan/confirm_move", opts)
+        self.assertNotIn("Confirm before Run Scan", opts)
+        self.assertNotIn("Confirm before Preview Routing", opts)
+        self.assertNotIn("scan/confirm_scan", opts)
+        self.assertNotIn("scan/confirm_preview", opts)
         scan = method("_start_scan_operation")
         nested = next(x for x in ast.walk(scan)
                       if isinstance(x, ast.FunctionDef) and x.name == "ask_confirmation")
@@ -47,12 +48,11 @@ class TestConfirmationsAndPath(unittest.TestCase):
                      str(ROOT / "app.py"), "exec"), ns)
         fn = ns["ask_confirmation"]
         for raw, expected in ((True, True), (False, False), ("false", False), ("1", True)):
-            ns["self"] = SimpleNamespace(settings=Settings({"scan/confirm_preview": raw}))
-            self.assertEqual(fn("scan/confirm_preview", True), expected)
+            ns["self"] = SimpleNamespace(settings=Settings({"scan/confirm_move": raw}))
+            self.assertEqual(fn("scan/confirm_move", True), expected)
         ns["self"] = SimpleNamespace(settings=Settings())
-        self.assertFalse(fn("scan/confirm_scan", False))
-        self.assertTrue(fn("scan/confirm_preview", True))
         self.assertTrue(fn("scan/confirm_move", True))
+        self.assertIn("confirm_needed = real_routing and", ast.unparse(scan))
 
     def test_routing_guards_retained(self):
         scan = ast.unparse(method("_start_scan_operation"))
