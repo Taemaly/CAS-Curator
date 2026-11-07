@@ -132,10 +132,10 @@ class PublicLibraryUIRegression(unittest.TestCase):
         for snippet in (
             'QPushButton("Create DB")',
             'QPushButton("Open DB")',
-            'self.mdb_path_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)',
+            'self.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)',
             'self.mdb_path_label.setPath(full_mdb_path)',
             'class ElidedPathLabel(QLabel)',
-            'self.mdb_path_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)',
+            'self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)',
             'Create legacy Excel MDB…',
             'def create_new_mdb(self):',
             'self.settings.setValue("last_library_path"',
