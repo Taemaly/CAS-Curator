@@ -13,8 +13,20 @@ from cached_duplicate_routes import resolve_missing_duplicates
 
 
 def _validate_child(source, root):
-    if os.path.commonpath([_path_key(source), _path_key(root)]) != _path_key(root):
-        raise RuntimeError('Source path outside scan root: ' + str(source))
+    """Enforce both lexical and real filesystem containment.
+
+    Existing symlink/junction parent folders can redirect a textual child path
+    outside the selected root. Checking the resolved path prevents this.
+    """
+    try:
+        textual = os.path.commonpath([_path_key(source), _path_key(root)]) == _path_key(root)
+        real_root = _path_key(Path(root).resolve())
+        real_path = _path_key(Path(source).resolve(strict=False))
+        physical = os.path.commonpath([real_path, real_root]) == real_root
+    except ValueError:
+        textual = physical = False
+    if not textual or not physical:
+        raise RuntimeError('Routing path escapes selected root (including links/junctions): ' + str(source))
 
 
 def _route_category(row):
@@ -100,7 +112,9 @@ def preview(sqlite_db,source_root,destination_root,preview_root):
     if problems:
         raise RuntimeError('%s files need special routing data absent from the saved scan. Preview blocked; no packages rescanned. Example: %s'%(len(problems),problems[0]))
     plan=_plan(items,source_root,destination_root)
-    stamp=datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    for _source, _category, destination, _collision in plan:
+        _validate_child(destination, destination_root)
+    stamp=datetime.now().strftime('%Y-%m-%d_%H-%M-%S-%f')
     session=Path(preview_root)/('Cached_Routing_Preview_'+stamp)
     session.mkdir(parents=True,exist_ok=True)
     output=session/'Routing_Preview.txt'
